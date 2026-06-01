@@ -1,0 +1,54 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>disable</Nullable>
+    <IsPackable>false</IsPackable>
+    <!-- Match YesSql's [InternalsVisibleTo("YesSql.Tests", PublicKey=…)] so CoreTests can reach
+         YesSql internals (Session._commands, NullableThumbprintFactory). -->
+    <AssemblyName>YesSql.Tests</AssemblyName>
+    <SignAssembly>true</SignAssembly>
+    <AssemblyOriginatorKeyFile>Z:\SOURCE\SCRATCH\YesSqlCosmosSpike\yessql\src\YesSqlKey.snk</AssemblyOriginatorKeyFile>
+    <!-- The linked YesSql v5.4.7 conformance sources predate latest analyzers; keep them quiet. -->
+    <NoWarn>$(NoWarn);CS0618;CS8002;xUnit1013;xUnit1026;CA1861;IDE0005</NoWarn>
+    <TreatWarningsAsErrors>false</TreatWarningsAsErrors>
+  </PropertyGroup>
+
+  <!-- YesSql's own v5.4.7 test suite, source-linked from the spike clone, compiled against the same
+       NuGet YesSql 5.4.7 that the provider references (one assembly, no version conflict). The
+       relational providers' own test classes are excluded. -->
+  <PropertyGroup>
+    <YesSqlTestsDir>Z:\SOURCE\SCRATCH\YesSqlCosmosSpike\yessql\test\YesSql.Tests</YesSqlTestsDir>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="$(YesSqlTestsDir)\**\*.cs"
+             Exclude="$(YesSqlTestsDir)\obj\**\*.cs;
+                      $(YesSqlTestsDir)\bin\**\*.cs;
+                      $(YesSqlTestsDir)\Properties\**\*.cs;
+                      $(YesSqlTestsDir)\SqliteTests.cs;
+                      $(YesSqlTestsDir)\SqliteLegacyIdentityTests.cs;
+                      $(YesSqlTestsDir)\MySqlTests.cs;
+                      $(YesSqlTestsDir)\PostgreSqlTests.cs;
+                      $(YesSqlTestsDir)\PostgreSqlLegacyIdentityTests.cs;
+                      $(YesSqlTestsDir)\SqlServerTests.cs;
+                      $(YesSqlTestsDir)\SqlServer2017Tests.cs;
+                      $(YesSqlTestsDir)\SqlServer2019Tests.cs;
+                      $(YesSqlTestsDir)\ProviderTests.cs">
+      <Link>YesSqlTests\%(RecursiveDir)%(Filename)%(Extension)</Link>
+    </Compile>
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.11.1" />
+    <PackageReference Include="xunit" Version="2.9.2" />
+    <PackageReference Include="xunit.runner.visualstudio" Version="2.8.2" />
+    <PackageReference Include="YesSql.Filters.Query" Version="5.4.7" />
+    <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="9.0.4" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\YesSql.Provider.CosmosDb\YesSql.Provider.CosmosDb.csproj" />
+  </ItemGroup>
+
+</Project>
