@@ -118,16 +118,35 @@ public sealed class CosmosDbCommand : DbCommand
 
             // UPDATE only carries the columns in its SET clause (Content/Version), so read the existing
             // item and patch the provided fields; INSERT carries all of them.
+            var isUpdate = StartsWith(sql, "update");
             JObject? item = null;
-            if (StartsWith(sql, "update"))
+            string? etag = null;
+            if (isUpdate)
             {
                 try
                 {
-                    item = (await CosmosContainer.ReadItemAsync<JObject>($"{table}:{id}", PartitionKeyFor(table), cancellationToken: cancellationToken)).Resource;
+                    var existing = await CosmosContainer.ReadItemAsync<JObject>($"{table}:{id}", PartitionKeyFor(table), cancellationToken: cancellationToken);
+                    item = existing.Resource;
+                    etag = existing.ETag;
                 }
                 catch (CosmosException ex) when (ex.StatusCode == HttpStatusCode.NotFound)
                 {
                     // fall through to a fresh item
+                }
+            }
+
+            // Optimistic concurrency: a checked update adds "and [Version] = <n>" (or "IS NULL OR = <n>");
+            // YesSql throws ConcurrencyException when the affected count is not 1, so return 0 on mismatch.
+            var versionCheck = isUpdate ? Regex.Match(sql, @"\[version\]\s*=\s*(\d+)", RegexOptions.IgnoreCase) : Match.Empty;
+            if (versionCheck.Success)
+            {
+                var checkVersion = long.Parse(versionCheck.Groups[1].Value);
+                var allowNull = Regex.IsMatch(sql, @"\[version\]\s+is\s+null", RegexOptions.IgnoreCase);
+                var current = item?["Version"];
+                var currentVersion = current is null || current.Type == JTokenType.Null ? (long?)null : current.ToObject<long>();
+                if (item is null || !(currentVersion == checkVersion || (allowNull && currentVersion is null)))
+                {
+                    return 0;
                 }
             }
 
@@ -148,7 +167,26 @@ public sealed class CosmosDbCommand : DbCommand
             }
 
             WithPartition(item, table);
-            await CosmosContainer.UpsertItemAsync(item, PartitionKeyFor(table), cancellationToken: cancellationToken);
+
+            // Version-checked updates use an ETag-conditional replace so a concurrent write between the
+            // read and the write is also detected (412 ⇒ treat as a concurrency failure).
+            if (versionCheck.Success && etag is not null)
+            {
+                try
+                {
+                    await CosmosContainer.ReplaceItemAsync(item, $"{table}:{id}", PartitionKeyFor(table),
+                        new ItemRequestOptions { IfMatchEtag = etag }, cancellationToken);
+                }
+                catch (CosmosException ex) when (ex.StatusCode == HttpStatusCode.PreconditionFailed)
+                {
+                    return 0;
+                }
+            }
+            else
+            {
+                await CosmosContainer.UpsertItemAsync(item, PartitionKeyFor(table), cancellationToken: cancellationToken);
+            }
+
             Undo?.Record($"{table}:{id}", PkValue(table), prior);
             return 1;
         }
