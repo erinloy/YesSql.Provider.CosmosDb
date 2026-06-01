@@ -1,5 +1,6 @@
+using System;
+using System.Collections.Generic;
 using System.Data;
-using YesSql.Provider.CosmosDb.Internal;
 using YesSql.Sql;
 
 namespace YesSql.Provider.CosmosDb;
@@ -11,6 +12,50 @@ namespace YesSql.Provider.CosmosDb;
 /// </summary>
 public sealed class CosmosDbDialect : BaseDialect
 {
+    static CosmosDbDialect()
+    {
+        _propertyTypes = new Dictionary<Type, DbType>
+        {
+            { typeof(object), DbType.Binary },
+            { typeof(byte[]), DbType.Binary },
+            { typeof(string), DbType.String },
+            { typeof(char), DbType.StringFixedLength },
+            { typeof(bool), DbType.Boolean },
+            { typeof(byte), DbType.Byte },
+            { typeof(sbyte), DbType.SByte },
+            { typeof(short), DbType.Int16 },
+            { typeof(ushort), DbType.UInt16 },
+            { typeof(int), DbType.Int32 },
+            { typeof(uint), DbType.UInt32 },
+            { typeof(long), DbType.Int64 },
+            { typeof(ulong), DbType.UInt64 },
+            { typeof(float), DbType.Single },
+            { typeof(double), DbType.Double },
+            { typeof(decimal), DbType.Decimal },
+            { typeof(DateTime), DbType.DateTime },
+            { typeof(DateTimeOffset), DbType.DateTimeOffset },
+            { typeof(Guid), DbType.Guid },
+            { typeof(TimeSpan), DbType.Time },
+            { typeof(char?), DbType.StringFixedLength },
+            { typeof(bool?), DbType.Boolean },
+            { typeof(byte?), DbType.Byte },
+            { typeof(sbyte?), DbType.SByte },
+            { typeof(short?), DbType.Int16 },
+            { typeof(ushort?), DbType.UInt16 },
+            { typeof(int?), DbType.Int32 },
+            { typeof(uint?), DbType.UInt32 },
+            { typeof(long?), DbType.Int64 },
+            { typeof(ulong?), DbType.UInt64 },
+            { typeof(float?), DbType.Single },
+            { typeof(double?), DbType.Double },
+            { typeof(decimal?), DbType.Decimal },
+            { typeof(DateTime?), DbType.DateTime },
+            { typeof(DateTimeOffset?), DbType.DateTimeOffset },
+            { typeof(Guid?), DbType.Guid },
+            { typeof(TimeSpan?), DbType.Time },
+        };
+    }
+
     public CosmosDbDialect()
     {
         // 'now' maps to Cosmos server time at translation; placeholder template for parity.
