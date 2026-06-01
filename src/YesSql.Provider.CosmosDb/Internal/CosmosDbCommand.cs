@@ -219,7 +219,7 @@ public sealed class CosmosDbCommand : DbCommand
         if (StartsWith(sql.TrimStart(), "insert"))
         {
             var table = ExtractTable(sql);
-            var newId = (await MaxIdAsync(table, cancellationToken) ?? 0) + 1;
+            var newId = await NextSequenceAsync(table, cancellationToken);
 
             var item = new JObject
             {
@@ -785,6 +785,46 @@ public sealed class CosmosDbCommand : DbCommand
         }
 
         return new CosmosDbDataReader(DocumentColumns, rows);
+    }
+
+    // Monotonic, never-reused id allocator for index rows (auto-increment has no Cosmos equivalent, and
+    // MAX+1 reuses ids after deletes — which breaks YesSql's append-only index expectations). A counter
+    // doc per table lives in an isolated "__seq" partition so it never appears in index/count queries.
+    private async Task<long> NextSequenceAsync(string table, CancellationToken cancellationToken)
+    {
+        var seqPk = new PartitionKey("__seq");
+
+        for (var attempt = 0; attempt < 8; attempt++)
+        {
+            try
+            {
+                var current = await CosmosContainer.ReadItemAsync<JObject>(table, seqPk, cancellationToken: cancellationToken);
+                var next = (current.Resource["next"]?.ToObject<long>() ?? 0) + 1;
+                current.Resource["next"] = next;
+                await CosmosContainer.ReplaceItemAsync(current.Resource, table, seqPk,
+                    new ItemRequestOptions { IfMatchEtag = current.ETag }, cancellationToken);
+                return next;
+            }
+            catch (CosmosException ex) when (ex.StatusCode == HttpStatusCode.NotFound)
+            {
+                var seed = (await MaxIdAsync(table, cancellationToken) ?? 0) + 1;
+                try
+                {
+                    await CosmosContainer.CreateItemAsync(new JObject { ["id"] = table, ["pk"] = "__seq", ["next"] = seed }, seqPk, cancellationToken: cancellationToken);
+                    return seed;
+                }
+                catch (CosmosException dup) when (dup.StatusCode == HttpStatusCode.Conflict)
+                {
+                    // created concurrently — retry the read/increment path
+                }
+            }
+            catch (CosmosException ex) when (ex.StatusCode == HttpStatusCode.PreconditionFailed)
+            {
+                // lost the ETag race — retry
+            }
+        }
+
+        throw new InvalidOperationException($"Could not allocate a sequence id for '{table}'.");
     }
 
     private async Task<long?> MaxIdAsync(string table, CancellationToken cancellationToken)
