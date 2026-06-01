@@ -81,9 +81,16 @@ public sealed class CosmosDbCommand : DbCommand
 
             item ??= new JObject { ["id"] = $"{table}:{id}", ["pk"] = table, ["Id"] = id };
 
-            SetIfPresent(item, "Type");
-            SetIfPresent(item, "Content");
-            SetIfPresent(item, "Version");
+            // Patch every provided column (documents: Type/Content/Version; indexes: their own fields).
+            // Id is the key and already set.
+            foreach (DbParameter p in _parameters)
+            {
+                var name = p.ParameterName.TrimStart('@');
+                if (!name.Equals("Id", StringComparison.OrdinalIgnoreCase))
+                {
+                    item[name] = ToToken(p.Value is DBNull ? null : p.Value);
+                }
+            }
 
             await CosmosContainer.UpsertItemAsync(item, new PartitionKey(table), cancellationToken: cancellationToken);
             return 1;
@@ -91,17 +98,44 @@ public sealed class CosmosDbCommand : DbCommand
 
         if (StartsWith(sql, "delete"))
         {
+            // General delete: query items in the partition matching the WHERE (by [Id] for documents,
+            // by [DocumentId] for map indexes, by composite key for reduce bridge rows), then delete each.
             var table = ExtractTable(sql);
-            var id = Convert.ToInt64(Param("Id"));
-            try
+            var where = ExtractWhere(sql);
+            var cosmosWhere = string.IsNullOrWhiteSpace(where) ? string.Empty : " AND " + TranslateWhere(where!);
+
+            var queryDef = new QueryDefinition("SELECT c.id FROM c WHERE c.pk = @pk" + cosmosWhere).WithParameter("@pk", table);
+            foreach (DbParameter p in _parameters)
             {
-                await CosmosContainer.DeleteItemAsync<JObject>($"{table}:{id}", new PartitionKey(table), cancellationToken: cancellationToken);
-                return 1;
+                queryDef = queryDef.WithParameter("@" + p.ParameterName.TrimStart('@'), p.Value is DBNull ? null : p.Value);
             }
-            catch (CosmosException ex) when (ex.StatusCode == HttpStatusCode.NotFound)
+
+            var ids = new List<string>();
+            using (var iterator = CosmosContainer.GetItemQueryIterator<JObject>(queryDef,
+                requestOptions: new QueryRequestOptions { PartitionKey = new PartitionKey(table) }))
             {
-                return 0;
+                while (iterator.HasMoreResults)
+                {
+                    foreach (var item in await iterator.ReadNextAsync(cancellationToken))
+                    {
+                        ids.Add(item["id"]!.ToString());
+                    }
+                }
             }
+
+            foreach (var id in ids)
+            {
+                try
+                {
+                    await CosmosContainer.DeleteItemAsync<JObject>(id, new PartitionKey(table), cancellationToken: cancellationToken);
+                }
+                catch (CosmosException ex) when (ex.StatusCode == HttpStatusCode.NotFound)
+                {
+                    // already gone
+                }
+            }
+
+            return ids.Count;
         }
 
         throw new NotSupportedException($"Unsupported non-query statement: {CommandText}");
@@ -386,9 +420,9 @@ public sealed class CosmosDbCommand : DbCommand
 
     private static string? ExtractWhere(string sql)
     {
-        var m = Regex.Match(sql, @"\bwhere\b(.*?)(?:\bgroup\s+by\b|\border\s+by\b|\blimit\b|\boffset\b|\)\s*as\b|$)",
+        var m = Regex.Match(sql, @"\bwhere\b(.*?)(?:\bgroup\s+by\b|\border\s+by\b|\blimit\b|\boffset\b|\)\s*as\b|;|$)",
             RegexOptions.IgnoreCase | RegexOptions.Singleline);
-        return m.Success ? m.Groups[1].Value.Trim() : null;
+        return m.Success ? m.Groups[1].Value.Trim().TrimEnd(';').Trim() : null;
     }
 
     private static int? ExtractLimit(string sql)
@@ -554,14 +588,6 @@ public sealed class CosmosDbCommand : DbCommand
 
         value = null;
         return false;
-    }
-
-    private void SetIfPresent(JObject item, string name)
-    {
-        if (TryParam(name, out var value))
-        {
-            item[name] = ToToken(value);
-        }
     }
 
     private static bool StartsWith(string sql, string keyword)
