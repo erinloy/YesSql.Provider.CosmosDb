@@ -310,6 +310,7 @@ public sealed class CosmosDbCommand : DbCommand
         if (!string.IsNullOrWhiteSpace(where))
         {
             var stripped = StripDocTypePredicate(where!).Trim();
+            stripped = await ResolveSubqueriesAsync(stripped, cancellationToken);
             if (stripped.Length > 0)
             {
                 cosmosWhere = TranslateWhere(stripped);
@@ -414,6 +415,92 @@ public sealed class CosmosDbCommand : DbCommand
         }
 
         return new CosmosDbDataReader(DocumentColumns, rows);
+    }
+
+    // Resolve "[Col] [NOT] IN (SELECT [c] FROM [t] AS a [WHERE …])" by executing the inner query and
+    // substituting a literal IN list (Cosmos has no cross-partition correlated subqueries).
+    private async Task<string> ResolveSubqueriesAsync(string where, CancellationToken cancellationToken)
+    {
+        while (true)
+        {
+            var m = Regex.Match(where, @"((?:(?:\w+|\[[^\]]+\])\.)?\[[^\]]+\])\s+(not\s+)?in\s*\(\s*select\b",
+                RegexOptions.IgnoreCase);
+            if (!m.Success)
+            {
+                return where;
+            }
+
+            // Balanced scan for the subquery's closing paren.
+            var openIdx = where.IndexOf('(', m.Index);
+            int depth = 0, closeIdx = -1;
+            for (var i = openIdx; i < where.Length; i++)
+            {
+                if (where[i] == '(')
+                {
+                    depth++;
+                }
+                else if (where[i] == ')' && --depth == 0)
+                {
+                    closeIdx = i;
+                    break;
+                }
+            }
+
+            if (closeIdx < 0)
+            {
+                return where; // malformed; leave as-is
+            }
+
+            var subquery = where.Substring(openIdx + 1, closeIdx - openIdx - 1);
+            var sm = Regex.Match(subquery,
+                @"select\s+(?:(?:\w+|\[[^\]]+\])\.)?\[([^\]]+)\]\s+from\s+\[([^\]]+)\]\s+as\s+\w+(?:\s+where\s+(.*))?$",
+                RegexOptions.IgnoreCase | RegexOptions.Singleline);
+            if (!sm.Success)
+            {
+                return where;
+            }
+
+            var innerColumn = sm.Groups[1].Value;
+            var innerTable = sm.Groups[2].Value;
+            var innerWhere = sm.Groups[3].Success ? sm.Groups[3].Value.Trim() : null;
+
+            var innerCosmosWhere = string.IsNullOrWhiteSpace(innerWhere) ? string.Empty : " AND " + TranslateWhere(innerWhere!);
+            var queryDef = new QueryDefinition($"SELECT VALUE c[\"{innerColumn}\"] FROM c WHERE c.pk = @__itbl" + innerCosmosWhere)
+                .WithParameter("@__itbl", innerTable);
+            foreach (DbParameter p in _parameters)
+            {
+                queryDef = queryDef.WithParameter("@" + p.ParameterName.TrimStart('@'), p.Value is DBNull ? null : p.Value);
+            }
+
+            var literals = new List<string>();
+            using (var iterator = CosmosContainer.GetItemQueryIterator<JToken>(queryDef,
+                requestOptions: new QueryRequestOptions { PartitionKey = new PartitionKey(innerTable) }))
+            {
+                while (iterator.HasMoreResults)
+                {
+                    foreach (var v in await iterator.ReadNextAsync(cancellationToken))
+                    {
+                        literals.Add(ToLiteral(v));
+                    }
+                }
+            }
+
+            var list = literals.Count > 0 ? string.Join(", ", literals) : "null";
+            var replacement = $"{m.Groups[1].Value} {(m.Groups[2].Success ? "NOT " : string.Empty)}IN ({list})";
+            where = where[..m.Index] + replacement + where[(closeIdx + 1)..];
+        }
+    }
+
+    private static string ToLiteral(JToken? token)
+    {
+        if (token is null || token.Type == JTokenType.Null)
+        {
+            return "null";
+        }
+
+        return token.Type == JTokenType.String
+            ? "'" + token.ToString().Replace("'", "\\'") + "'"
+            : token.ToString();
     }
 
     private static bool IsDocumentTable(string table) => table.EndsWith("Document", StringComparison.OrdinalIgnoreCase);
