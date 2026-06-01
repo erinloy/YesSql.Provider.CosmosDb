@@ -1,0 +1,24 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFrameworks>net8.0;net10.0</TargetFrameworks>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <LangVersion>latest</LangVersion>
+  </PropertyGroup>
+
+  <PropertyGroup Label="Package">
+    <PackageId>YesSql.Provider.CosmosDb</PackageId>
+    <Description>Azure Cosmos DB (NoSQL API) storage provider for YesSql.</Description>
+    <Authors>Ziltch</Authors>
+    <PackageTags>yessql;cosmosdb;azure;nosql;document-database;orchardcore</PackageTags>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Azure.Cosmos" Version="3.60.0" />
+    <PackageReference Include="Newtonsoft.Json" Version="13.0.4" />
+    <PackageReference Include="YesSql" Version="5.4.7" />
+  </ItemGroup>
+
+</Project>

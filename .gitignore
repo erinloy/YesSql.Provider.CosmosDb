@@ -1,0 +1,22 @@
+## .NET build artifacts
+bin/
+obj/
+[Bb]uild[Ll]og.*
+*.user
+*.suo
+.vs/
+
+## Test results
+[Tt]est[Rr]esults/
+*.trx
+*.coverage
+coverage/
+
+## Rider / VS Code
+.idea/
+.vscode/
+
+## Local env / secrets
+*.env
+appsettings.*.local.json
+secrets.json

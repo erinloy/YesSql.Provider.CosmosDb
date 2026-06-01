@@ -1,0 +1,8 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/YesSql.Provider.CosmosDb/YesSql.Provider.CosmosDb.csproj" />
+  </Folder>
+  <Folder Name="/test/">
+    <Project Path="test/YesSql.Provider.CosmosDb.Tests/YesSql.Provider.CosmosDb.Tests.csproj" />
+  </Folder>
+</Solution>
