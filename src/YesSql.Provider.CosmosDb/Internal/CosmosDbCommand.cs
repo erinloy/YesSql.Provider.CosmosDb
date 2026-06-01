@@ -61,15 +61,27 @@ public sealed class CosmosDbCommand : DbCommand
         {
             var table = ExtractTable(sql);
             var id = Convert.ToInt64(Param("Id"));
-            var item = new JObject
+
+            // UPDATE only carries the columns in its SET clause (Content/Version), so read the existing
+            // item and patch the provided fields; INSERT carries all of them.
+            JObject? item = null;
+            if (StartsWith(sql, "update"))
             {
-                ["id"] = $"{table}:{id}",
-                ["pk"] = table,
-                ["Id"] = id,
-                ["Type"] = ToToken(Param("Type")),
-                ["Content"] = ToToken(Param("Content")),
-                ["Version"] = ToToken(Param("Version")),
-            };
+                try
+                {
+                    item = (await CosmosContainer.ReadItemAsync<JObject>($"{table}:{id}", new PartitionKey(table), cancellationToken: cancellationToken)).Resource;
+                }
+                catch (CosmosException ex) when (ex.StatusCode == HttpStatusCode.NotFound)
+                {
+                    // fall through to a fresh item
+                }
+            }
+
+            item ??= new JObject { ["id"] = $"{table}:{id}", ["pk"] = table, ["Id"] = id };
+
+            SetIfPresent(item, "Type");
+            SetIfPresent(item, "Content");
+            SetIfPresent(item, "Version");
 
             await CosmosContainer.UpsertItemAsync(item, new PartitionKey(table), cancellationToken: cancellationToken);
             return 1;
@@ -203,7 +215,9 @@ public sealed class CosmosDbCommand : DbCommand
 
         // WHERE predicate over index columns → Cosmos predicate (alias.[Col] → c["Col"]).
         var cosmosWhere = string.Empty;
-        var whereMatch = Regex.Match(sql, @"\bwhere\b(.*?)(?:\border\s+by\b|\blimit\b|\boffset\b|$)",
+        // Stop the WHERE capture at the next clause boundary. ListAsync wraps the index lookup in a
+        // "(… GROUP BY [Document].[Id]) AS IndexQuery" subquery, so GROUP BY / ")" must terminate it.
+        var whereMatch = Regex.Match(sql, @"\bwhere\b(.*?)(?:\bgroup\s+by\b|\border\s+by\b|\blimit\b|\boffset\b|\)\s*as\b|$)",
             RegexOptions.IgnoreCase | RegexOptions.Singleline);
         if (whereMatch.Success)
         {
@@ -226,16 +240,24 @@ public sealed class CosmosDbCommand : DbCommand
         }
 
         var documentIds = new System.Collections.Generic.List<long>();
-        using (var iterator = CosmosContainer.GetItemQueryIterator<long>(queryDef,
-            requestOptions: new QueryRequestOptions { PartitionKey = new PartitionKey(indexTable) }))
+        try
         {
+            using var iterator = CosmosContainer.GetItemQueryIterator<long>(queryDef,
+                requestOptions: new QueryRequestOptions { PartitionKey = new PartitionKey(indexTable) });
             while (iterator.HasMoreResults)
             {
                 foreach (var docId in await iterator.ReadNextAsync(cancellationToken))
                 {
-                    documentIds.Add(docId);
+                    if (!documentIds.Contains(docId))
+                    {
+                        documentIds.Add(docId);
+                    }
                 }
             }
+        }
+        catch (CosmosException ex)
+        {
+            throw new NotSupportedException($"IDXQ_FAIL cosmos=[{queryText}] orig=[{CommandText}]: {ex.Message}", ex);
         }
 
         // Step 2: point-read documents
@@ -289,17 +311,29 @@ public sealed class CosmosDbCommand : DbCommand
     private static JToken ToToken(object? value) => value is null ? JValue.CreateNull() : JToken.FromObject(value);
 
     private object? Param(string name)
+        => TryParam(name, out var value) ? value : throw new InvalidOperationException($"Parameter '{name}' not found for: {CommandText}");
+
+    private bool TryParam(string name, out object? value)
     {
         foreach (DbParameter p in _parameters)
         {
-            var n = p.ParameterName.TrimStart('@');
-            if (string.Equals(n, name, StringComparison.OrdinalIgnoreCase))
+            if (string.Equals(p.ParameterName.TrimStart('@'), name, StringComparison.OrdinalIgnoreCase))
             {
-                return p.Value is DBNull ? null : p.Value;
+                value = p.Value is DBNull ? null : p.Value;
+                return true;
             }
         }
 
-        throw new InvalidOperationException($"Parameter '{name}' not found for: {CommandText}");
+        value = null;
+        return false;
+    }
+
+    private void SetIfPresent(JObject item, string name)
+    {
+        if (TryParam(name, out var value))
+        {
+            item[name] = ToToken(value);
+        }
     }
 
     private static bool StartsWith(string sql, string keyword)
