@@ -116,6 +116,14 @@ public sealed class CosmosDbCommand : DbCommand
             return await MaxIdAsync(table, cancellationToken);
         }
 
+        // CountAsync over an index join: SELECT count(distinct [Document].[Id]) FROM [Document] INNER
+        // JOIN [Index] … WHERE … → count the matching DocumentIds.
+        if (Regex.IsMatch(sql, @"count\s*\(", RegexOptions.IgnoreCase) && Regex.IsMatch(sql, @"\bjoin\b", RegexOptions.IgnoreCase))
+        {
+            var ids = await GatherDocumentIdsAsync(sql, cancellationToken);
+            return ids.Count;
+        }
+
         // Map-index write: insert into [<index>] ([Col]…) values (@Col…) — executed as scalar to
         // return the new index row Id. Cosmos has no auto-increment, so we allocate Id = MAX+1 and
         // store every parameter as a field on the index item.
@@ -198,10 +206,12 @@ public sealed class CosmosDbCommand : DbCommand
 
     // ---- helpers ----
 
-    private async Task<DbDataReader> ExecuteIndexJoinQueryAsync(string sql, CancellationToken cancellationToken)
+    // Parse an index-joined query and run the index lookup, returning distinct DocumentIds (ordered if
+    // the query has an ORDER BY). Shared by the reader (then point-reads) and CountAsync.
+    private async Task<System.Collections.Generic.List<long>> GatherDocumentIdsAsync(string sql, CancellationToken cancellationToken)
     {
         var join = Regex.Match(sql,
-            @"join\s+\[([^\]]+)\]\s+as\s+(\w+)\s+on\s+\w+\.\[DocumentId\]\s*=\s*\[([^\]]+)\]\.\[Id\]",
+            @"join\s+\[([^\]]+)\]\s+as\s+(\w+)\s+on\s+\w+\.\[DocumentId\]\s*=\s*\[[^\]]+\]\.\[Id\]",
             RegexOptions.IgnoreCase);
 
         if (!join.Success)
@@ -211,28 +221,20 @@ public sealed class CosmosDbCommand : DbCommand
 
         var indexTable = join.Groups[1].Value;
         var alias = join.Groups[2].Value;
-        var documentTable = join.Groups[3].Value;
 
-        // WHERE predicate over index columns → Cosmos predicate (alias.[Col] → c["Col"]).
+        // WHERE predicate over index columns → Cosmos predicate (alias.[Col] → c["Col"]). Stop at the
+        // next clause boundary (ListAsync wraps the lookup in "(… GROUP BY …) AS IndexQuery").
         var cosmosWhere = string.Empty;
-        // Stop the WHERE capture at the next clause boundary. ListAsync wraps the index lookup in a
-        // "(… GROUP BY [Document].[Id]) AS IndexQuery" subquery, so GROUP BY / ")" must terminate it.
         var whereMatch = Regex.Match(sql, @"\bwhere\b(.*?)(?:\bgroup\s+by\b|\border\s+by\b|\blimit\b|\boffset\b|\)\s*as\b|$)",
             RegexOptions.IgnoreCase | RegexOptions.Singleline);
         if (whereMatch.Success)
         {
-            var where = whereMatch.Groups[1].Value.Trim();
-            // alias.[Col] → c["Col"]. (Index WHERE clauses only reference the index alias columns.)
-            where = Regex.Replace(where, Regex.Escape(alias) + @"\.\[([^\]]+)\]", "c[\"$1\"]");
-            cosmosWhere = where;
+            cosmosWhere = Regex.Replace(whereMatch.Groups[1].Value.Trim(), Regex.Escape(alias) + @"\.\[([^\]]+)\]", "c[\"$1\"]");
         }
 
-        var limitMatch = Regex.Match(sql, @"\blimit\s+(\d+)", RegexOptions.IgnoreCase);
-        int? limit = limitMatch.Success ? int.Parse(limitMatch.Groups[1].Value) : null;
-
-        // Step 1: index → DocumentIds
         var queryText = "SELECT VALUE c.DocumentId FROM c WHERE c.pk = @pk"
-            + (cosmosWhere.Length > 0 ? " AND " + cosmosWhere : string.Empty);
+            + (cosmosWhere.Length > 0 ? " AND " + cosmosWhere : string.Empty)
+            + BuildOrderClause(sql);
         var queryDef = new QueryDefinition(queryText).WithParameter("@pk", indexTable);
         foreach (DbParameter p in _parameters)
         {
@@ -260,7 +262,55 @@ public sealed class CosmosDbCommand : DbCommand
             throw new NotSupportedException($"IDXQ_FAIL cosmos=[{queryText}] orig=[{CommandText}]: {ex.Message}", ex);
         }
 
-        // Step 2: point-read documents
+        return documentIds;
+    }
+
+    // Translate the SQL ORDER BY (which aggregates index columns as "MAX(a.[Col]) AS order_N" under the
+    // GROUP BY) into a Cosmos "ORDER BY c["Col"] [DESC]" clause.
+    private static string BuildOrderClause(string sql)
+    {
+        var aliasToColumn = new System.Collections.Generic.Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        foreach (Match m in Regex.Matches(sql, @"\(\s*\w+\.\[([^\]]+)\]\s*\)\s+as\s+(order_\d+)", RegexOptions.IgnoreCase))
+        {
+            aliasToColumn[m.Groups[2].Value] = m.Groups[1].Value;
+        }
+
+        if (aliasToColumn.Count == 0)
+        {
+            return string.Empty;
+        }
+
+        var orderBys = Regex.Matches(sql, @"order\s+by\s+(.+?)(?:\boffset\b|\)|$)", RegexOptions.IgnoreCase | RegexOptions.Singleline);
+        if (orderBys.Count == 0)
+        {
+            return string.Empty;
+        }
+
+        var terms = new System.Collections.Generic.List<string>();
+        foreach (var raw in orderBys[orderBys.Count - 1].Groups[1].Value.Split(','))
+        {
+            var parts = raw.Trim().Split(' ', StringSplitOptions.RemoveEmptyEntries);
+            if (parts.Length > 0 && aliasToColumn.TryGetValue(parts[0], out var col))
+            {
+                var desc = parts.Length > 1 && parts[1].Equals("DESC", StringComparison.OrdinalIgnoreCase);
+                terms.Add($"c[\"{col}\"]" + (desc ? " DESC" : string.Empty));
+            }
+        }
+
+        return terms.Count > 0 ? " ORDER BY " + string.Join(", ", terms) : string.Empty;
+    }
+
+    private async Task<DbDataReader> ExecuteIndexJoinQueryAsync(string sql, CancellationToken cancellationToken)
+    {
+        var documentTable = Regex.Match(sql,
+            @"join\s+\[[^\]]+\]\s+as\s+\w+\s+on\s+\w+\.\[DocumentId\]\s*=\s*\[([^\]]+)\]\.\[Id\]",
+            RegexOptions.IgnoreCase).Groups[1].Value;
+
+        var documentIds = await GatherDocumentIdsAsync(sql, cancellationToken);
+
+        var limitMatch = Regex.Match(sql, @"\blimit\s+(\d+)", RegexOptions.IgnoreCase);
+        int? limit = limitMatch.Success ? int.Parse(limitMatch.Groups[1].Value) : null;
+
         var rows = new System.Collections.Generic.List<object?[]>();
         foreach (var docId in documentIds)
         {
