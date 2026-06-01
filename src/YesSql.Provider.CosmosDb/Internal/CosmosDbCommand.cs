@@ -386,31 +386,48 @@ public sealed class CosmosDbCommand : DbCommand
     // GROUP BY) into a Cosmos "ORDER BY c["Col"] [DESC]" clause.
     private static string BuildOrderClause(string sql)
     {
-        var aliasToColumn = new System.Collections.Generic.Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-        foreach (Match m in Regex.Matches(sql, @"\(\s*\w+\.\[([^\]]+)\]\s*\)\s+as\s+(order_\d+)", RegexOptions.IgnoreCase))
-        {
-            aliasToColumn[m.Groups[2].Value] = m.Groups[1].Value;
-        }
-
-        if (aliasToColumn.Count == 0)
-        {
-            return string.Empty;
-        }
-
         var orderBys = Regex.Matches(sql, @"order\s+by\s+(.+?)(?:\boffset\b|\)|$)", RegexOptions.IgnoreCase | RegexOptions.Singleline);
         if (orderBys.Count == 0)
         {
             return string.Empty;
         }
 
+        // GROUP BY form aggregates the order column as "MAX(a.[Col]) AS order_N"; map alias → column.
+        var aliasToColumn = new System.Collections.Generic.Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        foreach (Match m in Regex.Matches(sql, @"\(\s*\w+\.\[([^\]]+)\]\s*\)\s+as\s+(order_\d+)", RegexOptions.IgnoreCase))
+        {
+            aliasToColumn[m.Groups[2].Value] = m.Groups[1].Value;
+        }
+
         var terms = new System.Collections.Generic.List<string>();
         foreach (var raw in orderBys[orderBys.Count - 1].Groups[1].Value.Split(','))
         {
-            var parts = raw.Trim().Split(' ', StringSplitOptions.RemoveEmptyEntries);
-            if (parts.Length > 0 && aliasToColumn.TryGetValue(parts[0], out var col))
+            var term = raw.Trim();
+            if (term.Length == 0)
             {
-                var desc = parts.Length > 1 && parts[1].Equals("DESC", StringComparison.OrdinalIgnoreCase);
-                terms.Add($"c[\"{col}\"]" + (desc ? " DESC" : string.Empty));
+                continue;
+            }
+
+            var desc = Regex.IsMatch(term, @"\bdesc\b", RegexOptions.IgnoreCase);
+            var expr = Regex.Replace(term, @"\s+(asc|desc)\b", string.Empty, RegexOptions.IgnoreCase).Trim();
+
+            string? column = null;
+            if (aliasToColumn.TryGetValue(expr, out var mapped))
+            {
+                column = mapped;       // aggregate alias (order_N)
+            }
+            else
+            {
+                var col = Regex.Match(expr, @"\[([^\]]+)\]");   // direct column ref: alias.[Col] or [Col]
+                if (col.Success)
+                {
+                    column = col.Groups[1].Value;
+                }
+            }
+
+            if (column != null)
+            {
+                terms.Add($"c[\"{column}\"]" + (desc ? " DESC" : string.Empty));
             }
         }
 
