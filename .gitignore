@@ -20,3 +20,6 @@ coverage/
 *.env
 appsettings.*.local.json
 secrets.json
+
+## Orchard sample runtime data
+**/App_Data/

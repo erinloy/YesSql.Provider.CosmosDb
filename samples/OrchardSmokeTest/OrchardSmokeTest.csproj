@@ -1,0 +1,19 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <!-- OrchardCore 2.2.1 depends on YesSql 5.4.6; pin to 5.4.7 to match the provider's translator. -->
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="OrchardCore.Application.Cms.Core.Targets" Version="2.2.1" />
+    <PackageReference Include="YesSql" Version="5.4.7" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\YesSql.Provider.CosmosDb\YesSql.Provider.CosmosDb.csproj" />
+  </ItemGroup>
+
+</Project>

@@ -4,13 +4,14 @@ An [Azure Cosmos DB](https://learn.microsoft.com/azure/cosmos-db/) (NoSQL API) s
 [YesSql](https://github.com/sebastienros/yessql) — the document-database layer used by
 [Orchard Core](https://orchardcore.net/).
 
-> **Status: ~90% of YesSql's own conformance suite passing (224/249); covers all the operations
-> Orchard Core's data layer performs.** Document CRUD, map + reduce indexes (with full lifecycle),
-> single- and multi-index queries, ordering, paging, counts, and `IN`-subqueries work end-to-end
-> against the Cosmos emulator. The remaining failures are non-Orchard operations or bounded by Cosmos
-> (transaction rollback / cross-partition ACID). See [`docs/CONFORMANCE.md`](docs/CONFORMANCE.md) for
-> the matrix and Orchard-readiness assessment, and [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for
-> how it works.
+> **Status: Orchard Core boots and runs on this provider** (validated — see
+> [`docs/ORCHARD-INTEGRATION.md`](docs/ORCHARD-INTEGRATION.md) and `samples/OrchardSmokeTest`), and
+> **~90% of YesSql's own conformance suite passes (224/249)**. Document CRUD, map + reduce indexes
+> (full lifecycle), single- and multi-index queries, ordering, paging, counts, and `IN`-subqueries work
+> end-to-end against the Cosmos emulator. The remaining conformance gaps are non-Orchard operations or
+> bounded by Cosmos (transaction rollback / cross-partition ACID). See
+> [`docs/CONFORMANCE.md`](docs/CONFORMANCE.md) for the matrix and
+> [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for how it works.
 
 ## Why
 

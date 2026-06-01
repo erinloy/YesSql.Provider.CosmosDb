@@ -1,5 +1,28 @@
 # Running Orchard Core on this provider
 
+> ## ✅ VALIDATED — Orchard Core boots and runs on this provider
+> `samples/OrchardSmokeTest` is a minimal Orchard Core CMS host (OrchardCore 2.2.1, net8, YesSql 5.4.7)
+> configured with the Cosmos `IStore` override + AutoSetup. On launch against the Cosmos emulator it
+> **provisioned a full tenant via the setup recipe with zero errors**, then served the site
+> (`<title>Cosmos Smoke Test</title>`, admin login HTTP 200). The Cosmos `orchard_smoke` database held
+> 20 items spanning the whole data layer — `Document`s, map indexes (`UserIndex`,
+> `OpenId_OpenIdScopeIndex`), a **reduce index + bridge** (`UserByRoleNameIndex` +
+> `UserByRoleNameIndex_Document`), and the provider's `__seq` id counters. **No `OrchardCore.db`
+> sqlite file was created** — the `Sqlite` provider label only satisfies setup validation; all data
+> went to Cosmos.
+>
+> ### What made it work (3 things)
+> 1. `OrchardCore_AutoSetup` config must be nested **under `"OrchardCore"`** in appsettings.json (the
+>    shell config is rooted there) — at the JSON root it is silently ignored.
+> 2. Enable the feature on the setup shell: `.AddOrchardCms().AddSetupFeatures("OrchardCore.AutoSetup")`.
+> 3. Override the per-tenant `IStore` (registered last → wins) to call `UseCosmosDb`, declaring
+>    `DatabaseProvider: "Sqlite"` in AutoSetup only so the connection validator passes.
+>
+> See `samples/OrchardSmokeTest/Program.cs` + `appsettings.json` for the working configuration.
+> (Caveat unchanged: request-scoped rollback on error is not supported — Cosmos has no cross-partition ACID.)
+
+---
+
 Based on reading Orchard Core's source (`OrchardCore.Data.YesSql` / `OrchardCore.Data.Abstractions`,
 cloned to `Z:\SOURCE\REFERENCE\libraries\orchardcore`).
 
