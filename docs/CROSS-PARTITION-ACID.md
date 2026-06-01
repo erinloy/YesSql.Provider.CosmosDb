@@ -1,5 +1,22 @@
 # Cross-partition ACID on Cosmos — deep investigation
 
+> ## ✅ IMPLEMENTED — `PartitionStrategy.PerStore` with atomic rollback
+> `CosmosDbOptions.PartitionStrategy` selects **PerTable** (default, scalable, no cross-table rollback)
+> or **PerStore** (single logical partition `PartitionScope` → atomic unit-of-work rollback). In PerStore
+> every write records its inverse in a per-transaction undo log; on rollback the unit of work is reverted
+> **atomically via a Cosmos transactional batch** within the one partition. Writes stay eager so YesSql's
+> autoflush read-your-writes is preserved; commit just discards the log.
+> - **Validated:** PerStore passes **226/249** conformance (vs 224 PerTable — the autoflush/transaction
+>   *rollback* tests now pass), plus 2 dedicated rollback tests (uncommitted work reverts, committed
+>   persists). The remaining transaction gaps are *optimistic concurrency* (ETag version checks), not
+>   rollback.
+> - **Caps (per store):** 20 GB / 10,000 RU/s, and ≤ 100 ops per rollback batch (chunked beyond that,
+>   with a per-item best-effort fallback). Non-binding for typical Orchard tenants.
+> - See `Internal/CosmosDbTransaction.cs` (undo log + batch) and `CosmosDbOptions.PartitionStrategy`.
+
+---
+
+
 ## The constraint (verified against Microsoft docs)
 
 Azure Cosmos DB has **no cross-partition transactions, by design** — atomically updating two partitions
