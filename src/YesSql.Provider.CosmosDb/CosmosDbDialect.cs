@@ -19,6 +19,9 @@ public sealed class CosmosDbDialect : BaseDialect
 
     public override string Name => "CosmosDb";
 
+    // Execute commands individually (no SQL batch) so the shim sees one well-known statement at a time.
+    public override bool SupportsBatching => false;
+
     // Identity is produced by YesSql's IIdGenerator (block allocation), not by a DB identity column.
     // Cosmos has no auto-increment, so these DDL/identity fragments are unused by the shim.
     public override string IdentityColumnString => "";

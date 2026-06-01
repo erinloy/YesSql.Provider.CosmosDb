@@ -46,7 +46,9 @@ public sealed class CosmosDbConnection : DbConnection
             return;
         }
 
-        _client ??= new CosmosClient(_options.AccountEndpoint, _options.AccountKey);
+        _client ??= _options.ClientOptions is null
+            ? new CosmosClient(_options.AccountEndpoint, _options.AccountKey)
+            : new CosmosClient(_options.AccountEndpoint, _options.AccountKey, _options.ClientOptions);
 
         if (_options.CreateIfNotExists)
         {

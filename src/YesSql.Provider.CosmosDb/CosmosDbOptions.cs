@@ -1,3 +1,5 @@
+using Microsoft.Azure.Cosmos;
+
 namespace YesSql.Provider.CosmosDb;
 
 /// <summary>
@@ -28,4 +30,10 @@ public sealed class CosmosDbOptions
 
     /// <summary>When true (default), the database/container are created on first connect if absent.</summary>
     public bool CreateIfNotExists { get; init; } = true;
+
+    /// <summary>
+    /// Optional Cosmos SDK client options. Needed for the local emulator (Gateway mode + accept the
+    /// self-signed certificate). Left null for normal accounts.
+    /// </summary>
+    public CosmosClientOptions? ClientOptions { get; init; }
 }
