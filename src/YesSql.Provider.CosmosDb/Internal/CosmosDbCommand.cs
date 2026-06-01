@@ -49,7 +49,7 @@ public sealed class CosmosDbCommand : DbCommand
 
     protected override DbParameter CreateDbParameter() => new CosmosDbParameter();
 
-    private Container Container => _connection.CosmosContainer;
+    private Container CosmosContainer => _connection.CosmosContainer;
 
     // ---- async (primary) path, used by Dapper via QueryAsync/ExecuteAsync ----
 
@@ -71,7 +71,7 @@ public sealed class CosmosDbCommand : DbCommand
                 ["Version"] = ToToken(Param("Version")),
             };
 
-            await Container.UpsertItemAsync(item, new PartitionKey(table), cancellationToken: cancellationToken);
+            await CosmosContainer.UpsertItemAsync(item, new PartitionKey(table), cancellationToken: cancellationToken);
             return 1;
         }
 
@@ -81,7 +81,7 @@ public sealed class CosmosDbCommand : DbCommand
             var id = Convert.ToInt64(Param("Id"));
             try
             {
-                await Container.DeleteItemAsync<JObject>($"{table}:{id}", new PartitionKey(table), cancellationToken: cancellationToken);
+                await CosmosContainer.DeleteItemAsync<JObject>($"{table}:{id}", new PartitionKey(table), cancellationToken: cancellationToken);
                 return 1;
             }
             catch (CosmosException ex) when (ex.StatusCode == HttpStatusCode.NotFound)
@@ -125,7 +125,7 @@ public sealed class CosmosDbCommand : DbCommand
                 item[name] = ToToken(p.Value is DBNull ? null : p.Value);
             }
 
-            await Container.UpsertItemAsync(item, new PartitionKey(table), cancellationToken: cancellationToken);
+            await CosmosContainer.UpsertItemAsync(item, new PartitionKey(table), cancellationToken: cancellationToken);
             return newId;
         }
 
@@ -162,7 +162,7 @@ public sealed class CosmosDbCommand : DbCommand
                 var id = Convert.ToInt64(p.Value);
                 try
                 {
-                    var resp = await Container.ReadItemAsync<JObject>($"{table}:{id}", new PartitionKey(table), cancellationToken: cancellationToken);
+                    var resp = await CosmosContainer.ReadItemAsync<JObject>($"{table}:{id}", new PartitionKey(table), cancellationToken: cancellationToken);
                     rows.Add(ToRow(resp.Resource));
                 }
                 catch (CosmosException ex) when (ex.StatusCode == HttpStatusCode.NotFound)
@@ -226,7 +226,7 @@ public sealed class CosmosDbCommand : DbCommand
         }
 
         var documentIds = new System.Collections.Generic.List<long>();
-        using (var iterator = Container.GetItemQueryIterator<long>(queryDef,
+        using (var iterator = CosmosContainer.GetItemQueryIterator<long>(queryDef,
             requestOptions: new QueryRequestOptions { PartitionKey = new PartitionKey(indexTable) }))
         {
             while (iterator.HasMoreResults)
@@ -249,7 +249,7 @@ public sealed class CosmosDbCommand : DbCommand
 
             try
             {
-                var resp = await Container.ReadItemAsync<JObject>($"{documentTable}:{docId}", new PartitionKey(documentTable), cancellationToken: cancellationToken);
+                var resp = await CosmosContainer.ReadItemAsync<JObject>($"{documentTable}:{docId}", new PartitionKey(documentTable), cancellationToken: cancellationToken);
                 rows.Add(ToRow(resp.Resource));
             }
             catch (CosmosException ex) when (ex.StatusCode == HttpStatusCode.NotFound)
@@ -264,7 +264,7 @@ public sealed class CosmosDbCommand : DbCommand
     private async Task<long?> MaxIdAsync(string table, CancellationToken cancellationToken)
     {
         var query = new QueryDefinition("SELECT VALUE MAX(c.Id) FROM c WHERE c.pk = @pk").WithParameter("@pk", table);
-        using var iterator = Container.GetItemQueryIterator<long?>(query,
+        using var iterator = CosmosContainer.GetItemQueryIterator<long?>(query,
             requestOptions: new QueryRequestOptions { PartitionKey = new PartitionKey(table) });
 
         while (iterator.HasMoreResults)
