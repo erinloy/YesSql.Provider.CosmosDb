@@ -1,6 +1,8 @@
 using System;
+using System.Collections.Generic;
 using System.Data;
 using System.Data.Common;
+using System.Linq;
 using System.Net;
 using System.Text.RegularExpressions;
 using System.Threading;
@@ -124,6 +126,34 @@ public sealed class CosmosDbCommand : DbCommand
             return ids.Count;
         }
 
+        // CountAsync without a join: SELECT count(*) FROM [<table>] [WHERE <predicate>] — count items in
+        // that partition (documents by Type, or index rows).
+        if (Regex.IsMatch(sql, @"count\s*\(", RegexOptions.IgnoreCase))
+        {
+            var table = ExtractTableAfter(sql, "from");
+            var where = ExtractWhere(sql);
+            var cosmosWhere = string.IsNullOrWhiteSpace(where) ? string.Empty : " AND " + TranslateWhere(where!);
+
+            var queryDef = new QueryDefinition("SELECT VALUE COUNT(1) FROM c WHERE c.pk = @pk" + cosmosWhere)
+                .WithParameter("@pk", table);
+            foreach (DbParameter p in _parameters)
+            {
+                queryDef = queryDef.WithParameter("@" + p.ParameterName.TrimStart('@'), p.Value is DBNull ? null : p.Value);
+            }
+
+            using var iterator = CosmosContainer.GetItemQueryIterator<long>(queryDef,
+                requestOptions: new QueryRequestOptions { PartitionKey = new PartitionKey(table) });
+            while (iterator.HasMoreResults)
+            {
+                foreach (var n in await iterator.ReadNextAsync(cancellationToken))
+                {
+                    return n;
+                }
+            }
+
+            return 0L;
+        }
+
         // Map-index write: insert into [<index>] ([Col]…) values (@Col…) — executed as scalar to
         // return the new index row Id. Cosmos has no auto-increment, so we allocate Id = MAX+1 and
         // store every parameter as a field on the index item.
@@ -156,42 +186,58 @@ public sealed class CosmosDbCommand : DbCommand
     {
         var sql = CommandText;
 
-        // Index-joined query: SELECT [Document].* FROM [Document] INNER JOIN [Index] AS a ON
-        // a.[DocumentId] = [Document].[Id] WHERE (<predicate on a.[Col]>) [LIMIT n].
-        // Translated in two steps: query the index for matching DocumentIds, then point-read documents.
-        if (Regex.IsMatch(sql, @"\bjoin\b", RegexOptions.IgnoreCase))
+        // An index join ("JOIN [index] AS a ON a.[DocumentId] = …") — whether flat (FirstOrDefault) or
+        // wrapped in a "(SELECT … GROUP BY …)" dedup subquery (ListAsync) — is an index query.
+        if (Regex.IsMatch(sql, @"join\s+\[[^\]]+\]\s+as\s+\w+\s+on\s+\w+\.\[DocumentId\]", RegexOptions.IgnoreCase))
         {
             return await ExecuteIndexJoinQueryAsync(sql, cancellationToken);
         }
 
-        // Document load by id(s): select * from [<table>] where [Id] = @Id  (single)
-        // or  ... where [Id] in (@Ids1, @Ids2, …)  (Dapper-expanded list). In both shapes the only
-        // parameters are id values, so we gather them and point-read each item.
-        if (StartsWith(sql.TrimStart(), "select") && Regex.IsMatch(sql, @"\[id\]", RegexOptions.IgnoreCase))
+        // A join onto a "(SELECT … )" subquery with no index inside is the document-by-type form of
+        // Query<T>().ListAsync().
+        if (Regex.IsMatch(sql, @"\bjoin\b", RegexOptions.IgnoreCase))
+        {
+            return await QueryDocumentsAsync(sql, cancellationToken);
+        }
+
+        if (StartsWith(sql.TrimStart(), "select"))
         {
             var table = ExtractTableAfter(sql, "from");
-            var rows = new System.Collections.Generic.List<object?[]>();
 
-            foreach (DbParameter p in _parameters)
+            if (IsDocumentTable(table))
             {
-                if (p.Value is null or DBNull)
+                // Load by id(s): WHERE [Id] = @Id / IN (…) — the only params are ids; point-read each.
+                if (Regex.IsMatch(sql, @"\[id\]\s*(=|in\b)", RegexOptions.IgnoreCase))
                 {
-                    continue;
+                    var rows = new System.Collections.Generic.List<object?[]>();
+                    foreach (DbParameter p in _parameters)
+                    {
+                        if (p.Value is null or DBNull)
+                        {
+                            continue;
+                        }
+
+                        var id = Convert.ToInt64(p.Value);
+                        try
+                        {
+                            var resp = await CosmosContainer.ReadItemAsync<JObject>($"{table}:{id}", new PartitionKey(table), cancellationToken: cancellationToken);
+                            rows.Add(ToRow(resp.Resource));
+                        }
+                        catch (CosmosException ex) when (ex.StatusCode == HttpStatusCode.NotFound)
+                        {
+                            // no row for this id
+                        }
+                    }
+
+                    return new CosmosDbDataReader(DocumentColumns, rows);
                 }
 
-                var id = Convert.ToInt64(p.Value);
-                try
-                {
-                    var resp = await CosmosContainer.ReadItemAsync<JObject>($"{table}:{id}", new PartitionKey(table), cancellationToken: cancellationToken);
-                    rows.Add(ToRow(resp.Resource));
-                }
-                catch (CosmosException ex) when (ex.StatusCode == HttpStatusCode.NotFound)
-                {
-                    // no row for this id
-                }
+                // Otherwise a document query: all documents in the partition, optionally filtered by Type.
+                return await QueryDocumentsAsync(sql, cancellationToken);
             }
 
-            return new CosmosDbDataReader(DocumentColumns, rows);
+            // Index-row query: SELECT * FROM [index] AS a [WHERE …] [LIMIT n] → return index items.
+            return await QueryIndexRowsAsync(sql, table, cancellationToken);
         }
 
         throw new NotSupportedException($"Unsupported query statement: {CommandText}");
@@ -222,14 +268,18 @@ public sealed class CosmosDbCommand : DbCommand
         var indexTable = join.Groups[1].Value;
         var alias = join.Groups[2].Value;
 
-        // WHERE predicate over index columns → Cosmos predicate (alias.[Col] → c["Col"]). Stop at the
-        // next clause boundary (ListAsync wraps the lookup in "(… GROUP BY …) AS IndexQuery").
+        // WHERE predicate over index columns → Cosmos predicate. Strip the document-Type predicate
+        // YesSql adds (it does not apply inside the index partition), then rewrite column refs.
+        _ = alias; // columns are rewritten generically by TranslateWhere
         var cosmosWhere = string.Empty;
-        var whereMatch = Regex.Match(sql, @"\bwhere\b(.*?)(?:\bgroup\s+by\b|\border\s+by\b|\blimit\b|\boffset\b|\)\s*as\b|$)",
-            RegexOptions.IgnoreCase | RegexOptions.Singleline);
-        if (whereMatch.Success)
+        var where = ExtractWhere(sql);
+        if (!string.IsNullOrWhiteSpace(where))
         {
-            cosmosWhere = Regex.Replace(whereMatch.Groups[1].Value.Trim(), Regex.Escape(alias) + @"\.\[([^\]]+)\]", "c[\"$1\"]");
+            var stripped = StripDocTypePredicate(where!).Trim();
+            if (stripped.Length > 0)
+            {
+                cosmosWhere = TranslateWhere(stripped);
+            }
         }
 
         var queryText = "SELECT VALUE c.DocumentId FROM c WHERE c.pk = @pk"
@@ -331,6 +381,119 @@ public sealed class CosmosDbCommand : DbCommand
         }
 
         return new CosmosDbDataReader(DocumentColumns, rows);
+    }
+
+    private static bool IsDocumentTable(string table) => table.EndsWith("Document", StringComparison.OrdinalIgnoreCase);
+
+    private static string? ExtractWhere(string sql)
+    {
+        var m = Regex.Match(sql, @"\bwhere\b(.*?)(?:\bgroup\s+by\b|\border\s+by\b|\blimit\b|\boffset\b|\)\s*as\b|$)",
+            RegexOptions.IgnoreCase | RegexOptions.Singleline);
+        return m.Success ? m.Groups[1].Value.Trim() : null;
+    }
+
+    private static int? ExtractLimit(string sql)
+    {
+        var m = Regex.Match(sql, @"\blimit\s+(\d+)", RegexOptions.IgnoreCase);
+        return m.Success ? int.Parse(m.Groups[1].Value) : (int?)null;
+    }
+
+    // Rewrite SQL column refs (alias.[Col], [table].[Col], or bare [Col]) → Cosmos c["Col"]. Single
+    // pass so an already-rewritten c["Col"] is not reprocessed.
+    private static string TranslateWhere(string where)
+        => Regex.Replace(where, @"(?:(?:\w+|\[[^\]]+\])\.)?\[([^\]]+)\]", "c[\"$1\"]");
+
+    // Remove the document-Type predicate ([Doc].[Type] = @p) YesSql adds to index joins.
+    private static string StripDocTypePredicate(string where)
+    {
+        where = Regex.Replace(where, @"\[[^\]]+\]\.\[Type\]\s*=\s*@\w+\s+and\s+", "", RegexOptions.IgnoreCase);
+        where = Regex.Replace(where, @"\s+and\s+\[[^\]]+\]\.\[Type\]\s*=\s*@\w+", "", RegexOptions.IgnoreCase);
+        where = Regex.Replace(where, @"^\s*\[[^\]]+\]\.\[Type\]\s*=\s*@\w+\s*$", "", RegexOptions.IgnoreCase);
+        return where;
+    }
+
+    // Query<T>() — all documents in the partition, optionally filtered by Type.
+    private async Task<DbDataReader> QueryDocumentsAsync(string sql, CancellationToken cancellationToken)
+    {
+        var docTable = ExtractTableAfter(sql, "from");
+        var hasType = TryParam("Type", out var typeVal);
+
+        var queryDef = new QueryDefinition("SELECT * FROM c WHERE c.pk = @pk" + (hasType ? " AND c.Type = @Type" : string.Empty) + BuildOrderClause(sql))
+            .WithParameter("@pk", docTable);
+        if (hasType)
+        {
+            queryDef = queryDef.WithParameter("@Type", typeVal);
+        }
+
+        var limit = ExtractLimit(sql);
+        var rows = new List<object?[]>();
+        using var iterator = CosmosContainer.GetItemQueryIterator<JObject>(queryDef,
+            requestOptions: new QueryRequestOptions { PartitionKey = new PartitionKey(docTable) });
+        while (iterator.HasMoreResults)
+        {
+            foreach (var item in await iterator.ReadNextAsync(cancellationToken))
+            {
+                if (limit.HasValue && rows.Count >= limit.Value)
+                {
+                    break;
+                }
+
+                rows.Add(ToRow(item));
+            }
+        }
+
+        return new CosmosDbDataReader(DocumentColumns, rows);
+    }
+
+    // Query<TIndex>() — return the index rows themselves (dynamic columns from the index fields).
+    private async Task<DbDataReader> QueryIndexRowsAsync(string sql, string indexTable, CancellationToken cancellationToken)
+    {
+        var where = ExtractWhere(sql);
+        var cosmosWhere = string.IsNullOrWhiteSpace(where) ? string.Empty : " AND " + TranslateWhere(where!);
+
+        var queryDef = new QueryDefinition("SELECT * FROM c WHERE c.pk = @pk" + cosmosWhere + BuildOrderClause(sql))
+            .WithParameter("@pk", indexTable);
+        foreach (DbParameter p in _parameters)
+        {
+            queryDef = queryDef.WithParameter("@" + p.ParameterName.TrimStart('@'), p.Value is DBNull ? null : p.Value);
+        }
+
+        var limit = ExtractLimit(sql);
+        var items = new List<JObject>();
+        using (var iterator = CosmosContainer.GetItemQueryIterator<JObject>(queryDef,
+            requestOptions: new QueryRequestOptions { PartitionKey = new PartitionKey(indexTable) }))
+        {
+            while (iterator.HasMoreResults)
+            {
+                foreach (var item in await iterator.ReadNextAsync(cancellationToken))
+                {
+                    if (limit.HasValue && items.Count >= limit.Value)
+                    {
+                        break;
+                    }
+
+                    items.Add(item);
+                }
+            }
+        }
+
+        var columns = new List<string>();
+        foreach (var item in items)
+        {
+            foreach (var prop in item.Properties())
+            {
+                if (!prop.Name.Equals("id", StringComparison.OrdinalIgnoreCase)
+                    && !prop.Name.Equals("pk", StringComparison.OrdinalIgnoreCase)
+                    && !columns.Contains(prop.Name))
+                {
+                    columns.Add(prop.Name);
+                }
+            }
+        }
+
+        var cols = columns.ToArray();
+        var rows = items.Select(i => cols.Select(c => (object?)i[c]?.ToObject<object>()).ToArray()).ToList();
+        return new CosmosDbDataReader(cols, rows);
     }
 
     private async Task<long?> MaxIdAsync(string table, CancellationToken cancellationToken)
