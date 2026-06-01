@@ -179,9 +179,20 @@ public sealed class CosmosDbCommand : DbCommand
         // JOIN [Index] … WHERE … → count the matching DocumentIds.
         if (Regex.IsMatch(sql, @"count\s*\(", RegexOptions.IgnoreCase) && Regex.IsMatch(sql, @"\bjoin\b", RegexOptions.IgnoreCase))
         {
-            var ids = Regex.IsMatch(sql, @"\bon\s+\w+\.\[Id\]\s*=\s*\w+\.\[\w+Id\]", RegexOptions.IgnoreCase)
-                ? await GatherReduceDocumentIdsAsync(sql, cancellationToken)
-                : await GatherDocumentIdsAsync(sql, cancellationToken);
+            List<long> ids;
+            if (Regex.IsMatch(sql, @"\bon\s+\w+\.\[Id\]\s*=\s*\w+\.\[\w+Id\]", RegexOptions.IgnoreCase))
+            {
+                ids = await GatherReduceDocumentIdsAsync(sql, cancellationToken);
+            }
+            else if (IndexJoinTables(sql).Distinct().Count() >= 2)
+            {
+                ids = await GatherMultiIndexDocumentIdsAsync(sql, cancellationToken);
+            }
+            else
+            {
+                ids = await GatherDocumentIdsAsync(sql, cancellationToken);
+            }
+
             return ids.Count;
         }
 
@@ -250,6 +261,14 @@ public sealed class CosmosDbCommand : DbCommand
         if (Regex.IsMatch(sql, @"\bon\s+\w+\.\[Id\]\s*=\s*\w+\.\[\w+Id\]", RegexOptions.IgnoreCase))
         {
             return await ExecuteReduceJoinQueryAsync(sql, cancellationToken);
+        }
+
+        // Multi-index join across DISTINCT index tables (.With<I1>().With<I2>()) — intersect each
+        // index's DocumentId set (INNER JOIN = AND). The same index joined repeatedly (scope / boolean
+        // queries) stays on the single-index path, where its combined WHERE translates correctly.
+        if (IndexJoinTables(sql).Distinct().Count() >= 2)
+        {
+            return await ExecuteMultiIndexJoinQueryAsync(sql, cancellationToken);
         }
 
         // An index join ("JOIN [index] AS a ON a.[DocumentId] = …") — whether flat (FirstOrDefault) or
@@ -681,6 +700,146 @@ public sealed class CosmosDbCommand : DbCommand
         var cols = columns.ToArray();
         var rows = items.Select(i => cols.Select(c => (object?)i[c]?.ToObject<object>()).ToArray()).ToList();
         return new CosmosDbDataReader(cols, rows);
+    }
+
+    private static List<(string Table, string Alias)> IndexJoins(string sql)
+        => Regex.Matches(sql, @"join\s+\[([^\]]+)\]\s+as\s+(\w+)\s+on\s+\w+\.\[DocumentId\]\s*=\s*\[[^\]]+\]\.\[Id\]", RegexOptions.IgnoreCase)
+            .Select(m => (m.Groups[1].Value, m.Groups[2].Value)).ToList();
+
+    private static IEnumerable<string> IndexJoinTables(string sql) => IndexJoins(sql).Select(j => j.Table);
+
+    // Strip redundant outer parentheses that wrap the whole expression: "((A) AND (B))" → "(A) AND (B)".
+    private static string UnwrapOuterParens(string s)
+    {
+        s = s.Trim();
+        while (s.Length >= 2 && s[0] == '(' && s[^1] == ')')
+        {
+            var depth = 0;
+            var wraps = true;
+            for (var i = 0; i < s.Length; i++)
+            {
+                if (s[i] == '(')
+                {
+                    depth++;
+                }
+                else if (s[i] == ')')
+                {
+                    depth--;
+                    if (depth == 0 && i < s.Length - 1)
+                    {
+                        wraps = false;
+                        break;
+                    }
+                }
+            }
+
+            if (!wraps)
+            {
+                break;
+            }
+
+            s = s[1..^1].Trim();
+        }
+
+        return s;
+    }
+
+    // Split a WHERE clause on top-level " AND " (respecting parentheses).
+    private static List<string> SplitTopLevelAnd(string where)
+    {
+        var parts = new List<string>();
+        int depth = 0, start = 0;
+        for (var i = 0; i < where.Length; i++)
+        {
+            if (where[i] == '(')
+            {
+                depth++;
+            }
+            else if (where[i] == ')')
+            {
+                depth--;
+            }
+            else if (depth == 0 && i + 5 <= where.Length && where.Substring(i, 5).Equals(" and ", StringComparison.OrdinalIgnoreCase))
+            {
+                parts.Add(where[start..i]);
+                i += 4;
+                start = i + 1;
+            }
+        }
+
+        parts.Add(where[start..]);
+        return parts.Select(p => p.Trim()).Where(p => p.Length > 0).ToList();
+    }
+
+    // Multi-index join across distinct index tables: query each index's DocumentId set (filtered by its
+    // own aliases' predicates) and intersect them.
+    private async Task<List<long>> GatherMultiIndexDocumentIdsAsync(string sql, CancellationToken cancellationToken)
+    {
+        var joins = IndexJoins(sql);
+        var where = ExtractWhere(sql);
+        var terms = string.IsNullOrWhiteSpace(where)
+            ? new List<string>()
+            : SplitTopLevelAnd(UnwrapOuterParens(StripDocTypePredicate(where!).Trim()));
+
+        List<long>? result = null;
+        foreach (var group in joins.GroupBy(j => j.Table))
+        {
+            var aliases = group.Select(j => j.Alias).ToList();
+            var tableTerms = terms.Where(t => aliases.Any(a => Regex.IsMatch(t, @"\b" + Regex.Escape(a) + @"\.", RegexOptions.IgnoreCase))).ToList();
+            var sub = tableTerms.Count > 0 ? " AND " + TranslateWhere(string.Join(" AND ", tableTerms)) : string.Empty;
+
+            var queryDef = new QueryDefinition("SELECT VALUE c.DocumentId FROM c WHERE c.pk = @pk" + sub).WithParameter("@pk", group.Key);
+            foreach (DbParameter p in _parameters)
+            {
+                queryDef = queryDef.WithParameter("@" + p.ParameterName.TrimStart('@'), p.Value is DBNull ? null : p.Value);
+            }
+
+            var ids = new HashSet<long>();
+            using (var iterator = CosmosContainer.GetItemQueryIterator<long>(queryDef,
+                requestOptions: new QueryRequestOptions { PartitionKey = new PartitionKey(group.Key) }))
+            {
+                while (iterator.HasMoreResults)
+                {
+                    foreach (var v in await iterator.ReadNextAsync(cancellationToken))
+                    {
+                        ids.Add(v);
+                    }
+                }
+            }
+
+            result = result is null ? ids.ToList() : result.Where(ids.Contains).ToList();
+        }
+
+        return (result ?? new List<long>()).Distinct().ToList();
+    }
+
+    private async Task<DbDataReader> ExecuteMultiIndexJoinQueryAsync(string sql, CancellationToken cancellationToken)
+    {
+        var documentTable = ExtractTableAfter(sql, "from");
+        var documentIds = await GatherMultiIndexDocumentIdsAsync(sql, cancellationToken);
+
+        IEnumerable<long> page = documentIds.Skip(ExtractOffset(sql));
+        var limit = ExtractLimit(sql);
+        if (limit.HasValue)
+        {
+            page = page.Take(limit.Value);
+        }
+
+        var rows = new List<object?[]>();
+        foreach (var docId in page)
+        {
+            try
+            {
+                var resp = await CosmosContainer.ReadItemAsync<JObject>($"{documentTable}:{docId}", new PartitionKey(documentTable), cancellationToken: cancellationToken);
+                rows.Add(ToRow(resp.Resource));
+            }
+            catch (CosmosException ex) when (ex.StatusCode == HttpStatusCode.NotFound)
+            {
+                // document missing
+            }
+        }
+
+        return new CosmosDbDataReader(DocumentColumns, rows);
     }
 
     // Reduce-index query: doc ← bridge → index. Resolve in three steps — matching index Ids, then the
