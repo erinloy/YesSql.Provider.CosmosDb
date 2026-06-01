@@ -650,8 +650,10 @@ public sealed class CosmosDbCommand : DbCommand
         {
             foreach (var prop in item.Properties())
             {
-                if (!prop.Name.Equals("id", StringComparison.OrdinalIgnoreCase)
-                    && !prop.Name.Equals("pk", StringComparison.OrdinalIgnoreCase)
+                // Exclude the Cosmos envelope fields by exact (ordinal) name — the lowercase system "id"
+                // and "pk" — while keeping the index's own numeric "Id" column.
+                if (!prop.Name.Equals("id", StringComparison.Ordinal)
+                    && !prop.Name.Equals("pk", StringComparison.Ordinal)
                     && !columns.Contains(prop.Name))
                 {
                     columns.Add(prop.Name);
