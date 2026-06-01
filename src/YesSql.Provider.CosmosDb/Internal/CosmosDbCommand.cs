@@ -62,6 +62,9 @@ public sealed class CosmosDbCommand : DbCommand
 
     private PartitionKey PartitionKeyFor(string table) => new(PkValue(table));
 
+    // The active unit of work's undo log (set by YesSql on the command), or null when untracked.
+    private CosmosDbTransaction? Undo => DbTransaction as CosmosDbTransaction;
+
     // WHERE fragment that scopes a query to one table's items (bind the named param to PkValue(table)).
     // In PerStore the single partition holds every table, so the __table discriminator is required.
     private string Scoped(string table, string pkParam = "@pk")
@@ -104,6 +107,7 @@ public sealed class CosmosDbCommand : DbCommand
             WithPartition(bridge, bridgeTable);
 
             await CosmosContainer.UpsertItemAsync(bridge, PartitionKeyFor(bridgeTable), cancellationToken: cancellationToken);
+            Undo?.Record(bridge["id"]!.ToString(), PkValue(bridgeTable), null);
             return 1;
         }
 
@@ -127,6 +131,9 @@ public sealed class CosmosDbCommand : DbCommand
                 }
             }
 
+            // Snapshot the prior state (for rollback) before patching; null ⇒ this is an insert.
+            var prior = item is null ? null : (JObject)item.DeepClone();
+
             item ??= new JObject { ["id"] = $"{table}:{id}", ["Id"] = id };
 
             // Patch every provided column (documents: Type/Content/Version; indexes: their own fields).
@@ -142,6 +149,7 @@ public sealed class CosmosDbCommand : DbCommand
 
             WithPartition(item, table);
             await CosmosContainer.UpsertItemAsync(item, PartitionKeyFor(table), cancellationToken: cancellationToken);
+            Undo?.Record($"{table}:{id}", PkValue(table), prior);
             return 1;
         }
 
@@ -153,13 +161,14 @@ public sealed class CosmosDbCommand : DbCommand
             var where = ExtractWhere(sql);
             var cosmosWhere = string.IsNullOrWhiteSpace(where) ? string.Empty : " AND " + TranslateWhere(where!);
 
-            var queryDef = new QueryDefinition("SELECT c.id FROM c WHERE " + Scoped(table) + cosmosWhere).WithParameter("@pk", PkValue(table));
+            // SELECT * (not just id) so the full items can be restored on rollback.
+            var queryDef = new QueryDefinition("SELECT * FROM c WHERE " + Scoped(table) + cosmosWhere).WithParameter("@pk", PkValue(table));
             foreach (DbParameter p in _parameters)
             {
                 queryDef = queryDef.WithParameter("@" + p.ParameterName.TrimStart('@'), p.Value is DBNull ? null : p.Value);
             }
 
-            var ids = new List<string>();
+            var items = new List<JObject>();
             using (var iterator = CosmosContainer.GetItemQueryIterator<JObject>(queryDef,
                 requestOptions: new QueryRequestOptions { PartitionKey = PartitionKeyFor(table) }))
             {
@@ -167,13 +176,15 @@ public sealed class CosmosDbCommand : DbCommand
                 {
                     foreach (var item in await iterator.ReadNextAsync(cancellationToken))
                     {
-                        ids.Add(item["id"]!.ToString());
+                        items.Add(item);
                     }
                 }
             }
 
-            foreach (var id in ids)
+            foreach (var item in items)
             {
+                var id = item["id"]!.ToString();
+                Undo?.Record(id, PkValue(table), item); // restore the deleted item on rollback
                 try
                 {
                     await CosmosContainer.DeleteItemAsync<JObject>(id, PartitionKeyFor(table), cancellationToken: cancellationToken);
@@ -184,7 +195,7 @@ public sealed class CosmosDbCommand : DbCommand
                 }
             }
 
-            return ids.Count;
+            return items.Count;
         }
 
         throw new NotSupportedException($"Unsupported non-query statement: {CommandText}");
@@ -272,6 +283,7 @@ public sealed class CosmosDbCommand : DbCommand
 
             WithPartition(item, table);
             await CosmosContainer.UpsertItemAsync(item, PartitionKeyFor(table), cancellationToken: cancellationToken);
+            Undo?.Record(item["id"]!.ToString(), PkValue(table), null);
             return newId;
         }
 
