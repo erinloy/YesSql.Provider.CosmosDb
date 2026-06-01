@@ -358,17 +358,16 @@ public sealed class CosmosDbCommand : DbCommand
 
         var documentIds = await GatherDocumentIdsAsync(sql, cancellationToken);
 
-        var limitMatch = Regex.Match(sql, @"\blimit\s+(\d+)", RegexOptions.IgnoreCase);
-        int? limit = limitMatch.Success ? int.Parse(limitMatch.Groups[1].Value) : null;
-
-        var rows = new System.Collections.Generic.List<object?[]>();
-        foreach (var docId in documentIds)
+        IEnumerable<long> page = documentIds.Skip(ExtractOffset(sql));
+        var limit = ExtractLimit(sql);
+        if (limit.HasValue)
         {
-            if (limit.HasValue && rows.Count >= limit.Value)
-            {
-                break;
-            }
+            page = page.Take(limit.Value);
+        }
 
+        var rows = new List<object?[]>();
+        foreach (var docId in page)
+        {
             try
             {
                 var resp = await CosmosContainer.ReadItemAsync<JObject>($"{documentTable}:{docId}", new PartitionKey(documentTable), cancellationToken: cancellationToken);
@@ -398,10 +397,21 @@ public sealed class CosmosDbCommand : DbCommand
         return m.Success ? int.Parse(m.Groups[1].Value) : (int?)null;
     }
 
-    // Rewrite SQL column refs (alias.[Col], [table].[Col], or bare [Col]) → Cosmos c["Col"]. Single
-    // pass so an already-rewritten c["Col"] is not reprocessed.
+    private static int ExtractOffset(string sql)
+    {
+        var m = Regex.Match(sql, @"\boffset\s+(\d+)", RegexOptions.IgnoreCase);
+        return m.Success ? int.Parse(m.Groups[1].Value) : 0;
+    }
+
+    // Rewrite SQL column refs (alias.[Col], [table].[Col], or bare [Col]) → Cosmos c["Col"] (single
+    // pass so an already-rewritten c["Col"] is not reprocessed), then map SQL null tests to Cosmos.
     private static string TranslateWhere(string where)
-        => Regex.Replace(where, @"(?:(?:\w+|\[[^\]]+\])\.)?\[([^\]]+)\]", "c[\"$1\"]");
+    {
+        where = Regex.Replace(where, @"(?:(?:\w+|\[[^\]]+\])\.)?\[([^\]]+)\]", "c[\"$1\"]");
+        where = Regex.Replace(where, @"(c\[""[^""]+""\])\s+is\s+not\s+null", "(IS_DEFINED($1) AND NOT IS_NULL($1))", RegexOptions.IgnoreCase);
+        where = Regex.Replace(where, @"(c\[""[^""]+""\])\s+is\s+null", "(NOT IS_DEFINED($1) OR IS_NULL($1))", RegexOptions.IgnoreCase);
+        return where;
+    }
 
     // Remove the document-Type predicate ([Doc].[Type] = @p) YesSql adds to index joins.
     private static string StripDocTypePredicate(string where)
@@ -425,24 +435,27 @@ public sealed class CosmosDbCommand : DbCommand
             queryDef = queryDef.WithParameter("@Type", typeVal);
         }
 
-        var limit = ExtractLimit(sql);
-        var rows = new List<object?[]>();
-        using var iterator = CosmosContainer.GetItemQueryIterator<JObject>(queryDef,
-            requestOptions: new QueryRequestOptions { PartitionKey = new PartitionKey(docTable) });
-        while (iterator.HasMoreResults)
+        var items = new List<JObject>();
+        using (var iterator = CosmosContainer.GetItemQueryIterator<JObject>(queryDef,
+            requestOptions: new QueryRequestOptions { PartitionKey = new PartitionKey(docTable) }))
         {
-            foreach (var item in await iterator.ReadNextAsync(cancellationToken))
+            while (iterator.HasMoreResults)
             {
-                if (limit.HasValue && rows.Count >= limit.Value)
+                foreach (var item in await iterator.ReadNextAsync(cancellationToken))
                 {
-                    break;
+                    items.Add(item);
                 }
-
-                rows.Add(ToRow(item));
             }
         }
 
-        return new CosmosDbDataReader(DocumentColumns, rows);
+        IEnumerable<JObject> page = items.Skip(ExtractOffset(sql));
+        var limit = ExtractLimit(sql);
+        if (limit.HasValue)
+        {
+            page = page.Take(limit.Value);
+        }
+
+        return new CosmosDbDataReader(DocumentColumns, page.Select(ToRow).ToList());
     }
 
     // Query<TIndex>() — return the index rows themselves (dynamic columns from the index fields).
@@ -458,8 +471,7 @@ public sealed class CosmosDbCommand : DbCommand
             queryDef = queryDef.WithParameter("@" + p.ParameterName.TrimStart('@'), p.Value is DBNull ? null : p.Value);
         }
 
-        var limit = ExtractLimit(sql);
-        var items = new List<JObject>();
+        var all = new List<JObject>();
         using (var iterator = CosmosContainer.GetItemQueryIterator<JObject>(queryDef,
             requestOptions: new QueryRequestOptions { PartitionKey = new PartitionKey(indexTable) }))
         {
@@ -467,16 +479,19 @@ public sealed class CosmosDbCommand : DbCommand
             {
                 foreach (var item in await iterator.ReadNextAsync(cancellationToken))
                 {
-                    if (limit.HasValue && items.Count >= limit.Value)
-                    {
-                        break;
-                    }
-
-                    items.Add(item);
+                    all.Add(item);
                 }
             }
         }
 
+        IEnumerable<JObject> paged = all.Skip(ExtractOffset(sql));
+        var limit = ExtractLimit(sql);
+        if (limit.HasValue)
+        {
+            paged = paged.Take(limit.Value);
+        }
+
+        var items = paged.ToList();
         var columns = new List<string>();
         foreach (var item in items)
         {
