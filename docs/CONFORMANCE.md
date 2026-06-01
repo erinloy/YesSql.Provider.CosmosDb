@@ -3,7 +3,7 @@
 The provider is validated against **YesSql's own test suite** (`CoreTests`, v5.4.7), the same suite
 the first-party SQL Server / PostgreSQL / MySQL / SQLite providers pass.
 
-**Current: 202 / 249 passing (81%).** Plus 8 hand-written provider tests, all green, 0 build warnings.
+**Current: 207 / 249 passing (83%).** Plus 8 hand-written provider tests, all green, 0 build warnings.
 
 ## Running the conformance suite
 
@@ -37,37 +37,47 @@ container instead of the raw `DELETE FROM <table>` `CoreTests` uses).
   `AND`/`OR`, `IS [NOT] NULL`; `OrderBy` (asc/desc); `OFFSET`/`LIMIT` paging.
 - `IN`/`NOT IN` subqueries (resolved by pre-executing the inner query).
 - Document-by-`Type` queries (`Query<T>()`), index-row queries (`Query<TIndex>()`).
+- **Reduce indexes — initial save + query** (`ShouldReduce`, `ShouldQueryByReducedIndex`): aggregated
+  index rows are written, composite-key bridge rows link them to documents, and the doc↔bridge↔index
+  three-way query/count resolves correctly.
 
-## What's left (47 failures) — by category and feasibility
+## What's left (42 failures) — by category and feasibility
 
 | Bucket | ~Count | Feasibility |
 | --- | --- | --- |
-| **Reduce indexes** | ~10 | Tractable but **not yet working** — see below. Biggest bucket. |
+| **Reduce-index lifecycle** | ~7 | Partly done — see below. Merge/update/delete still broken. |
 | **Transactions / autoflush / rollback** | ~7 | **Cosmos-bounded** — needs command buffering + per-partition transactional batch + an undo-log for rollback. Cosmos has no cross-partition ACID; partial at best. |
 | **Multi-index joins** (`CanRunInner/Left/RightJoin`, `ShouldJoinMapIndexes`) | ~6 | **Cosmos-bounded** — no cross-item/-partition JOIN; multi-step emulation only. |
 | **Ordering edge cases** (case-insensitive, value-type, dedup) | ~4 | Mixed; case-insensitive fights Cosmos's case-sensitive `ORDER BY`. |
 | **SQL functions** (`year()`/`month()`/decimal/`now()`) | ~3 | Largely **N/A** to a NoSQL store. |
 | **Misc** (binary-in-index, DateTimeOffset compare, rename-column DDL, subclasses) | ~7 | Varied / niche. |
 
-### Reduce indexes — the next target (needs trace-driven debugging)
+### Reduce indexes — initial save + query DONE; lifecycle remains
 
 A reduce index (e.g. `ArticlesByDay { DayOfYear, Count }`) aggregates many documents into one index
 row per group key, with a **bridge table** linking that row to its contributing documents.
 
-**Observed failure:** in `ShouldReduce`, `QueryIndex<ArticlesByDay>().CountAsync()` returns **0**
-(expected 4) — the reduce index rows are **not persisted at all**. `SaveChangesAsync` succeeds but no
-effective index `INSERT` lands. This is a *silent* failure (no exception), so it can't be diagnosed by
-the translate-and-rerun loop used for the other buckets.
+**Done** (trace-driven, see commits): the first save aggregates correctly (one index row per group),
+composite-key bridge rows (`<bridge>:<indexFk>:<docId>`, with columns mapped from the INSERT's column
+list since they differ from the param names — `[ArticlesByDayId]` ← `@Id`) link them to documents, and
+the three-way doc↔bridge↔index query/count resolves (index by group key → bridge by `<IndexName>Id`
+IN → point-read documents).
 
-**Plan:**
-1. Enable YesSql trace logging (`configuration.UseLogger(...)` / `EnableLogging`) during a single
-   reduce save and capture the exact command sequence + SQL YesSql emits for `ReduceIndex`.
-2. Implement the reduce **write** path: group-key aggregation (one index row per key, `Count` merged
-   on update) + **composite-key bridge rows** (`<bridge>:<indexId>:<docId>` — a non-composite key
-   collapses multiple docs into one bridge row; this was attempted and is necessary but insufficient
-   alone, so it was reverted to keep the suite at a clean 202).
-3. Implement the reduce **read** path: the doc↔bridge↔index three-way join becomes a multi-step
-   Cosmos lookup (index by group key → bridge by `<IndexName>Id` → point-read documents).
+**Still broken — merge/update/delete lifecycle** (`UpdatingDocumentShouldUpdateReducedIndex`,
+`ShouldReduceAndMergeWithDatabase`, `ShouldAddGroupKey`, `ShouldRemoveGroupKey`,
+`Removing/AlteringDocumentShouldUpdateReducedIndex`, `ShouldJoinReduceIndex`).
+
+**Observed:** save 2 docs (day1) → 1 index row, `Count=2` ✓. Then a *second* session saves 1 more
+(day1): YesSql emits `update [ArticlesByDay] set [Count]=@Count, [DayOfYear]=@DayOfYear where [Id]=@Id`
++ a bridge insert — but the result is **2 index rows** (expected 1) with `Count=2` (expected 3). So the
+merge `UPDATE` is landing on a *different* key than the existing row (likely creating a phantom row via
+the update-path's read-or-create), and/or the merged `Count` is stale.
+
+**Next:** add **param-value** tracing (the `ILogger` capture only sees SQL text, not `@Id`/`@Count`
+values) — instrument `CosmosDbCommand` to log `CommandText` + parameter values for `tpArticlesByDay`
+ops on the second save. Determine whether YesSql's merge `UPDATE` targets the existing `Id` (and my
+update is creating a duplicate) or a fresh `Id` (and the load-by-group-key returned the wrong row).
+Then fix the merge-update path and the reduce delete (`DeleteReduceIndexCommand` + bridge cleanup).
 
 ### Transactions / rollback — Cosmos limitation
 
