@@ -6,12 +6,14 @@ An [Azure Cosmos DB](https://learn.microsoft.com/azure/cosmos-db/) (NoSQL API) s
 
 > **Status: Orchard Core boots and runs on this provider** (validated — see
 > [`docs/ORCHARD-INTEGRATION.md`](docs/ORCHARD-INTEGRATION.md) and `samples/OrchardSmokeTest`), and
-> **~90% of YesSql's own conformance suite passes (224/249)**. Document CRUD, map + reduce indexes
-> (full lifecycle), single- and multi-index queries, ordering, paging, counts, and `IN`-subqueries work
-> end-to-end against the Cosmos emulator. The remaining conformance gaps are non-Orchard operations or
-> bounded by Cosmos (transaction rollback / cross-partition ACID). See
-> [`docs/CONFORMANCE.md`](docs/CONFORMANCE.md) for the matrix and
-> [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for how it works.
+> **~92% of YesSql's own conformance suite passes (229/249)**. Document CRUD, map + reduce indexes
+> (full lifecycle), single- and multi-index queries, ordering, paging, counts, `IN`-subqueries,
+> **optimistic concurrency** (version + ETag), and **unit-of-work rollback** (atomic in `PerStore`,
+> best-effort in `PerTable`) work end-to-end against the Cosmos emulator. The remaining gaps are
+> non-Orchard operations (raw LEFT/RIGHT joins, SQL date/decimal functions, DDL) or Cosmos-bounded
+> niceties. See [`docs/CONFORMANCE.md`](docs/CONFORMANCE.md) for the matrix,
+> [`docs/CROSS-PARTITION-ACID.md`](docs/CROSS-PARTITION-ACID.md) for the partitioning/ACID model, and
+> [`docs/ORCHARD-INTEGRATION.md`](docs/ORCHARD-INTEGRATION.md) for the Orchard wiring.
 
 ## Why
 
