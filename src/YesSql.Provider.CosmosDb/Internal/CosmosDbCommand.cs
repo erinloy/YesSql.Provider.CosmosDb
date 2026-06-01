@@ -59,6 +59,29 @@ public sealed class CosmosDbCommand : DbCommand
     {
         var sql = CommandText.TrimStart();
 
+        // Reduce-index bridge row (Index↔Document link). The columns (e.g. [ArticlesByDayId],
+        // [DocumentId]) don't match the param names (@Id, @DocumentId), so map columns→params by
+        // position. Composite key (<indexFk>:<documentId>) — many rows share an index Id.
+        if (StartsWith(sql, "insert") && TryParam("DocumentId", out var bridgeDocId) && !TryParam("Type", out _) && !TryParam("Content", out _))
+        {
+            var bridgeTable = ExtractTable(sql);
+            var cv = Regex.Match(sql, @"\(([^)]*)\)\s*values\s*\(([^)]*)\)", RegexOptions.IgnoreCase);
+            var columns = cv.Groups[1].Value.Split(',').Select(c => c.Trim().Trim('[', ']')).ToArray();
+            var values = cv.Groups[2].Value.Split(',').Select(v => v.Trim().TrimStart('@')).ToArray();
+
+            var bridge = new JObject { ["pk"] = bridgeTable };
+            for (var i = 0; i < columns.Length && i < values.Length; i++)
+            {
+                bridge[columns[i]] = ToToken(TryParam(values[i], out var pv) ? pv : null);
+            }
+
+            var indexFk = columns.Length > 0 ? bridge[columns[0]]?.ToString() : "0";
+            bridge["id"] = $"{bridgeTable}:{indexFk}:{bridgeDocId}";
+
+            await CosmosContainer.UpsertItemAsync(bridge, new PartitionKey(bridgeTable), cancellationToken: cancellationToken);
+            return 1;
+        }
+
         if (StartsWith(sql, "insert") || StartsWith(sql, "update"))
         {
             var table = ExtractTable(sql);
@@ -156,7 +179,9 @@ public sealed class CosmosDbCommand : DbCommand
         // JOIN [Index] … WHERE … → count the matching DocumentIds.
         if (Regex.IsMatch(sql, @"count\s*\(", RegexOptions.IgnoreCase) && Regex.IsMatch(sql, @"\bjoin\b", RegexOptions.IgnoreCase))
         {
-            var ids = await GatherDocumentIdsAsync(sql, cancellationToken);
+            var ids = Regex.IsMatch(sql, @"\bon\s+\w+\.\[Id\]\s*=\s*\w+\.\[\w+Id\]", RegexOptions.IgnoreCase)
+                ? await GatherReduceDocumentIdsAsync(sql, cancellationToken)
+                : await GatherDocumentIdsAsync(sql, cancellationToken);
             return ids.Count;
         }
 
@@ -219,6 +244,13 @@ public sealed class CosmosDbCommand : DbCommand
     protected override async Task<DbDataReader> ExecuteDbDataReaderAsync(CommandBehavior behavior, CancellationToken cancellationToken)
     {
         var sql = CommandText;
+
+        // Reduce-index query — a doc↔bridge↔index three-way join, recognised by the index↔bridge join
+        // "ON a.[Id] = b.[<X>Id]". Resolve via index → bridge → documents.
+        if (Regex.IsMatch(sql, @"\bon\s+\w+\.\[Id\]\s*=\s*\w+\.\[\w+Id\]", RegexOptions.IgnoreCase))
+        {
+            return await ExecuteReduceJoinQueryAsync(sql, cancellationToken);
+        }
 
         // An index join ("JOIN [index] AS a ON a.[DocumentId] = …") — whether flat (FirstOrDefault) or
         // wrapped in a "(SELECT … GROUP BY …)" dedup subquery (ListAsync) — is an index query.
@@ -630,6 +662,102 @@ public sealed class CosmosDbCommand : DbCommand
         var cols = columns.ToArray();
         var rows = items.Select(i => cols.Select(c => (object?)i[c]?.ToObject<object>()).ToArray()).ToList();
         return new CosmosDbDataReader(cols, rows);
+    }
+
+    // Reduce-index query: doc ← bridge → index. Resolve in three steps — matching index Ids, then the
+    // bridge rows linking them to documents, then the document ids.
+    private async Task<List<long>> GatherReduceDocumentIdsAsync(string sql, CancellationToken cancellationToken)
+    {
+        var bridge = Regex.Match(sql, @"join\s+\[([^\]]+)\]\s+as\s+\w+\s+on\s+\w+\.\[DocumentId\]\s*=\s*\[[^\]]+\]\.\[Id\]", RegexOptions.IgnoreCase);
+        var index = Regex.Match(sql, @"join\s+\[([^\]]+)\]\s+as\s+\w+\s+on\s+\w+\.\[Id\]\s*=\s*\w+\.\[(\w+)\]", RegexOptions.IgnoreCase);
+        if (!bridge.Success || !index.Success)
+        {
+            throw new NotSupportedException($"Unsupported reduce query: {CommandText}");
+        }
+
+        var bridgeTable = bridge.Groups[1].Value;
+        var indexTable = index.Groups[1].Value;
+        var bridgeForeignKey = index.Groups[2].Value;
+
+        var where = ExtractWhere(sql);
+        var indexWhere = string.IsNullOrWhiteSpace(where) ? string.Empty : " AND " + TranslateWhere(StripDocTypePredicate(where!));
+
+        // 1. matching index rows
+        var indexQuery = new QueryDefinition("SELECT VALUE c.Id FROM c WHERE c.pk = @pk" + indexWhere).WithParameter("@pk", indexTable);
+        foreach (DbParameter p in _parameters)
+        {
+            indexQuery = indexQuery.WithParameter("@" + p.ParameterName.TrimStart('@'), p.Value is DBNull ? null : p.Value);
+        }
+
+        var indexIds = new List<long>();
+        using (var iterator = CosmosContainer.GetItemQueryIterator<long>(indexQuery,
+            requestOptions: new QueryRequestOptions { PartitionKey = new PartitionKey(indexTable) }))
+        {
+            while (iterator.HasMoreResults)
+            {
+                foreach (var v in await iterator.ReadNextAsync(cancellationToken))
+                {
+                    indexIds.Add(v);
+                }
+            }
+        }
+
+        if (indexIds.Count == 0)
+        {
+            return new List<long>();
+        }
+
+        // 2. bridge rows linking those index rows to documents
+        var bridgeQuery = new QueryDefinition(
+            $"SELECT VALUE c.DocumentId FROM c WHERE c.pk = @pk AND c[\"{bridgeForeignKey}\"] IN ({string.Join(", ", indexIds)})")
+            .WithParameter("@pk", bridgeTable);
+
+        var documentIds = new List<long>();
+        using (var iterator = CosmosContainer.GetItemQueryIterator<long>(bridgeQuery,
+            requestOptions: new QueryRequestOptions { PartitionKey = new PartitionKey(bridgeTable) }))
+        {
+            while (iterator.HasMoreResults)
+            {
+                foreach (var v in await iterator.ReadNextAsync(cancellationToken))
+                {
+                    if (!documentIds.Contains(v))
+                    {
+                        documentIds.Add(v);
+                    }
+                }
+            }
+        }
+
+        return documentIds;
+    }
+
+    private async Task<DbDataReader> ExecuteReduceJoinQueryAsync(string sql, CancellationToken cancellationToken)
+    {
+        var documentTable = Regex.Match(sql, @"from\s+\[([^\]]+)\]", RegexOptions.IgnoreCase).Groups[1].Value;
+        var documentIds = await GatherReduceDocumentIdsAsync(sql, cancellationToken);
+
+        IEnumerable<long> page = documentIds.Skip(ExtractOffset(sql));
+        var limit = ExtractLimit(sql);
+        if (limit.HasValue)
+        {
+            page = page.Take(limit.Value);
+        }
+
+        var rows = new List<object?[]>();
+        foreach (var docId in page)
+        {
+            try
+            {
+                var resp = await CosmosContainer.ReadItemAsync<JObject>($"{documentTable}:{docId}", new PartitionKey(documentTable), cancellationToken: cancellationToken);
+                rows.Add(ToRow(resp.Resource));
+            }
+            catch (CosmosException ex) when (ex.StatusCode == HttpStatusCode.NotFound)
+            {
+                // document missing
+            }
+        }
+
+        return new CosmosDbDataReader(DocumentColumns, rows);
     }
 
     private async Task<long?> MaxIdAsync(string table, CancellationToken cancellationToken)
