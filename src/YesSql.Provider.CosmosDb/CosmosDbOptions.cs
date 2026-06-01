@@ -32,6 +32,25 @@ public sealed class CosmosDbOptions
     public bool CreateIfNotExists { get; init; } = true;
 
     /// <summary>
+    /// How items are mapped to Cosmos logical partitions.
+    /// <list type="bullet">
+    /// <item><see cref="PartitionStrategy.PerTable"/> (default): one partition per YesSql table —
+    /// horizontally scalable, but a unit of work spans partitions so there is no cross-table rollback.</item>
+    /// <item><see cref="PartitionStrategy.PerStore"/>: a single partition (<see cref="PartitionScope"/>)
+    /// for the whole store — a unit of work stays in one logical partition, enabling atomic rollback via
+    /// a partition-scoped operation. Capped at 20 GB / 10,000 RU/s per store (ample for typical Orchard
+    /// tenants, whose blobs live outside the DB).</item>
+    /// </list>
+    /// </summary>
+    public PartitionStrategy PartitionStrategy { get; init; } = PartitionStrategy.PerTable;
+
+    /// <summary>
+    /// The single logical-partition key used when <see cref="PartitionStrategy"/> is
+    /// <see cref="PartitionStrategy.PerStore"/> (e.g. the tenant/shell name). Defaults to <c>store</c>.
+    /// </summary>
+    public string PartitionScope { get; init; } = "store";
+
+    /// <summary>
     /// Optional Cosmos SDK client options. Needed for the local emulator (Gateway mode + accept the
     /// self-signed certificate). Left null for normal accounts.
     /// </summary>
