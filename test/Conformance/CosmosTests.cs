@@ -35,6 +35,11 @@ namespace YesSql.Tests
             }),
         };
 
+        private static readonly PartitionStrategy Strategy =
+            string.Equals(Environment.GetEnvironmentVariable("COSMOS_PARTITION"), "PerStore", StringComparison.OrdinalIgnoreCase)
+                ? PartitionStrategy.PerStore
+                : PartitionStrategy.PerTable;
+
         protected override IConfiguration CreateConfiguration()
             => new Configuration()
                 .UseCosmosDb(new CosmosDbOptions
@@ -44,6 +49,8 @@ namespace YesSql.Tests
                     DatabaseId = DatabaseId,
                     ContainerId = ContainerId,
                     ClientOptions = ClientOptions(),
+                    PartitionStrategy = Strategy,
+                    PartitionScope = "conf",
                 })
                 .SetTablePrefix(TablePrefix)
                 .UseDefaultIdGenerator()
