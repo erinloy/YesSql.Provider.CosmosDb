@@ -680,7 +680,15 @@ public sealed class CosmosDbCommand : DbCommand
         var bridgeForeignKey = index.Groups[2].Value;
 
         var where = ExtractWhere(sql);
-        var indexWhere = string.IsNullOrWhiteSpace(where) ? string.Empty : " AND " + TranslateWhere(StripDocTypePredicate(where!));
+        var indexWhere = string.Empty;
+        if (!string.IsNullOrWhiteSpace(where))
+        {
+            var stripped = StripDocTypePredicate(where!).Trim();
+            if (stripped.Length > 0)
+            {
+                indexWhere = " AND " + TranslateWhere(stripped);
+            }
+        }
 
         // 1. matching index rows
         var indexQuery = new QueryDefinition("SELECT VALUE c.Id FROM c WHERE c.pk = @pk" + indexWhere).WithParameter("@pk", indexTable);
