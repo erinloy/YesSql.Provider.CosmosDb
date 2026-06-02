@@ -381,6 +381,14 @@ public sealed class CosmosDbCommand : DbCommand
         {
             var table = ExtractTableAfter(sql, "from");
 
+            // Scalar date-part projection: SELECT DateTimePart("<part>", [<col>]) FROM [<table>] — run it
+            // as a Cosmos VALUE query over the partition so the computed int is returned, not a raw column.
+            var dateFn = Regex.Match(sql, @"DateTimePart\(\s*""(\w+)""\s*,\s*\[(\w+)\]\s*\)", RegexOptions.IgnoreCase);
+            if (dateFn.Success)
+            {
+                return await ExecuteDatePartAsync(sql, table, dateFn.Groups[1].Value, dateFn.Groups[2].Value, cancellationToken);
+            }
+
             if (IsDocumentTable(table))
             {
                 // Load by id(s): WHERE [Id] = @Id / IN (…) — the only params are ids; point-read each.
@@ -780,6 +788,36 @@ public sealed class CosmosDbCommand : DbCommand
         }
 
         return row;
+    }
+
+    // Run a "SELECT DateTimePart(\"part\", [col]) FROM [table]" projection as a Cosmos VALUE query over the
+    // partition, returning the computed integer(s) under a single column named after the part.
+    private async Task<DbDataReader> ExecuteDatePartAsync(string sql, string table, string part, string column, CancellationToken cancellationToken)
+    {
+        var where = ExtractWhere(sql);
+        var cosmosWhere = string.IsNullOrWhiteSpace(where) ? string.Empty : " AND " + TranslateWhere(where!);
+
+        var queryDef = new QueryDefinition($"SELECT VALUE DateTimePart(\"{part}\", c.{column}) FROM c WHERE " + Scoped(table) + cosmosWhere)
+            .WithParameter("@pk", PkValue(table));
+        foreach (DbParameter p in _parameters)
+        {
+            queryDef = queryDef.WithParameter("@" + p.ParameterName.TrimStart('@'), p.Value is DBNull ? null : p.Value);
+        }
+
+        var rows = new List<object?[]>();
+        using (var iterator = CosmosContainer.GetItemQueryIterator<JToken>(queryDef,
+            requestOptions: new QueryRequestOptions { PartitionKey = PartitionKeyFor(table) }))
+        {
+            while (iterator.HasMoreResults)
+            {
+                foreach (var value in await iterator.ReadNextAsync(cancellationToken))
+                {
+                    rows.Add([value is null || value.Type == JTokenType.Null ? null : value.ToObject<long>()]);
+                }
+            }
+        }
+
+        return new CosmosDbDataReader([part], rows);
     }
 
     // Query<TIndex>() — return the index rows themselves (dynamic columns from the index fields).

@@ -60,6 +60,15 @@ public sealed class CosmosDbDialect : BaseDialect
     {
         // 'now' maps to Cosmos server time at translation; placeholder template for parity.
         Methods.Add("now", new TemplateFunction("GetCurrentDateTime()"));
+
+        // Date-part extraction → Cosmos DateTimePart(part, <iso-datetime>). The translator recognises a
+        // DateTimePart(...) projection and runs it as a scalar Cosmos query.
+        Methods.Add("second", new TemplateFunction("DateTimePart(\"second\", {0})"));
+        Methods.Add("minute", new TemplateFunction("DateTimePart(\"minute\", {0})"));
+        Methods.Add("hour", new TemplateFunction("DateTimePart(\"hour\", {0})"));
+        Methods.Add("day", new TemplateFunction("DateTimePart(\"day\", {0})"));
+        Methods.Add("month", new TemplateFunction("DateTimePart(\"month\", {0})"));
+        Methods.Add("year", new TemplateFunction("DateTimePart(\"year\", {0})"));
     }
 
     public override string Name => "CosmosDb";
