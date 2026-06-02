@@ -455,9 +455,19 @@ public sealed class CosmosDbCommand : DbCommand
             }
         }
 
-        var queryText = "SELECT VALUE c.DocumentId FROM c WHERE " + Scoped(indexTable)
-            + (cosmosWhere.Length > 0 ? " AND " + cosmosWhere : string.Empty)
-            + BuildOrderClause(sql);
+        // Ordering: Cosmos ORDER BY is case-sensitive and can't ORDER BY LOWER(...), so when the query is
+        // ordered we fetch DocumentId + the order columns and sort client-side (case-insensitive, matching
+        // the reference dialects). Unordered queries keep the cheap "SELECT VALUE c.DocumentId".
+        var orderTerms = ParseOrderTerms(sql);
+        // DocumentId is already projected, so don't re-select it (Cosmos rejects the duplicate property).
+        var extraOrderCols = orderTerms.Select(t => t.Column).Distinct()
+            .Where(col => !col.Equals("DocumentId", StringComparison.OrdinalIgnoreCase)).ToList();
+        var projection = orderTerms.Count == 0
+            ? "VALUE c.DocumentId"
+            : "c.DocumentId" + string.Concat(extraOrderCols.Select(col => $", c[\"{col}\"]"));
+
+        var queryText = "SELECT " + projection + " FROM c WHERE " + Scoped(indexTable)
+            + (cosmosWhere.Length > 0 ? " AND " + cosmosWhere : string.Empty);
         var queryDef = new QueryDefinition(queryText).WithParameter("@pk", PkValue(indexTable));
         foreach (DbParameter p in _parameters)
         {
@@ -467,12 +477,37 @@ public sealed class CosmosDbCommand : DbCommand
         var documentIds = new System.Collections.Generic.List<long>();
         try
         {
-            using var iterator = CosmosContainer.GetItemQueryIterator<long>(queryDef,
-                requestOptions: new QueryRequestOptions { PartitionKey = PartitionKeyFor(indexTable) });
-            while (iterator.HasMoreResults)
+            if (orderTerms.Count == 0)
             {
-                foreach (var docId in await iterator.ReadNextAsync(cancellationToken))
+                using var iterator = CosmosContainer.GetItemQueryIterator<long>(queryDef,
+                    requestOptions: new QueryRequestOptions { PartitionKey = PartitionKeyFor(indexTable) });
+                while (iterator.HasMoreResults)
                 {
+                    foreach (var docId in await iterator.ReadNextAsync(cancellationToken))
+                    {
+                        if (!documentIds.Contains(docId))
+                        {
+                            documentIds.Add(docId);
+                        }
+                    }
+                }
+            }
+            else
+            {
+                var rows = new System.Collections.Generic.List<JObject>();
+                using var iterator = CosmosContainer.GetItemQueryIterator<JObject>(queryDef,
+                    requestOptions: new QueryRequestOptions { PartitionKey = PartitionKeyFor(indexTable) });
+                while (iterator.HasMoreResults)
+                {
+                    foreach (var row in await iterator.ReadNextAsync(cancellationToken))
+                    {
+                        rows.Add(row);
+                    }
+                }
+
+                foreach (var row in OrderRows(rows, orderTerms))
+                {
+                    var docId = row["DocumentId"]!.ToObject<long>();
                     if (!documentIds.Contains(docId))
                     {
                         documentIds.Add(docId);
@@ -527,6 +562,102 @@ public sealed class CosmosDbCommand : DbCommand
 
     // Translate the SQL ORDER BY (which aggregates index columns as "MAX(a.[Col]) AS order_N" under the
     // GROUP BY) into a Cosmos "ORDER BY c["Col"] [DESC]" clause.
+    // Parse the trailing ORDER BY into (column, descending) pairs for client-side sorting.
+    private static System.Collections.Generic.List<(string Column, bool Desc)> ParseOrderTerms(string sql)
+    {
+        var result = new System.Collections.Generic.List<(string, bool)>();
+        var orderBys = Regex.Matches(sql, @"order\s+by\s+(.+?)(?:\boffset\b|\)|$)", RegexOptions.IgnoreCase | RegexOptions.Singleline);
+        if (orderBys.Count == 0)
+        {
+            return result;
+        }
+
+        var aliasToColumn = new System.Collections.Generic.Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        foreach (Match m in Regex.Matches(sql, @"\(\s*\w+\.\[([^\]]+)\]\s*\)\s+as\s+(order_\d+)", RegexOptions.IgnoreCase))
+        {
+            aliasToColumn[m.Groups[2].Value] = m.Groups[1].Value;
+        }
+
+        foreach (var raw in orderBys[^1].Groups[1].Value.Split(','))
+        {
+            var term = raw.Trim();
+            if (term.Length == 0)
+            {
+                continue;
+            }
+
+            var desc = Regex.IsMatch(term, @"\bdesc\b", RegexOptions.IgnoreCase);
+            var expr = Regex.Replace(term, @"\s+(asc|desc)\b", string.Empty, RegexOptions.IgnoreCase).Trim();
+
+            string? column = null;
+            if (aliasToColumn.TryGetValue(expr, out var mapped))
+            {
+                column = mapped;
+            }
+            else
+            {
+                var col = Regex.Match(expr, @"\[([^\]]+)\]");
+                if (col.Success)
+                {
+                    column = col.Groups[1].Value;
+                }
+            }
+
+            if (column != null)
+            {
+                result.Add((column, desc));
+            }
+        }
+
+        return result;
+    }
+
+    // Order comparison matching the reference dialects: nulls first, numbers numerically, everything else
+    // as a case-insensitive string (ISO date strings sort chronologically under ordinal comparison).
+    private static int CompareTokens(JToken? a, JToken? b)
+    {
+        var aNull = a is null || a.Type == JTokenType.Null;
+        var bNull = b is null || b.Type == JTokenType.Null;
+        if (aNull || bNull)
+        {
+            return aNull == bNull ? 0 : aNull ? -1 : 1;
+        }
+
+        var aNum = a!.Type is JTokenType.Integer or JTokenType.Float;
+        var bNum = b!.Type is JTokenType.Integer or JTokenType.Float;
+        if (aNum && bNum)
+        {
+            return a.ToObject<double>().CompareTo(b.ToObject<double>());
+        }
+
+        return string.Compare(a.ToString(), b.ToString(), StringComparison.OrdinalIgnoreCase);
+    }
+
+    // Stable client-side ordering of rows by the parsed order terms (shared by the index/join gatherers).
+    private static System.Collections.Generic.IEnumerable<JObject> OrderRows(
+        System.Collections.Generic.List<JObject> rows, System.Collections.Generic.List<(string Column, bool Desc)> orderTerms)
+        => rows
+            .Select((row, index) => (Row: row, Index: index))
+            .OrderBy(x => x, System.Collections.Generic.Comparer<(JObject Row, int Index)>.Create((x, y) =>
+            {
+                foreach (var (column, desc) in orderTerms)
+                {
+                    var c = CompareTokens(x.Row[column], y.Row[column]);
+                    if (desc)
+                    {
+                        c = -c;
+                    }
+
+                    if (c != 0)
+                    {
+                        return c;
+                    }
+                }
+
+                return x.Index.CompareTo(y.Index);
+            }))
+            .Select(x => x.Row);
+
     private static string BuildOrderClause(string sql)
     {
         var orderBys = Regex.Matches(sql, @"order\s+by\s+(.+?)(?:\boffset\b|\)|$)", RegexOptions.IgnoreCase | RegexOptions.Singleline);
@@ -1036,7 +1167,75 @@ public sealed class CosmosDbCommand : DbCommand
             result = result is null ? ids.ToList() : result.Where(ids.Contains).ToList();
         }
 
-        return (result ?? new List<long>()).Distinct().ToList();
+        var documentIds = (result ?? new List<long>()).Distinct().ToList();
+
+        // Order across the joined indexes (Cosmos can't ORDER BY case-insensitively). The order column(s)
+        // live in one of the joined index tables; gather their values per DocumentId, then sort client-side.
+        var orderTerms = ParseOrderTerms(sql);
+        if (orderTerms.Count > 0 && documentIds.Count > 0)
+        {
+            var orderCols = orderTerms.Select(t => t.Column).Distinct()
+                .Where(col => !col.Equals("DocumentId", StringComparison.OrdinalIgnoreCase)).ToList();
+            var orderValues = new Dictionary<long, JObject>();
+            foreach (var group in joins.GroupBy(j => j.Table))
+            {
+                var projection = "c.DocumentId" + string.Concat(orderCols.Select(col => $", c[\"{col}\"]"));
+                var orderQuery = new QueryDefinition("SELECT " + projection + " FROM c WHERE " + Scoped(group.Key) + " AND ARRAY_CONTAINS(@__ids, c.DocumentId)")
+                    .WithParameter("@pk", PkValue(group.Key))
+                    .WithParameter("@__ids", documentIds);
+                using var iterator = CosmosContainer.GetItemQueryIterator<JObject>(orderQuery,
+                    requestOptions: new QueryRequestOptions { PartitionKey = PartitionKeyFor(group.Key) });
+                while (iterator.HasMoreResults)
+                {
+                    foreach (var row in await iterator.ReadNextAsync(cancellationToken))
+                    {
+                        var docId = row["DocumentId"]!.ToObject<long>();
+                        if (!orderValues.TryGetValue(docId, out var aggregate))
+                        {
+                            aggregate = new JObject();
+                            orderValues[docId] = aggregate;
+                        }
+
+                        foreach (var col in orderCols)
+                        {
+                            if (aggregate[col] is null && row[col] is { } v && v.Type != JTokenType.Null)
+                            {
+                                aggregate[col] = v;
+                            }
+                        }
+                    }
+                }
+            }
+
+            documentIds = documentIds
+                .Select((id, index) => (Id: id, Index: index))
+                .OrderBy(x => x, System.Collections.Generic.Comparer<(long Id, int Index)>.Create((x, y) =>
+                {
+                    orderValues.TryGetValue(x.Id, out var xv);
+                    orderValues.TryGetValue(y.Id, out var yv);
+                    foreach (var (column, desc) in orderTerms)
+                    {
+                        var c = column.Equals("DocumentId", StringComparison.OrdinalIgnoreCase)
+                            ? x.Id.CompareTo(y.Id)
+                            : CompareTokens(xv?[column], yv?[column]);
+                        if (desc)
+                        {
+                            c = -c;
+                        }
+
+                        if (c != 0)
+                        {
+                            return c;
+                        }
+                    }
+
+                    return x.Index.CompareTo(y.Index);
+                }))
+                .Select(x => x.Id)
+                .ToList();
+        }
+
+        return documentIds;
     }
 
     private async Task<DbDataReader> ExecuteMultiIndexJoinQueryAsync(string sql, CancellationToken cancellationToken)
