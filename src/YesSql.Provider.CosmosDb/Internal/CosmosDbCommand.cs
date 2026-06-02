@@ -291,28 +291,7 @@ public sealed class CosmosDbCommand : DbCommand
         // that partition (documents by Type, or index rows).
         if (Regex.IsMatch(sql, @"count\s*\(", RegexOptions.IgnoreCase))
         {
-            var table = ExtractTableAfter(sql, "from");
-            var where = ExtractWhere(sql);
-            var cosmosWhere = string.IsNullOrWhiteSpace(where) ? string.Empty : " AND " + TranslateWhere(where!);
-
-            var queryDef = new QueryDefinition("SELECT VALUE COUNT(1) FROM c WHERE " + Scoped(table) + cosmosWhere)
-                .WithParameter("@pk", PkValue(table));
-            foreach (DbParameter p in _parameters)
-            {
-                queryDef = queryDef.WithParameter("@" + p.ParameterName.TrimStart('@'), p.Value is DBNull ? null : p.Value);
-            }
-
-            using var iterator = CosmosContainer.GetItemQueryIterator<long>(queryDef,
-                requestOptions: new QueryRequestOptions { PartitionKey = PartitionKeyFor(table) });
-            while (iterator.HasMoreResults)
-            {
-                foreach (var n in await iterator.ReadNextAsync(cancellationToken))
-                {
-                    return n;
-                }
-            }
-
-            return 0L;
+            return await CountItemsAsync(sql, cancellationToken);
         }
 
         // Map-index write: insert into [<index>] ([Col]…) values (@Col…) — executed as scalar to
@@ -375,6 +354,14 @@ public sealed class CosmosDbCommand : DbCommand
         if (Regex.IsMatch(sql, @"\bjoin\b", RegexOptions.IgnoreCase))
         {
             return await QueryDocumentsAsync(sql, cancellationToken);
+        }
+
+        // A non-join COUNT executed through a reader (e.g. raw Dapper QueryFirstOrDefaultAsync<int>) rather
+        // than ExecuteScalar — return the scalar count as a single "count" column so the reader yields it.
+        if (Regex.IsMatch(sql, @"\bcount\s*\(", RegexOptions.IgnoreCase))
+        {
+            var count = await CountItemsAsync(sql, cancellationToken);
+            return new CosmosDbDataReader(["count"], [[(object?)count]]);
         }
 
         if (StartsWith(sql.TrimStart(), "select"))
@@ -672,6 +659,34 @@ public sealed class CosmosDbCommand : DbCommand
     }
 
     private static bool IsDocumentTable(string table) => table.EndsWith("Document", StringComparison.OrdinalIgnoreCase);
+
+    // Count items in a partition: SELECT count(...) FROM [<table>] [WHERE <predicate>]. Shared by the
+    // scalar path (CountAsync) and the reader path (raw Dapper QueryFirstOrDefaultAsync<int>).
+    private async Task<long> CountItemsAsync(string sql, CancellationToken cancellationToken)
+    {
+        var table = ExtractTableAfter(sql, "from");
+        var where = ExtractWhere(sql);
+        var cosmosWhere = string.IsNullOrWhiteSpace(where) ? string.Empty : " AND " + TranslateWhere(where!);
+
+        var queryDef = new QueryDefinition("SELECT VALUE COUNT(1) FROM c WHERE " + Scoped(table) + cosmosWhere)
+            .WithParameter("@pk", PkValue(table));
+        foreach (DbParameter p in _parameters)
+        {
+            queryDef = queryDef.WithParameter("@" + p.ParameterName.TrimStart('@'), p.Value is DBNull ? null : p.Value);
+        }
+
+        using var iterator = CosmosContainer.GetItemQueryIterator<long>(queryDef,
+            requestOptions: new QueryRequestOptions { PartitionKey = PartitionKeyFor(table) });
+        while (iterator.HasMoreResults)
+        {
+            foreach (var n in await iterator.ReadNextAsync(cancellationToken))
+            {
+                return n;
+            }
+        }
+
+        return 0L;
+    }
 
     private static string? ExtractWhere(string sql)
     {
