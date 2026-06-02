@@ -40,8 +40,47 @@ namespace YesSql.Tests
                 ? PartitionStrategy.PerStore
                 : PartitionStrategy.PerTable;
 
+        // The vnext emulator reports Gateway=OK before its pgcosmos extension finishes starting, so the first
+        // queries race it and fail with 503 "pgcosmos extension is still starting". Block once until a real
+        // round-trip succeeds, so the suite self-warms instead of flaking.
+        private static readonly object WarmupLock = new();
+        private static bool _warmed;
+
+        private static void EnsureEmulatorWarm()
+        {
+            lock (WarmupLock)
+            {
+                if (_warmed)
+                {
+                    return;
+                }
+
+                using var client = new CosmosClient(Endpoint, Key, ClientOptions());
+                for (var attempt = 0; attempt < 60; attempt++)
+                {
+                    try
+                    {
+                        var db = client.CreateDatabaseIfNotExistsAsync("warmup_gate").GetAwaiter().GetResult().Database;
+                        var container = db.CreateContainerIfNotExistsAsync("warmup", "/pk").GetAwaiter().GetResult().Container;
+                        container.UpsertItemAsync(new { id = "w", pk = "w" }, new PartitionKey("w")).GetAwaiter().GetResult();
+                        container.ReadItemAsync<object>("w", new PartitionKey("w")).GetAwaiter().GetResult();
+                        _warmed = true;
+                        return;
+                    }
+                    catch
+                    {
+                        System.Threading.Thread.Sleep(2000);
+                    }
+                }
+
+                throw new InvalidOperationException("Cosmos emulator did not become ready within the warmup window.");
+            }
+        }
+
         protected override IConfiguration CreateConfiguration()
-            => new Configuration()
+        {
+            EnsureEmulatorWarm();
+            return new Configuration()
                 .UseCosmosDb(new CosmosDbOptions
                 {
                     AccountEndpoint = Endpoint,
@@ -55,6 +94,7 @@ namespace YesSql.Tests
                 .SetTablePrefix(TablePrefix)
                 .UseDefaultIdGenerator()
                 .SetIdentityColumnSize(IdentityColumnSize.Int64);
+        }
 
         // DDL is a no-op on a schemaless store; nothing to clean.
         protected override Task CleanDatabaseAsync(IConfiguration configuration, bool throwOnError)
