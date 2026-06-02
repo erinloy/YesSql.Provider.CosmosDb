@@ -92,8 +92,12 @@ public sealed class CosmosDbDialect : BaseDialect
     public override string GetDropIndexString(string indexName, string tableName, string schema) => "";
 
     public override string GetTypeName(DbType dbType, int? length, byte? precision, byte? scale)
-        // Cosmos is schemaless; column types are irrelevant since DDL is not executed.
-        => "TEXT";
+        // Cosmos is schemaless; column types are irrelevant since DDL is not executed. Decimal still
+        // reports a precision/scale-qualified name so callers that inspect the type definition (and the
+        // conformance suite) see the expected DECIMAL(p,s) form rather than a bare type.
+        => dbType == DbType.Decimal
+            ? $"DECIMAL({precision ?? DefaultDecimalPrecision},{scale ?? DefaultDecimalScale})"
+            : "TEXT";
 
     public override void Page(ISqlBuilder sqlBuilder, string offset, string limit)
     {
