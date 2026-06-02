@@ -707,13 +707,25 @@ public sealed class CosmosDbCommand : DbCommand
     private async Task<DbDataReader> QueryDocumentsAsync(string sql, CancellationToken cancellationToken)
     {
         var docTable = ExtractTableAfter(sql, "from");
-        var hasType = TryParam("Type", out var typeVal);
 
-        var queryDef = new QueryDefinition("SELECT * FROM c WHERE " + Scoped(docTable) + (hasType ? " AND c.Type = @Type" : string.Empty) + BuildOrderClause(sql))
-            .WithParameter("@pk", PkValue(docTable));
-        if (hasType)
+        // Type filter: YesSql usually binds @Type, but some callers (e.g. Orchard's QueriesDocument
+        // migration) embed a [Type] = '<literal>' directly in the WHERE. Honour both, otherwise the
+        // filter is silently dropped and the query returns the wrong document(s).
+        object? typeFilter = TryParam("Type", out var typeVal) ? typeVal : null;
+        if (typeFilter is null)
         {
-            queryDef = queryDef.WithParameter("@Type", typeVal);
+            var lit = Regex.Match(sql, @"\[Type\]\s*=\s*'([^']*)'", RegexOptions.IgnoreCase);
+            if (lit.Success)
+            {
+                typeFilter = lit.Groups[1].Value;
+            }
+        }
+
+        var queryDef = new QueryDefinition("SELECT * FROM c WHERE " + Scoped(docTable) + (typeFilter is not null ? " AND c.Type = @Type" : string.Empty) + BuildOrderClause(sql))
+            .WithParameter("@pk", PkValue(docTable));
+        if (typeFilter is not null)
+        {
+            queryDef = queryDef.WithParameter("@Type", typeFilter);
         }
 
         var items = new List<JObject>();
@@ -736,7 +748,38 @@ public sealed class CosmosDbCommand : DbCommand
             page = page.Take(limit.Value);
         }
 
-        return new CosmosDbDataReader(DocumentColumns, page.Select(ToRow).ToList());
+        // Honour the SELECT projection. Dapper reads result columns positionally, so a single-column
+        // projection (e.g. "SELECT [Content]") must return exactly that column — returning the full
+        // document row would make Dapper read [Id] (a number) where [Content] (a string) was asked for.
+        var columns = ExtractDocumentSelectColumns(sql) ?? DocumentColumns;
+        return new CosmosDbDataReader(columns, page.Select(item => ProjectRow(item, columns)).ToList());
+    }
+
+    // The document columns a SELECT projects, or null for "*" / "alias.*" (→ all DocumentColumns).
+    private static string[]? ExtractDocumentSelectColumns(string sql)
+    {
+        var m = Regex.Match(sql, @"select\s+(.*?)\s+from\b", RegexOptions.IgnoreCase | RegexOptions.Singleline);
+        if (!m.Success || m.Groups[1].Value.Contains('*'))
+        {
+            return null;
+        }
+
+        var cols = Regex.Matches(m.Groups[1].Value, @"\[(\w+)\]").Select(x => x.Groups[1].Value).ToArray();
+        return cols.Length > 0 ? cols : null;
+    }
+
+    // Project a document item onto the requested columns (numeric Id/Version as long, others as string).
+    private static object?[] ProjectRow(JObject item, string[] columns)
+    {
+        var row = new object?[columns.Length];
+        for (var i = 0; i < columns.Length; i++)
+        {
+            row[i] = columns[i] is "Id" or "Version" or "DocumentId"
+                ? item[columns[i]]?.ToObject<long>()
+                : item[columns[i]]?.ToObject<string>();
+        }
+
+        return row;
     }
 
     // Query<TIndex>() — return the index rows themselves (dynamic columns from the index fields).
