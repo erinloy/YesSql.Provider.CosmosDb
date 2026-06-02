@@ -485,6 +485,43 @@ public sealed class CosmosDbCommand : DbCommand
             throw new NotSupportedException($"IDXQ_FAIL cosmos=[{queryText}] orig=[{CommandText}]: {ex.Message}", ex);
         }
 
+        // filterType:true adds a "[Document].[Type] = @p" predicate that StripDocTypePredicate removed (it
+        // can't run inside the index partition). Re-apply it: keep only gathered ids whose document has that
+        // exact Type. Without this, a Query<SubClass>(filterType:true) counts every subclass, not just one.
+        var typeMatch = where is null ? Match.Empty : Regex.Match(where, @"\[[^\]]+\]\.\[Type\]\s*=\s*@(\w+)", RegexOptions.IgnoreCase);
+        if (typeMatch.Success && documentIds.Count > 0)
+        {
+            var typeParam = typeMatch.Groups[1].Value;
+            object? typeValue = null;
+            foreach (DbParameter p in _parameters)
+            {
+                if (p.ParameterName.TrimStart('@').Equals(typeParam, StringComparison.OrdinalIgnoreCase))
+                {
+                    typeValue = p.Value is DBNull ? null : p.Value;
+                    break;
+                }
+            }
+
+            var docTable = ExtractTableAfter(sql, "from");
+            var matching = new System.Collections.Generic.HashSet<long>();
+            var typeQuery = new QueryDefinition("SELECT VALUE c.Id FROM c WHERE " + Scoped(docTable) + " AND c.Type = @__type AND ARRAY_CONTAINS(@__ids, c.Id)")
+                .WithParameter("@pk", PkValue(docTable))
+                .WithParameter("@__type", typeValue)
+                .WithParameter("@__ids", documentIds);
+            using var typeIterator = CosmosContainer.GetItemQueryIterator<long>(typeQuery,
+                requestOptions: new QueryRequestOptions { PartitionKey = PartitionKeyFor(docTable) });
+            while (typeIterator.HasMoreResults)
+            {
+                foreach (var id in await typeIterator.ReadNextAsync(cancellationToken))
+                {
+                    matching.Add(id);
+                }
+            }
+
+            // Preserve the original (ORDER BY) sequence — keep matching ids in place, drop the rest.
+            documentIds = documentIds.Where(matching.Contains).ToList();
+        }
+
         return documentIds;
     }
 
