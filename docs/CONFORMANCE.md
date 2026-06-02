@@ -3,27 +3,30 @@
 The provider is validated against **YesSql's own test suite** (`CoreTests`, v5.4.7), the same suite
 the first-party SQL Server / PostgreSQL / MySQL / SQLite providers pass.
 
-**Current: 229 / 249 passing (92%)** — PerTable and PerStore both. Plus 10 hand-written provider tests
-(incl. rollback), all green, 0 build warnings. **Validated end-to-end: Orchard Core boots and runs on
-this provider** (see ORCHARD-INTEGRATION.md).
+**Current: 242 / 249 passing (97%)** — PerStore (the suite self-warms the emulator before measuring; see
+"Running the conformance suite"). Plus the hand-written provider tests (incl. rollback), all green.
+**Validated end-to-end: Orchard Core 3.0 boots and runs on this provider** (see ORCHARD-INTEGRATION.md).
 
 ## Orchard Core readiness
 
 **Every operation Orchard exercises is supported:** document CRUD; map indexes and their update/delete
 lifecycle; reduce indexes (aggregate, merge, query); single- and multi-index (`.With<I1>().With<I2>()`)
-queries; `Where`/range/boolean/`IS NULL`/`IN`-subquery predicates; `OrderBy`; paging; `CountAsync`;
+queries; `Where`/range/boolean/`IS NULL`/`IN`-subquery predicates; `OrderBy` (case-insensitive, matching
+the reference dialects); paging; `CountAsync` (scalar and via the reader path); SQL date-part /
+`now()` functions; **`filterType` CLR-type polymorphism** (`Query<SubClass>(filterType: true)`);
 monotonic (append-only) index ids; **optimistic concurrency** (version check + ETag, so
 `ConcurrencyException` is raised on stale/concurrent writes); and **unit-of-work rollback** (undo log —
-atomic in `PerStore`, best-effort in `PerTable`). Orchard discriminates content types via a
-`ContentType` *column* on its indexes (supported), not via YesSql's CLR `filterType` polymorphism.
+atomic in `PerStore`, best-effort in `PerTable`).
 
-The 20 remaining failures are **not Orchard operations** or are **bounded by Cosmos**:
-- Raw `LEFT`/`RIGHT`/`INNER JOIN` count API (`CanRun*Join`, `ShouldJoinReduceIndex`,
-  `ShouldOrderJoinedMapIndexes`) — Orchard uses `.With()`, not raw joins.
-- `filterType` CLR-type polymorphism (`ShouldQuerySubClasses`) — Orchard uses the `ContentType` column.
-- SQL `year()/month()/decimal/now()` functions, `RenameColumn` DDL — not used / N/A on a schemaless store.
-- Case-insensitive `ORDER BY` (Cosmos ORDER BY is case-sensitive), binary-in-index, `DateTimeOffset` vs
-  `DateTime` compare — niche / Cosmos-bounded.
+The 7 remaining failures are **not Orchard operations** or are **bounded by Cosmos**:
+- Raw `INNER`/`LEFT`/`RIGHT JOIN` API (`CanRun*Join`) — Cosmos has no cross-document JOIN; Orchard uses
+  `.With()`, not raw joins.
+- Map+reduce index intersection in one query (`ShouldJoinReduceIndex` — `.With<Map>().With<Reduce>()`).
+- `RenameColumn` DDL + raw literal-value table INSERT (`ShouldRenameColumn`) — N/A on a schemaless store.
+- Binary (`byte[]`) index columns (`ShouldStoreBinaryInIndex`) — needs per-column type metadata to
+  decode base64 on read.
+- `DateTimeOffset`-field vs `DateTime`-value comparison (`ShouldCompareDateTimeOffsetWithDateTime`) —
+  storage must preserve the offset, so a cross-type match needs instant-based comparison; niche.
 
 The one previously Orchard-relevant gap — request rollback / concurrency — is now **closed** (rollback
 via the undo log, concurrency via version+ETag). True cross-partition ACID remains impossible on Cosmos;
