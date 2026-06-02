@@ -114,11 +114,27 @@ public sealed class CosmosDbCommand : DbCommand
         if (StartsWith(sql, "insert") || StartsWith(sql, "update"))
         {
             var table = ExtractTable(sql);
-            var id = Convert.ToInt64(Param("Id"));
 
             // UPDATE only carries the columns in its SET clause (Content/Version), so read the existing
             // item and patch the provided fields; INSERT carries all of them.
             var isUpdate = StartsWith(sql, "update");
+
+            // Resolve the row Id. UPDATE always carries @Id (its key). An INSERT into an identity table
+            // (e.g. Orchard's [RecordIndexingTask]) carries no @Id — Cosmos has no auto-increment, so
+            // allocate Id = next sequence, mirroring the scalar-insert path above.
+            long id;
+            if (TryParam("Id", out var idParam) && idParam is not null and not DBNull)
+            {
+                id = Convert.ToInt64(idParam);
+            }
+            else if (!isUpdate)
+            {
+                id = await NextSequenceAsync(table, cancellationToken);
+            }
+            else
+            {
+                id = Convert.ToInt64(Param("Id")); // UPDATE without its key — preserve the original error
+            }
             JObject? item = null;
             string? etag = null;
             if (isUpdate)
