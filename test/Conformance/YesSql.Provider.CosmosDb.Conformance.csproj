@@ -14,11 +14,12 @@
     <TreatWarningsAsErrors>false</TreatWarningsAsErrors>
   </PropertyGroup>
 
-  <!-- YesSql's own v5.4.7 test suite, source-linked from the spike clone, compiled against the same
-       NuGet YesSql 5.4.7 that the provider references (one assembly, no version conflict). The
-       relational providers' own test classes are excluded. -->
+  <!-- YesSql's own v5.4.7 test suite, source-linked and compiled against the same NuGet YesSql 5.4.7
+       the provider references (one assembly, no version conflict); the relational providers' own test
+       classes are excluded. Clone YesSql v5.4.7 into ./external first (see scripts/clone-yessql.ps1 or
+       the CI workflow), or override YesSqlTestsDir to point at an existing clone. -->
   <PropertyGroup>
-    <YesSqlTestsDir>Z:\SOURCE\SCRATCH\YesSqlCosmosSpike\yessql\test\YesSql.Tests</YesSqlTestsDir>
+    <YesSqlTestsDir Condition="'$(YesSqlTestsDir)' == ''">$(MSBuildThisFileDirectory)..\..\external\yessql\test\YesSql.Tests</YesSqlTestsDir>
   </PropertyGroup>
 
   <ItemGroup>

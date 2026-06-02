@@ -100,6 +100,12 @@ dotnet test test/Conformance/YesSql.Provider.CosmosDb.Conformance.csproj
 
 `net8.0;net10.0` — matching YesSql 5.4.7.
 
+## Continuous integration
+
+A ready-to-use GitHub Actions workflow (build + Cosmos emulator + tests + pack) lives at
+[`docs/github-actions-ci.yml`](docs/github-actions-ci.yml). To enable it, copy it to
+`.github/workflows/ci.yml` and push (adding a workflow file requires a token with the `workflow` scope).
+
 ## License
 
-MIT
+MIT — see [LICENSE](LICENSE).

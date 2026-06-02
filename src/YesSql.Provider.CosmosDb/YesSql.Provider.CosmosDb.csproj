@@ -9,11 +9,27 @@
 
   <PropertyGroup Label="Package">
     <PackageId>YesSql.Provider.CosmosDb</PackageId>
-    <Description>Azure Cosmos DB (NoSQL API) storage provider for YesSql.</Description>
+    <Version>0.1.0</Version>
+    <Description>Azure Cosmos DB (NoSQL API) storage provider for YesSql — run Orchard Core (and any YesSql-based store) on Cosmos DB. Supports map/reduce indexes, queries, optimistic concurrency, and atomic unit-of-work rollback (single-partition PerStore mode).</Description>
     <Authors>Ziltch</Authors>
-    <PackageTags>yessql;cosmosdb;azure;nosql;document-database;orchardcore</PackageTags>
+    <Company>Ziltch</Company>
+    <Copyright>Copyright (c) 2026 Ziltch</Copyright>
+    <PackageTags>yessql;cosmosdb;azure;nosql;document-database;orchardcore;orchard</PackageTags>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <PackageProjectUrl>https://github.com/erinloy/YesSql.Provider.CosmosDb</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/erinloy/YesSql.Provider.CosmosDb</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <PackageReleaseNotes>Initial preview. ~92% of YesSql's conformance suite; Orchard Core boots and runs on Cosmos. PerTable (scalable) and PerStore (single-partition, atomic rollback) modes.</PackageReleaseNotes>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <IncludeSymbols>true</IncludeSymbols>
+    <SymbolPackageFormat>snupkg</SymbolPackageFormat>
   </PropertyGroup>
+
+  <ItemGroup>
+    <None Include="..\..\README.md" Pack="true" PackagePath="\" />
+    <None Include="..\..\LICENSE" Pack="true" PackagePath="\" />
+  </ItemGroup>
 
   <ItemGroup>
     <PackageReference Include="Microsoft.Azure.Cosmos" Version="3.60.0" />

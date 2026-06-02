@@ -23,3 +23,9 @@ secrets.json
 
 ## Orchard sample runtime data
 **/App_Data/
+
+## YesSql conformance sources (cloned by scripts/clone-yessql.ps1 or CI)
+external/
+
+## Package output
+artifacts/

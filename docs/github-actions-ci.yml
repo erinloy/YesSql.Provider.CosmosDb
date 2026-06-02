@@ -1,0 +1,60 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build-test-pack:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: |
+            8.0.x
+            10.0.x
+
+      - name: Start Azure Cosmos DB emulator
+        run: |
+          docker run -d --name cosmos -p 8081:8081 \
+            mcr.microsoft.com/cosmosdb/linux/azure-cosmos-emulator:vnext-preview
+          echo "Waiting for the emulator data plane (PostgreSQL=OK)..."
+          for i in $(seq 1 60); do
+            if docker logs cosmos 2>&1 | grep -q "PostgreSQL=OK, Gateway=OK"; then
+              echo "emulator ready"; break
+            fi
+            sleep 5
+          done
+
+      - name: Clone YesSql conformance sources (v5.4.7)
+        run: git clone --depth 1 --branch v5.4.7 https://github.com/sebastienros/yessql external/yessql
+
+      - name: Build
+        run: dotnet build src/YesSql.Provider.CosmosDb/YesSql.Provider.CosmosDb.csproj -c Release
+
+      # Gate: the self-contained provider tests (CRUD, indexes, queries, rollback) must pass.
+      - name: Provider tests
+        run: dotnet test test/YesSql.Provider.CosmosDb.Tests/YesSql.Provider.CosmosDb.Tests.csproj -c Release -f net10.0
+
+      # Informational: YesSql's full conformance suite (~92% pass; the rest are non-Orchard / Cosmos-bounded).
+      - name: Conformance (PerTable)
+        continue-on-error: true
+        run: dotnet test test/Conformance/YesSql.Provider.CosmosDb.Conformance.csproj -c Release
+
+      - name: Conformance (PerStore)
+        continue-on-error: true
+        env:
+          COSMOS_PARTITION: PerStore
+        run: dotnet test test/Conformance/YesSql.Provider.CosmosDb.Conformance.csproj -c Release
+
+      - name: Pack
+        run: dotnet pack src/YesSql.Provider.CosmosDb/YesSql.Provider.CosmosDb.csproj -c Release -o ./artifacts
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nupkg
+          path: ./artifacts/*.nupkg
