@@ -1073,7 +1073,7 @@ public sealed class CosmosDbCommand : DbCommand
         }
 
         var cols = columns.ToArray();
-        var rows = items.Select(i => cols.Select(c => (object?)i[c]?.ToObject<object>()).ToArray()).ToList();
+        var rows = items.Select(i => cols.Select(c => FromToken(i[c])).ToArray()).ToList();
         return new CosmosDbDataReader(cols, rows);
     }
 
@@ -1490,7 +1490,30 @@ public sealed class CosmosDbCommand : DbCommand
         item["Version"]?.ToObject<long>(),
     ];
 
-    private static JToken ToToken(object? value) => value is null ? JValue.CreateNull() : JToken.FromObject(value);
+    private static JToken ToToken(object? value) => value switch
+    {
+        null => JValue.CreateNull(),
+        // JSON has no binary type; wrap byte[] self-descriptively so reads can recover it as byte[]
+        // (a bare base64 string would come back as a string and fail the byte[] cast).
+        byte[] bytes => new JObject { ["$b64"] = Convert.ToBase64String(bytes) },
+        _ => JToken.FromObject(value),
+    };
+
+    // Reverse of ToToken for reading column values: recover wrapped byte[]; otherwise the raw CLR value.
+    private static object? FromToken(JToken? token)
+    {
+        if (token is null || token.Type == JTokenType.Null)
+        {
+            return null;
+        }
+
+        if (token is JObject obj && obj["$b64"] is { } b64)
+        {
+            return Convert.FromBase64String(b64.Value<string>()!);
+        }
+
+        return token.ToObject<object>();
+    }
 
     private object? Param(string name)
         => TryParam(name, out var value) ? value : throw new InvalidOperationException($"Parameter '{name}' not found for: {CommandText}");
