@@ -270,21 +270,7 @@ public sealed class CosmosDbCommand : DbCommand
         // JOIN [Index] … WHERE … → count the matching DocumentIds.
         if (Regex.IsMatch(sql, @"count\s*\(", RegexOptions.IgnoreCase) && Regex.IsMatch(sql, @"\bjoin\b", RegexOptions.IgnoreCase))
         {
-            List<long> ids;
-            if (Regex.IsMatch(sql, @"\bon\s+\w+\.\[Id\]\s*=\s*\w+\.\[\w+Id\]", RegexOptions.IgnoreCase))
-            {
-                ids = await GatherReduceDocumentIdsAsync(sql, cancellationToken);
-            }
-            else if (IndexJoinTables(sql).Distinct().Count() >= 2)
-            {
-                ids = await GatherMultiIndexDocumentIdsAsync(sql, cancellationToken);
-            }
-            else
-            {
-                ids = await GatherDocumentIdsAsync(sql, cancellationToken);
-            }
-
-            return ids.Count;
+            return await CountJoinAsync(sql, cancellationToken);
         }
 
         // CountAsync without a join: SELECT count(*) FROM [<table>] [WHERE <predicate>] — count items in
@@ -326,6 +312,15 @@ public sealed class CosmosDbCommand : DbCommand
     protected override async Task<DbDataReader> ExecuteDbDataReaderAsync(CommandBehavior behavior, CancellationToken cancellationToken)
     {
         var sql = CommandText;
+
+        // A COUNT over a join run through the reader (raw Dapper QueryFirstOrDefaultAsync<int>, e.g. the
+        // Inner/Left/Right join count API) — compute the matching-DocumentId count and yield it as a single
+        // "count" column, before the join branches treat it as a row-returning query.
+        if (Regex.IsMatch(sql, @"\bcount\s*\(", RegexOptions.IgnoreCase) && Regex.IsMatch(sql, @"\bjoin\b", RegexOptions.IgnoreCase))
+        {
+            var joinCount = await CountJoinAsync(sql, cancellationToken);
+            return new CosmosDbDataReader(["count"], [[(object?)joinCount]]);
+        }
 
         // Reduce-index query — a doc↔bridge↔index three-way join, recognised by the index↔bridge join
         // "ON a.[Id] = b.[<X>Id]". Resolve via index → bridge → documents.
@@ -428,8 +423,10 @@ public sealed class CosmosDbCommand : DbCommand
     // the query has an ORDER BY). Shared by the reader (then point-reads) and CountAsync.
     private async Task<System.Collections.Generic.List<long>> GatherDocumentIdsAsync(string sql, CancellationToken cancellationToken)
     {
+        // Accept both the .With() form ("… = [Document].[Id]") and the raw SqlBuilder join form
+        // ("… = d.[Id]", aliased) so InnerJoin/LeftJoin/RightJoin over Document⋈Index parse.
         var join = Regex.Match(sql,
-            @"join\s+\[([^\]]+)\]\s+as\s+(\w+)\s+on\s+\w+\.\[DocumentId\]\s*=\s*\[[^\]]+\]\.\[Id\]",
+            @"join\s+\[([^\]]+)\]\s+as\s+(\w+)\s+on\s+\w+\.\[DocumentId\]\s*=\s*(?:\w+|\[[^\]]+\])\.\[Id\]",
             RegexOptions.IgnoreCase);
 
         if (!join.Success)
@@ -827,6 +824,27 @@ public sealed class CosmosDbCommand : DbCommand
     }
 
     private static bool IsDocumentTable(string table) => table.EndsWith("Document", StringComparison.OrdinalIgnoreCase);
+
+    // Count the matching DocumentIds for a COUNT over a join (reduce / multi-index / single-index). Shared
+    // by the scalar path (CountAsync) and the reader path (raw Inner/Left/Right join count API).
+    private async Task<long> CountJoinAsync(string sql, CancellationToken cancellationToken)
+    {
+        System.Collections.Generic.List<long> ids;
+        if (Regex.IsMatch(sql, @"\bon\s+\w+\.\[Id\]\s*=\s*\w+\.\[\w+Id\]", RegexOptions.IgnoreCase))
+        {
+            ids = await GatherReduceDocumentIdsAsync(sql, cancellationToken);
+        }
+        else if (IndexJoinTables(sql).Distinct().Count() >= 2)
+        {
+            ids = await GatherMultiIndexDocumentIdsAsync(sql, cancellationToken);
+        }
+        else
+        {
+            ids = await GatherDocumentIdsAsync(sql, cancellationToken);
+        }
+
+        return ids.Count;
+    }
 
     // Count items in a partition: SELECT count(...) FROM [<table>] [WHERE <predicate>]. Shared by the
     // scalar path (CountAsync) and the reader path (raw Dapper QueryFirstOrDefaultAsync<int>).
