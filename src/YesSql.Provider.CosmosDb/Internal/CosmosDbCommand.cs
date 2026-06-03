@@ -86,6 +86,43 @@ public sealed class CosmosDbCommand : DbCommand
     {
         var sql = CommandText.TrimStart();
 
+        // RenameColumn DDL (emitted by the schema interpreter): rewrite the field on every row in the
+        // partition. Cosmos is schemaless, so a column rename is a data rewrite, not metadata.
+        if (StartsWith(sql, "renamecolumn"))
+        {
+            var rename = Regex.Match(sql, @"renamecolumn\s+\[([^\]]+)\]\s+\[([^\]]+)\]\s+\[([^\]]+)\]", RegexOptions.IgnoreCase);
+            if (!rename.Success)
+            {
+                return 0;
+            }
+
+            var renameTable = rename.Groups[1].Value;
+            var oldColumn = rename.Groups[2].Value;
+            var newColumn = rename.Groups[3].Value;
+
+            var renameQuery = new QueryDefinition("SELECT * FROM c WHERE " + Scoped(renameTable)).WithParameter("@pk", PkValue(renameTable));
+            var renamed = 0;
+            using var renameIterator = CosmosContainer.GetItemQueryIterator<JObject>(renameQuery,
+                requestOptions: new QueryRequestOptions { PartitionKey = PartitionKeyFor(renameTable) });
+            while (renameIterator.HasMoreResults)
+            {
+                foreach (var item in await renameIterator.ReadNextAsync(cancellationToken))
+                {
+                    if (item.Property(oldColumn) is null)
+                    {
+                        continue;
+                    }
+
+                    item[newColumn] = item[oldColumn];
+                    item.Remove(oldColumn);
+                    await CosmosContainer.UpsertItemAsync(item, PartitionKeyFor(renameTable), cancellationToken: cancellationToken);
+                    renamed++;
+                }
+            }
+
+            return renamed;
+        }
+
         // Reduce-index bridge row (Index↔Document link). The columns (e.g. [ArticlesByDayId],
         // [DocumentId]) don't match the param names (@Id, @DocumentId), so map columns→params by
         // position. Composite key (<indexFk>:<documentId>) — many rows share an index Id.
@@ -179,6 +216,28 @@ public sealed class CosmosDbCommand : DbCommand
                 if (!name.Equals("Id", StringComparison.OrdinalIgnoreCase))
                 {
                     item[name] = ToToken(p.Value is DBNull ? null : p.Value);
+                }
+            }
+
+            // INSERT with literal VALUES (no parameters), e.g. "INSERT INTO [T] ([C1]) VALUES ('v')" — map
+            // each "[Column]" to its parsed literal. Parameterised positions (@p) are already handled above.
+            if (!isUpdate)
+            {
+                var insertMatch = Regex.Match(sql, @"insert\s+into\s+\[[^\]]+\]\s*\(([^)]*)\)\s*values\s*\((.*)\)", RegexOptions.IgnoreCase | RegexOptions.Singleline);
+                if (insertMatch.Success)
+                {
+                    var insertCols = Regex.Matches(insertMatch.Groups[1].Value, @"\[([^\]]+)\]").Select(m => m.Groups[1].Value).ToList();
+                    var insertVals = SplitTopLevelCommas(insertMatch.Groups[2].Value);
+                    for (var i = 0; i < insertCols.Count && i < insertVals.Count; i++)
+                    {
+                        var raw = insertVals[i].Trim();
+                        if (raw.StartsWith('@') || insertCols[i].Equals("Id", StringComparison.OrdinalIgnoreCase))
+                        {
+                            continue;
+                        }
+
+                        item[insertCols[i]] = ParseSqlLiteral(raw);
+                    }
                 }
             }
 
@@ -872,6 +931,71 @@ public sealed class CosmosDbCommand : DbCommand
         }
 
         return 0L;
+    }
+
+    // Split a comma-separated list at top level, respecting single-quoted strings and nested parentheses.
+    private static System.Collections.Generic.List<string> SplitTopLevelCommas(string s)
+    {
+        var parts = new System.Collections.Generic.List<string>();
+        var depth = 0;
+        var inString = false;
+        var start = 0;
+        for (var i = 0; i < s.Length; i++)
+        {
+            var ch = s[i];
+            if (ch == '\'')
+            {
+                inString = !inString;
+            }
+            else if (!inString && ch == '(')
+            {
+                depth++;
+            }
+            else if (!inString && ch == ')')
+            {
+                depth--;
+            }
+            else if (!inString && depth == 0 && ch == ',')
+            {
+                parts.Add(s[start..i]);
+                start = i + 1;
+            }
+        }
+
+        parts.Add(s[start..]);
+        return parts;
+    }
+
+    // Parse a SQL literal (quoted string, number, bool, or NULL) into a JToken.
+    private static JToken ParseSqlLiteral(string raw)
+    {
+        raw = raw.Trim();
+        if (raw.Equals("null", StringComparison.OrdinalIgnoreCase))
+        {
+            return JValue.CreateNull();
+        }
+
+        if (raw.Length >= 2 && raw[0] == '\'' && raw[^1] == '\'')
+        {
+            return new JValue(raw[1..^1].Replace("''", "'"));
+        }
+
+        if (raw.Equals("true", StringComparison.OrdinalIgnoreCase) || raw.Equals("false", StringComparison.OrdinalIgnoreCase))
+        {
+            return new JValue(bool.Parse(raw));
+        }
+
+        if (long.TryParse(raw, out var l))
+        {
+            return new JValue(l);
+        }
+
+        if (double.TryParse(raw, System.Globalization.NumberStyles.Any, System.Globalization.CultureInfo.InvariantCulture, out var d))
+        {
+            return new JValue(d);
+        }
+
+        return new JValue(raw);
     }
 
     private static string? ExtractWhere(string sql)
