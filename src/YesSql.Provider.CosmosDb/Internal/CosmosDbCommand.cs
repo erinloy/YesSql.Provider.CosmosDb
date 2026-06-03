@@ -1289,16 +1289,26 @@ public sealed class CosmosDbCommand : DbCommand
     // bridge rows linking them to documents, then the document ids.
     private async Task<List<long>> GatherReduceDocumentIdsAsync(string sql, CancellationToken cancellationToken)
     {
-        var bridge = Regex.Match(sql, @"join\s+\[([^\]]+)\]\s+as\s+\w+\s+on\s+\w+\.\[DocumentId\]\s*=\s*\[[^\]]+\]\.\[Id\]", RegexOptions.IgnoreCase);
-        var index = Regex.Match(sql, @"join\s+\[([^\]]+)\]\s+as\s+\w+\s+on\s+\w+\.\[Id\]\s*=\s*\w+\.\[(\w+)\]", RegexOptions.IgnoreCase);
-        if (!bridge.Success || !index.Success)
+        // index↔bridge join: "JOIN [Index] AS idx ON idx.[Id] = <bridgeAlias>.[<FK>]". Capture the bridge
+        // alias so we pick the RIGHT bridge — a query may also join plain map indexes (.With<Map>()) whose
+        // "[DocumentId] = [Document].[Id]" join looks identical to the reduce bridge's.
+        var index = Regex.Match(sql, @"join\s+\[([^\]]+)\]\s+as\s+(\w+)\s+on\s+\w+\.\[Id\]\s*=\s*(\w+)\.\[(\w+)\]", RegexOptions.IgnoreCase);
+        if (!index.Success)
+        {
+            throw new NotSupportedException($"Unsupported reduce query: {CommandText}");
+        }
+
+        var indexTable = index.Groups[1].Value;
+        var bridgeAlias = index.Groups[3].Value;
+        var bridgeForeignKey = index.Groups[4].Value;
+
+        var bridge = Regex.Match(sql, @"join\s+\[([^\]]+)\]\s+as\s+" + Regex.Escape(bridgeAlias) + @"\s+on\s+" + Regex.Escape(bridgeAlias) + @"\.\[DocumentId\]\s*=\s*(?:\w+|\[[^\]]+\])\.\[Id\]", RegexOptions.IgnoreCase);
+        if (!bridge.Success)
         {
             throw new NotSupportedException($"Unsupported reduce query: {CommandText}");
         }
 
         var bridgeTable = bridge.Groups[1].Value;
-        var indexTable = index.Groups[1].Value;
-        var bridgeForeignKey = index.Groups[2].Value;
 
         var where = ExtractWhere(sql);
         var indexWhere = string.Empty;
@@ -1355,6 +1365,32 @@ public sealed class CosmosDbCommand : DbCommand
                     }
                 }
             }
+        }
+
+        // A reduce query may also join plain map indexes (.With<Map>().With<Reduce>()). Intersect: keep only
+        // documents that also have a row in each such map index (the bridge itself is excluded by alias).
+        foreach (var (mapTable, mapAlias) in IndexJoins(sql))
+        {
+            if (documentIds.Count == 0 || mapAlias.Equals(bridgeAlias, StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            var mapIds = new HashSet<long>();
+            var mapQuery = new QueryDefinition("SELECT VALUE c.DocumentId FROM c WHERE " + Scoped(mapTable) + " AND ARRAY_CONTAINS(@__ids, c.DocumentId)")
+                .WithParameter("@pk", PkValue(mapTable))
+                .WithParameter("@__ids", documentIds);
+            using var mapIterator = CosmosContainer.GetItemQueryIterator<long>(mapQuery,
+                requestOptions: new QueryRequestOptions { PartitionKey = PartitionKeyFor(mapTable) });
+            while (mapIterator.HasMoreResults)
+            {
+                foreach (var v in await mapIterator.ReadNextAsync(cancellationToken))
+                {
+                    mapIds.Add(v);
+                }
+            }
+
+            documentIds = documentIds.Where(mapIds.Contains).ToList();
         }
 
         return documentIds;
