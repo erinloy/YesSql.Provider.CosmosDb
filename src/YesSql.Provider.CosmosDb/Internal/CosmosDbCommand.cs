@@ -1019,11 +1019,30 @@ public sealed class CosmosDbCommand : DbCommand
 
     // Rewrite SQL column refs (alias.[Col], [table].[Col], or bare [Col]) → Cosmos c["Col"] (single
     // pass so an already-rewritten c["Col"] is not reprocessed), then map SQL null tests to Cosmos.
-    private static string TranslateWhere(string where)
+    private string TranslateWhere(string where)
     {
         where = Regex.Replace(where, @"(?:(?:\w+|\[[^\]]+\])\.)?\[([^\]]+)\]", "c[\"$1\"]");
         where = Regex.Replace(where, @"(c\[""[^""]+""\])\s+is\s+not\s+null", "(IS_DEFINED($1) AND NOT IS_NULL($1))", RegexOptions.IgnoreCase);
         where = Regex.Replace(where, @"(c\[""[^""]+""\])\s+is\s+null", "(NOT IS_DEFINED($1) OR IS_NULL($1))", RegexOptions.IgnoreCase);
+
+        // Compare DateTime/DateTimeOffset parameters by instant (DateTimeToTimestamp) rather than by the raw
+        // ISO text, so a DateTimeOffset field ("…+00:00") matches a DateTime value ("…Z") for the same moment.
+        // Only predicates against a date parameter are wrapped, so non-date comparisons are untouched.
+        foreach (DbParameter p in _parameters)
+        {
+            if (p.Value is not (DateTime or DateTimeOffset))
+            {
+                continue;
+            }
+
+            var paramRef = "@" + p.ParameterName.TrimStart('@');
+            var escaped = Regex.Escape(paramRef);
+            where = Regex.Replace(where, @"(c\[""[^""]+""\])\s*(=|!=|<>|<=|>=|<|>)\s*" + escaped + @"(?![\w])",
+                "DateTimeToTimestamp($1) $2 DateTimeToTimestamp(" + paramRef + ")");
+            where = Regex.Replace(where, escaped + @"(?![\w])\s*(=|!=|<>|<=|>=|<|>)\s*(c\[""[^""]+""\])",
+                "DateTimeToTimestamp(" + paramRef + ") $1 DateTimeToTimestamp($2)");
+        }
+
         return where;
     }
 
