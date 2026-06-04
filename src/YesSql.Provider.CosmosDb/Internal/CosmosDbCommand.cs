@@ -1025,7 +1025,16 @@ public sealed class CosmosDbCommand : DbCommand
     private static string BuildOffsetLimitClause(string sql)
     {
         var limit = ExtractLimit(sql);
-        return limit.HasValue ? $" OFFSET {ExtractOffset(sql)} LIMIT {limit.Value}" : string.Empty;
+        var offset = ExtractOffset(sql);
+        if (limit.HasValue)
+        {
+            return $" OFFSET {offset} LIMIT {limit.Value}";
+        }
+
+        // Bare OFFSET with no LIMIT (e.g. .Skip(n) without .Take(...)): Cosmos rejects OFFSET on its own, so
+        // pair it with a sentinel max LIMIT to skip the first n rows and return all the rest. (The in-memory
+        // Skip that used to handle this was removed once paging moved into the Cosmos query.)
+        return offset > 0 ? $" OFFSET {offset} LIMIT {int.MaxValue}" : string.Empty;
     }
 
     // Rewrite SQL column refs (alias.[Col], [table].[Col], or bare [Col]) → Cosmos c["Col"] (single

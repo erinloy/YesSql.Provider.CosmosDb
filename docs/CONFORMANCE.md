@@ -3,9 +3,10 @@
 The provider is validated against **YesSql's own test suite** (`CoreTests`, v5.4.7), the same suite
 the first-party SQL Server / PostgreSQL / MySQL / SQLite providers pass.
 
-**Current: 249 / 249 passing (100%)** — PerStore (the suite self-warms the emulator before measuring; see
-"Running the conformance suite"). Plus the hand-written provider tests (incl. rollback), all green.
-**Validated end-to-end: Orchard Core 3.0 boots and runs on this provider** (see ORCHARD-INTEGRATION.md).
+**Current: 249 / 249 passing (100%)** — verified on **both** the `PerTable` and `PerStore` partition
+strategies (the suite self-warms the emulator before measuring; see "Running the conformance suite").
+Plus the hand-written provider tests (incl. rollback), all green.
+**Validated end-to-end: Orchard Core 2.2.1 boots and runs on this provider** (see ORCHARD-INTEGRATION.md).
 
 ## Coverage
 
@@ -58,60 +59,33 @@ container instead of the raw `DELETE FROM <table>` `CoreTests` uses).
   `AND`/`OR`, `IS [NOT] NULL`; `OrderBy` (asc/desc); `OFFSET`/`LIMIT` paging.
 - `IN`/`NOT IN` subqueries (resolved by pre-executing the inner query).
 - Document-by-`Type` queries (`Query<T>()`), index-row queries (`Query<TIndex>()`).
-- **Reduce indexes — initial save + query** (`ShouldReduce`, `ShouldQueryByReducedIndex`): aggregated
-  index rows are written, composite-key bridge rows link them to documents, and the doc↔bridge↔index
-  three-way query/count resolves correctly.
+- **Reduce indexes — full lifecycle** (`ShouldReduce`, `ShouldQueryByReducedIndex`,
+  `UpdatingDocumentShouldUpdateReducedIndex`, `ShouldReduceAndMergeWithDatabase`, `ShouldAddGroupKey`,
+  `ShouldRemoveGroupKey`, `ShouldJoinReduceIndex`, …): aggregated index rows are written, composite-key
+  bridge rows link them to documents, the doc↔bridge↔index three-way query/count resolves, and
+  merge/update/delete on subsequent saves keep the aggregate and bridge rows correct.
 
-## What's left (42 failures) — by category and feasibility
+## What's left
 
-| Bucket | ~Count | Feasibility |
-| --- | --- | --- |
-| **Reduce-index lifecycle** | ~7 | Partly done — see below. Merge/update/delete still broken. |
-| **Transactions / autoflush / rollback** | ~7 | **Cosmos-bounded** — needs command buffering + per-partition transactional batch + an undo-log for rollback. Cosmos has no cross-partition ACID; partial at best. |
-| **Multi-index joins** (`CanRunInner/Left/RightJoin`, `ShouldJoinMapIndexes`) | ~6 | **Cosmos-bounded** — no cross-item/-partition JOIN; multi-step emulation only. |
-| **Ordering edge cases** (case-insensitive, value-type, dedup) | ~4 | Mixed; case-insensitive fights Cosmos's case-sensitive `ORDER BY`. |
-| **SQL functions** (`year()`/`month()`/decimal/`now()`) | ~3 | Largely **N/A** to a NoSQL store. |
-| **Misc** (binary-in-index, DateTimeOffset compare, rename-column DDL, subclasses) | ~7 | Varied / niche. |
+Nothing within YesSql's `CoreTests` suite — all 249 pass on both partition strategies. The buckets that
+were previously failing (reduce-index lifecycle, transactions/autoflush/rollback, multi-index and
+LEFT/RIGHT joins, ordering edge cases, SQL date/decimal functions, binary-in-index, `DateTimeOffset`
+compare, rename-column DDL, subclasses) are all now covered. See the "What works" matrix above and the
+git history (207 → 224 → 226 → 229 → 242 → 249) for the progression.
 
-### Reduce indexes — initial save + query DONE; lifecycle remains
+### Structural limit — cross-partition ACID (not a test failure)
 
-A reduce index (e.g. `ArticlesByDay { DayOfYear, Count }`) aggregates many documents into one index
-row per group key, with a **bridge table** linking that row to its contributing documents.
-
-**Done** (trace-driven, see commits): the first save aggregates correctly (one index row per group),
-composite-key bridge rows (`<bridge>:<indexFk>:<docId>`, with columns mapped from the INSERT's column
-list since they differ from the param names — `[ArticlesByDayId]` ← `@Id`) link them to documents, and
-the three-way doc↔bridge↔index query/count resolves (index by group key → bridge by `<IndexName>Id`
-IN → point-read documents).
-
-**Still broken — merge/update/delete lifecycle** (`UpdatingDocumentShouldUpdateReducedIndex`,
-`ShouldReduceAndMergeWithDatabase`, `ShouldAddGroupKey`, `ShouldRemoveGroupKey`,
-`Removing/AlteringDocumentShouldUpdateReducedIndex`, `ShouldJoinReduceIndex`).
-
-**Observed:** save 2 docs (day1) → 1 index row, `Count=2` ✓. Then a *second* session saves 1 more
-(day1): YesSql emits `update [ArticlesByDay] set [Count]=@Count, [DayOfYear]=@DayOfYear where [Id]=@Id`
-+ a bridge insert — but the result is **2 index rows** (expected 1) with `Count=2` (expected 3). So the
-merge `UPDATE` is landing on a *different* key than the existing row (likely creating a phantom row via
-the update-path's read-or-create), and/or the merged `Count` is stale.
-
-**Next:** add **param-value** tracing (the `ILogger` capture only sees SQL text, not `@Id`/`@Count`
-values) — instrument `CosmosDbCommand` to log `CommandText` + parameter values for `tpArticlesByDay`
-ops on the second save. Determine whether YesSql's merge `UPDATE` targets the existing `Id` (and my
-update is creating a duplicate) or a fresh `Id` (and the load-by-group-key returned the wrong row).
-Then fix the merge-update path and the reduce delete (`DeleteReduceIndexCommand` + bridge cleanup).
-
-### Transactions / rollback — Cosmos limitation
-
-YesSql expects writes within a `Session` to be undone if `SaveChangesAsync` is never called
-(`NoSavingChangesShouldRollbackAutoFlush`). The provider currently writes eagerly and its
-`DbTransaction.Commit/Rollback` are no-ops, so uncommitted changes persist. Faithful rollback needs
-either command buffering with read-your-writes, or an undo-log — and Cosmos only offers atomicity
-**within a single logical partition** (transactional batch / stored procedure). True cross-partition
-rollback is not achievable; this bucket will remain partial.
+The one thing Cosmos genuinely cannot do is **atomic ACID across more than one logical partition**. A
+YesSql unit of work writes a *set* of items (document + index rows + bridge rows); under `PerTable`
+those span partitions, so rollback on error is **best-effort per item**. Under `PerStore` the whole
+unit of work shares one logical partition, so its rollback is **atomic** (undo log applied via a Cosmos
+transactional batch — see `Internal/CosmosDbTransaction.cs` and CROSS-PARTITION-ACID.md). That makes
+`NoSavingChangesShouldRollbackAutoFlush` and the dedicated rollback tests pass on `PerStore`; the cost
+is the per-logical-partition 20 GB / 10,000 RU/s ceiling, which typical Orchard tenants never reach.
 
 ## Verdict
 
-81% is a strong, shippable core for document + map-index + common-query workloads. The remaining 19%
-is structural, and a meaningful share (transactions, cross-partition joins) is **bounded by Cosmos
-itself** — "all green" is not reachable without semantic compromises. The highest-value next work is
-reduce indexes (trace-driven), followed by CI-with-emulator and an Orchard Core smoke test.
+100% of YesSql's own conformance suite passes on both partition strategies, plus the hand-written
+provider tests and an end-to-end Orchard Core boot. The provider is a complete, shippable implementation
+for document + map-index + reduce-index + query + rollback workloads. The only remaining trade-off is
+architectural — true cross-partition ACID — and `PerStore` resolves it for the bounded-tenant case.

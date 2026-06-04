@@ -94,8 +94,13 @@ Add a `CosmosDb` constant to `DatabaseProviderValue`, a `case` to both switches,
 but makes Orchard depend on the Cosmos provider package; best done as a PR or a small Orchard module.
 
 ## Smoke-test plan
-1. Minimal ASP.NET Core host + `AddOrchardCore().AddDataAccess()` (or the `OrchardCore.Application.*`
+
+Steps 1–2 are **done and validated** (see the banner above — `samples/OrchardSmokeTest` boots a tenant
+via AutoSetup on Cosmos and serves the site). Steps 3–4 remain as deeper manual exercises, not yet run:
+
+1. ✅ Minimal ASP.NET Core host + `AddOrchardCore().AddDataAccess()` (or the `OrchardCore.Application.*`
    meta-package) targeting the Cosmos emulator.
-2. Use Option A to force `UseCosmosDb`, AutoSetup to provision a tenant.
-3. Exercise: create a content type, create/edit/publish/delete content items, list and filter them.
-4. Watch the request-rollback path (intentional failure) to confirm the documented limitation.
+2. ✅ Use Option A to force `UseCosmosDb`, AutoSetup to provision a tenant.
+3. ⬜ Exercise: create a content type, create/edit/publish/delete content items, list and filter them.
+4. ⬜ Watch the request-rollback path (intentional failure) to confirm the documented limitation
+   (`PerTable` best-effort vs `PerStore` atomic).
