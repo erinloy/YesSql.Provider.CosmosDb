@@ -24,6 +24,15 @@ public sealed class CosmosDbConnection : DbConnection
     // connection. Lazy<T> guarantees the client is constructed exactly once even under concurrent first-opens.
     private static readonly ConcurrentDictionary<string, Lazy<CosmosClient>> SharedClients = new();
 
+    // Creating the database/container is a Cosmos CONTROL-PLANE (metadata) operation — cheap on the Postgres-
+    // backed emulator but EXPENSIVE and heavily rate-limited on real Cosmos. YesSql opens a DbConnection per
+    // unit-of-work, so calling CreateDatabaseIfNotExists + CreateContainerIfNotExists on EVERY open hammers the
+    // control plane; under setup load the throttled metadata operation parks forever (the connection never
+    // finishes opening). Ensure the database+container EXACTLY ONCE per (endpoint,db,container) for the process;
+    // Lazy<Task> guarantees the ensure runs a single time even under concurrent first-opens, and every other
+    // open just awaits the already-completed task.
+    private static readonly ConcurrentDictionary<string, Lazy<Task>> EnsuredContainers = new();
+
     private readonly CosmosDbOptions _options;
     private CosmosClient? _client;
     private Container? _container;
@@ -63,12 +72,25 @@ public sealed class CosmosDbConnection : DbConnection
 
         if (_options.CreateIfNotExists)
         {
-            var db = await _client.CreateDatabaseIfNotExistsAsync(_options.DatabaseId, cancellationToken: cancellationToken);
-            await db.Database.CreateContainerIfNotExistsAsync(_options.ContainerId, _options.PartitionKeyPath, cancellationToken: cancellationToken);
+            var client = _client;
+            var options = _options;
+            var ensureKey = $"{options.AccountEndpoint}\n{options.DatabaseId}\n{options.ContainerId}";
+            await EnsuredContainers.GetOrAdd(
+                ensureKey,
+                _ => new Lazy<Task>(() => EnsureDatabaseAndContainerAsync(client, options))).Value;
         }
 
         _container = _client.GetContainer(_options.DatabaseId, _options.ContainerId);
         _state = ConnectionState.Open;
+    }
+
+    // Runs the (rate-limited, control-plane) database/container creation a single time per process. Not bound to
+    // any caller's CancellationToken on purpose: the result is shared by all connections, so a per-request cancel
+    // must not poison the shared ensure. Provisioning a database/container is a one-off bootstrap, not a hot path.
+    private static async Task EnsureDatabaseAndContainerAsync(CosmosClient client, CosmosDbOptions options)
+    {
+        var db = await client.CreateDatabaseIfNotExistsAsync(options.DatabaseId);
+        await db.Database.CreateContainerIfNotExistsAsync(options.ContainerId, options.PartitionKeyPath);
     }
 
     public override void Open() => OpenAsync(CancellationToken.None).GetAwaiter().GetResult();
