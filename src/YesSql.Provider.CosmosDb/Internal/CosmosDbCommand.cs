@@ -1017,6 +1017,17 @@ public sealed class CosmosDbCommand : DbCommand
         return m.Success ? int.Parse(m.Groups[1].Value) : 0;
     }
 
+    // Push paging into the Cosmos query (OFFSET … LIMIT) so a BOUNDED result set is returned. Without this the
+    // provider fetches every matching document in the partition and trims client-side — which is fast on the
+    // Postgres-backed emulator but degrades to an effective hang on real Cosmos as a partition fills (it returns
+    // the entire matching set just to take the first row). Cosmos requires OFFSET and LIMIT together; ORDER BY is
+    // optional (already appended separately when present).
+    private static string BuildOffsetLimitClause(string sql)
+    {
+        var limit = ExtractLimit(sql);
+        return limit.HasValue ? $" OFFSET {ExtractOffset(sql)} LIMIT {limit.Value}" : string.Empty;
+    }
+
     // Rewrite SQL column refs (alias.[Col], [table].[Col], or bare [Col]) → Cosmos c["Col"] (single
     // pass so an already-rewritten c["Col"] is not reprocessed), then map SQL null tests to Cosmos.
     private string TranslateWhere(string where)
@@ -1073,7 +1084,7 @@ public sealed class CosmosDbCommand : DbCommand
             }
         }
 
-        var queryDef = new QueryDefinition("SELECT * FROM c WHERE " + Scoped(docTable) + (typeFilter is not null ? " AND c.Type = @Type" : string.Empty) + BuildOrderClause(sql))
+        var queryDef = new QueryDefinition("SELECT * FROM c WHERE " + Scoped(docTable) + (typeFilter is not null ? " AND c.Type = @Type" : string.Empty) + BuildOrderClause(sql) + BuildOffsetLimitClause(sql))
             .WithParameter("@pk", PkValue(docTable));
         if (typeFilter is not null)
         {
@@ -1093,12 +1104,8 @@ public sealed class CosmosDbCommand : DbCommand
             }
         }
 
-        IEnumerable<JObject> page = items.Skip(ExtractOffset(sql));
-        var limit = ExtractLimit(sql);
-        if (limit.HasValue)
-        {
-            page = page.Take(limit.Value);
-        }
+        // OFFSET/LIMIT is now applied by Cosmos (BuildOffsetLimitClause); items is already the page.
+        IEnumerable<JObject> page = items;
 
         // Honour the SELECT projection. Dapper reads result columns positionally, so a single-column
         // projection (e.g. "SELECT [Content]") must return exactly that column — returning the full
@@ -1170,7 +1177,7 @@ public sealed class CosmosDbCommand : DbCommand
         var where = ExtractWhere(sql);
         var cosmosWhere = string.IsNullOrWhiteSpace(where) ? string.Empty : " AND " + TranslateWhere(where!);
 
-        var queryDef = new QueryDefinition("SELECT * FROM c WHERE " + Scoped(indexTable) + cosmosWhere + BuildOrderClause(sql))
+        var queryDef = new QueryDefinition("SELECT * FROM c WHERE " + Scoped(indexTable) + cosmosWhere + BuildOrderClause(sql) + BuildOffsetLimitClause(sql))
             .WithParameter("@pk", PkValue(indexTable));
         foreach (DbParameter p in _parameters)
         {
@@ -1190,14 +1197,8 @@ public sealed class CosmosDbCommand : DbCommand
             }
         }
 
-        IEnumerable<JObject> paged = all.Skip(ExtractOffset(sql));
-        var limit = ExtractLimit(sql);
-        if (limit.HasValue)
-        {
-            paged = paged.Take(limit.Value);
-        }
-
-        var items = paged.ToList();
+        // OFFSET/LIMIT is now applied by Cosmos (BuildOffsetLimitClause); all is already the page.
+        var items = all;
         var columns = new List<string>();
         foreach (var item in items)
         {

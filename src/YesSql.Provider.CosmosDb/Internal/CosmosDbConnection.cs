@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Concurrent;
 using System.Data;
 using System.Data.Common;
 using System.Threading;
@@ -15,6 +16,14 @@ namespace YesSql.Provider.CosmosDb.Internal;
 /// </summary>
 public sealed class CosmosDbConnection : DbConnection
 {
+    // A CosmosClient is expensive — it owns its own socket pool and background monitor threads — and the SDK
+    // mandates a SINGLETON per account for the whole application lifetime. YesSql opens a DbConnection per
+    // unit-of-work, so creating a client per connection spawns one CosmosClient per session; under load (e.g.
+    // Orchard's setup/recipe execution) that exhausts sockets/connections and operations hang. Share ONE client
+    // per (endpoint,key) across all connections; it lives for the process lifetime and is never disposed per-
+    // connection. Lazy<T> guarantees the client is constructed exactly once even under concurrent first-opens.
+    private static readonly ConcurrentDictionary<string, Lazy<CosmosClient>> SharedClients = new();
+
     private readonly CosmosDbOptions _options;
     private CosmosClient? _client;
     private Container? _container;
@@ -46,9 +55,11 @@ public sealed class CosmosDbConnection : DbConnection
             return;
         }
 
-        _client ??= _options.ClientOptions is null
-            ? new CosmosClient(_options.AccountEndpoint, _options.AccountKey)
-            : new CosmosClient(_options.AccountEndpoint, _options.AccountKey, _options.ClientOptions);
+        _client = SharedClients.GetOrAdd(
+            _options.AccountEndpoint + "\n" + _options.AccountKey,
+            _ => new Lazy<CosmosClient>(() => _options.ClientOptions is null
+                ? new CosmosClient(_options.AccountEndpoint, _options.AccountKey)
+                : new CosmosClient(_options.AccountEndpoint, _options.AccountKey, _options.ClientOptions))).Value;
 
         if (_options.CreateIfNotExists)
         {
@@ -76,7 +87,8 @@ public sealed class CosmosDbConnection : DbConnection
     {
         if (disposing)
         {
-            _client?.Dispose();
+            // Do NOT dispose the shared CosmosClient — it is a process-lifetime singleton shared by every
+            // connection. Just detach this connection's references.
             _client = null;
             _container = null;
             _state = ConnectionState.Closed;
