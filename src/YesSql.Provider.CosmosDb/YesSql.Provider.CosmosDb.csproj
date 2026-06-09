@@ -9,7 +9,7 @@
 
   <PropertyGroup Label="Package">
     <PackageId>YesSql.Provider.CosmosDb</PackageId>
-    <Version>0.1.2</Version>
+    <Version>0.1.3</Version>
     <Description>Azure Cosmos DB (NoSQL API) storage provider for YesSql — run Orchard Core (and any YesSql-based store) on Cosmos DB. Supports map/reduce indexes, queries, optimistic concurrency, and atomic unit-of-work rollback (single-partition PerStore mode).</Description>
     <Authors>Ziltch</Authors>
     <Company>Ziltch</Company>
@@ -20,7 +20,7 @@
     <PackageProjectUrl>https://github.com/erinloy/YesSql.Provider.CosmosDb</PackageProjectUrl>
     <RepositoryUrl>https://github.com/erinloy/YesSql.Provider.CosmosDb</RepositoryUrl>
     <RepositoryType>git</RepositoryType>
-    <PackageReleaseNotes>0.1.2: fix paging regression — a bare OFFSET (.Skip without .Take) was dropped because Cosmos rejects OFFSET without LIMIT and the client-side fallback had been removed; now pairs a lone offset with a sentinel max LIMIT. Restores the full conformance suite to 249/249 (100%) on both PerTable and PerStore. 0.1.1: real-Azure-Cosmos correctness/scalability fixes found running a full Orchard Core setup against the classic (non-Postgres) emulator — (1) share a singleton CosmosClient per account instead of one per connection; (2) push OFFSET/LIMIT into Cosmos queries instead of trimming client-side; (3) provision database/container once per process, not on every connection open (control-plane ops are rate-limited on real Cosmos). 0.1.0: initial preview — ~92% of YesSql's conformance suite; Orchard Core boots and runs on Cosmos; PerTable and PerStore modes.</PackageReleaseNotes>
+    <PackageReleaseNotes>0.1.3: support bulk content-rewrite UPDATEs — "UPDATE [T] SET [Col] = REPLACE([Col], from, to) [WHERE pred]" (e.g. Orchard Core's serialized-$type rename migrations such as OrchardCore.Search.Lucene's query-type rename). Previously these fell through the single-row @Id-keyed UPDATE path and threw "Parameter 'Id' not found"; now translated to a query-modify-write over the matching partition items, with literal or @parameter REPLACE arguments and rollback support. 0.1.2: fix paging regression — a bare OFFSET (.Skip without .Take) was dropped because Cosmos rejects OFFSET without LIMIT and the client-side fallback had been removed; now pairs a lone offset with a sentinel max LIMIT. Restores the full conformance suite to 249/249 (100%) on both PerTable and PerStore. 0.1.1: real-Azure-Cosmos correctness/scalability fixes found running a full Orchard Core setup against the classic (non-Postgres) emulator — (1) share a singleton CosmosClient per account instead of one per connection; (2) push OFFSET/LIMIT into Cosmos queries instead of trimming client-side; (3) provision database/container once per process, not on every connection open (control-plane ops are rate-limited on real Cosmos). 0.1.0: initial preview — ~92% of YesSql's conformance suite; Orchard Core boots and runs on Cosmos; PerTable and PerStore modes.</PackageReleaseNotes>
     <GenerateDocumentationFile>true</GenerateDocumentationFile>
     <IncludeSymbols>true</IncludeSymbols>
     <SymbolPackageFormat>snupkg</SymbolPackageFormat>

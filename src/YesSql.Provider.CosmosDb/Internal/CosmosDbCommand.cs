@@ -148,6 +148,112 @@ public sealed class CosmosDbCommand : DbCommand
             return 1;
         }
 
+        // Bulk content rewrite: UPDATE [<table>] SET [<col>] = REPLACE([<col>], <from>, <to>) [WHERE <pred>].
+        // OrchardCore emits this to rename serialized $type names inside stored documents (e.g. the Lucene
+        // query type rename in OrchardCore.Search.Lucene's migration). It is NOT a single-row, @Id-keyed
+        // document write — there is no @Id — so it must not fall through to the patch-by-id UPDATE path below
+        // (which would throw "Parameter 'Id' not found"). Translate it to a query-modify-write: find the
+        // matching items in the partition and string-replace the column on each. (Document.Content is stored
+        // as a JSON string, so REPLACE is a plain string replace; arguments may be 'literals' or @parameters.)
+        if (StartsWith(sql, "update"))
+        {
+            var replaceHead = Regex.Match(sql, @"^update\s+\[([^\]]+)\]\s+set\s+\[([^\]]+)\]\s*=\s*replace\b",
+                RegexOptions.IgnoreCase);
+            var replaceOpen = replaceHead.Success ? sql.IndexOf('(', replaceHead.Index + replaceHead.Length) : -1;
+            if (replaceOpen >= 0)
+            {
+                // Balanced scan to REPLACE's closing paren, ignoring parens inside single-quoted literals
+                // (a doubled '' inside a literal nets to no toggle, so it stays "in string").
+                int depth = 0, replaceClose = -1;
+                var inLiteral = false;
+                for (var i = replaceOpen; i < sql.Length; i++)
+                {
+                    var ch = sql[i];
+                    if (ch == '\'')
+                    {
+                        inLiteral = !inLiteral;
+                    }
+                    else if (!inLiteral && ch == '(')
+                    {
+                        depth++;
+                    }
+                    else if (!inLiteral && ch == ')' && --depth == 0)
+                    {
+                        replaceClose = i;
+                        break;
+                    }
+                }
+
+                var trailing = replaceClose > 0 ? sql[(replaceClose + 1)..].Trim().TrimEnd(';').Trim() : "?";
+                var trailingWhere = Regex.Match(trailing, @"^where\s+(.*)$", RegexOptions.IgnoreCase | RegexOptions.Singleline);
+
+                // Only handle the clean "= REPLACE(col, from, to) [WHERE pred]" shape; anything else trailing
+                // (e.g. a second SET assignment) falls through to the generic path below.
+                if (replaceClose > replaceOpen && (trailing.Length == 0 || trailingWhere.Success))
+                {
+                    var replaceTable = replaceHead.Groups[1].Value;
+                    var replaceColumn = replaceHead.Groups[2].Value;
+                    var replaceArgs = SplitTopLevelCommas(sql[(replaceOpen + 1)..replaceClose]);
+                    if (replaceArgs.Count >= 3)
+                    {
+                        var fromValue = ResolveSqlValue(replaceArgs[1]);
+                        var toValue = ResolveSqlValue(replaceArgs[2]) ?? string.Empty;
+
+                        // A null/absent "from" can't drive a replace — no-op rather than corrupt content.
+                        if (fromValue is null)
+                        {
+                            return 0;
+                        }
+
+                        var replaceWhere = trailingWhere.Success ? trailingWhere.Groups[1].Value.Trim() : null;
+                        var cosmosWhere = string.IsNullOrWhiteSpace(replaceWhere) ? string.Empty : " AND " + TranslateWhere(replaceWhere!);
+                        var replaceQuery = new QueryDefinition("SELECT * FROM c WHERE " + Scoped(replaceTable) + cosmosWhere)
+                            .WithParameter("@pk", PkValue(replaceTable));
+                        foreach (DbParameter p in _parameters)
+                        {
+                            replaceQuery = replaceQuery.WithParameter("@" + p.ParameterName.TrimStart('@'), p.Value is DBNull ? null : p.Value);
+                        }
+
+                        var matches = new List<JObject>();
+                        using (var iterator = CosmosContainer.GetItemQueryIterator<JObject>(replaceQuery,
+                            requestOptions: new QueryRequestOptions { PartitionKey = PartitionKeyFor(replaceTable) }))
+                        {
+                            while (iterator.HasMoreResults)
+                            {
+                                foreach (var item in await iterator.ReadNextAsync(cancellationToken))
+                                {
+                                    matches.Add(item);
+                                }
+                            }
+                        }
+
+                        var replacedCount = 0;
+                        foreach (var item in matches)
+                        {
+                            if (item[replaceColumn]?.Type != JTokenType.String)
+                            {
+                                continue;
+                            }
+
+                            var current = item[replaceColumn]!.ToObject<string>()!;
+                            if (!current.Contains(fromValue, StringComparison.Ordinal))
+                            {
+                                continue;
+                            }
+
+                            var prior = (JObject)item.DeepClone();
+                            item[replaceColumn] = current.Replace(fromValue, toValue, StringComparison.Ordinal);
+                            await CosmosContainer.UpsertItemAsync(item, PartitionKeyFor(replaceTable), cancellationToken: cancellationToken);
+                            Undo?.Record(item["id"]!.ToString(), PkValue(replaceTable), prior);
+                            replacedCount++;
+                        }
+
+                        return replacedCount;
+                    }
+                }
+            }
+        }
+
         if (StartsWith(sql, "insert") || StartsWith(sql, "update"))
         {
             var table = ExtractTable(sql);
@@ -1666,6 +1772,29 @@ public sealed class CosmosDbCommand : DbCommand
         }
 
         return token.ToObject<object>();
+    }
+
+    // Resolve a value token that is either a SQL string literal ('… with '' escapes') or a bound @parameter,
+    // to its string value (null for a NULL literal or a null parameter). Used by the REPLACE-update path.
+    private string? ResolveSqlValue(string token)
+    {
+        token = token.Trim();
+        if (token.Length == 0 || token.Equals("null", StringComparison.OrdinalIgnoreCase))
+        {
+            return null;
+        }
+
+        if (token[0] == '@')
+        {
+            return TryParam(token.TrimStart('@'), out var value) ? value?.ToString() : null;
+        }
+
+        if (token.Length >= 2 && token[0] == '\'' && token[^1] == '\'')
+        {
+            return token[1..^1].Replace("''", "'");
+        }
+
+        return token;
     }
 
     private object? Param(string name)
