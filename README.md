@@ -1,3 +1,5 @@
+NOTICE: AI GENERATED SLOP. KNOWN TO WORK, BUT BARELY REVIEWED. TAKE APPROPRIATE PERCAUTIONS IN YOUR DOWNSTREAM AI GENERATED SLOP.
+
 # YesSql.Provider.CosmosDb
 
 An [Azure Cosmos DB](https://learn.microsoft.com/azure/cosmos-db/) (NoSQL API) storage provider for
