@@ -54,6 +54,18 @@ internal sealed class CosmosDbTransaction : DbTransaction
 
     public override async Task RollbackAsync(CancellationToken cancellationToken)
     {
+        try
+        {
+            await RollbackCoreAsync(cancellationToken);
+        }
+        catch (CosmosException ex)
+        {
+            throw new CosmosDbException(ex);
+        }
+    }
+
+    private async Task RollbackCoreAsync(CancellationToken cancellationToken)
+    {
         if (_committed || _undo.Count == 0)
         {
             return;

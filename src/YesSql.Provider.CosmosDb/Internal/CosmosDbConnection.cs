@@ -67,9 +67,16 @@ internal sealed class CosmosDbConnection : DbConnection
 
         var client = _client;
         var options = _options;
-        await EnsuredContainers.EnsureAsync(
-            options.AccountEndpoint + "\n" + options.DatabaseId + "\n" + options.ContainerId,
-            () => EnsureDatabaseAndContainerAsync(client, options)).ConfigureAwait(false);
+        try
+        {
+            await EnsuredContainers.EnsureAsync(
+                options.AccountEndpoint + "\n" + options.DatabaseId + "\n" + options.ContainerId,
+                () => EnsureDatabaseAndContainerAsync(client, options)).ConfigureAwait(false);
+        }
+        catch (CosmosException ex)
+        {
+            throw new CosmosDbException(ex);
+        }
 
         _container = _client.GetContainer(_options.DatabaseId, _options.ContainerId);
         _state = ConnectionState.Open;

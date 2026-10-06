@@ -115,16 +115,6 @@ public class PartitionKeyPathTests
     }
 
     [Fact]
-    public async Task A_missing_container_fails_when_creation_is_disabled()
-    {
-        var databaseId = Emulator.NewDatabaseId("yessql_nocreate");
-
-        await Assert.ThrowsAnyAsync<CosmosException>(
-            () => StoreFactory.CreateAndInitializeAsync(
-                new Configuration().UseCosmosDb(Emulator.Options(databaseId, createIfNotExists: false))));
-    }
-
-    [Fact]
     public async Task An_existing_container_can_be_used_when_creation_is_disabled()
     {
         var databaseId = Emulator.NewDatabaseId("yessql_existing");

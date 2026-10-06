@@ -106,6 +106,18 @@ internal sealed class CosmosDbCommand : DbCommand
 
     public override async Task<int> ExecuteNonQueryAsync(CancellationToken cancellationToken)
     {
+        try
+        {
+            return await ExecuteNonQueryCoreAsync(cancellationToken);
+        }
+        catch (CosmosException ex)
+        {
+            throw new CosmosDbException(ex);
+        }
+    }
+
+    private async Task<int> ExecuteNonQueryCoreAsync(CancellationToken cancellationToken)
+    {
         _derivedParameters.Clear();
         var sql = CommandText.TrimStart();
 
@@ -444,6 +456,18 @@ internal sealed class CosmosDbCommand : DbCommand
 
     public override async Task<object?> ExecuteScalarAsync(CancellationToken cancellationToken)
     {
+        try
+        {
+            return await ExecuteScalarCoreAsync(cancellationToken);
+        }
+        catch (CosmosException ex)
+        {
+            throw new CosmosDbException(ex);
+        }
+    }
+
+    private async Task<object?> ExecuteScalarCoreAsync(CancellationToken cancellationToken)
+    {
         _derivedParameters.Clear();
         var sql = CommandText;
 
@@ -498,6 +522,18 @@ internal sealed class CosmosDbCommand : DbCommand
     }
 
     protected override async Task<DbDataReader> ExecuteDbDataReaderAsync(CommandBehavior behavior, CancellationToken cancellationToken)
+    {
+        try
+        {
+            return await ExecuteReaderCoreAsync(cancellationToken);
+        }
+        catch (CosmosException ex)
+        {
+            throw new CosmosDbException(ex);
+        }
+    }
+
+    private async Task<DbDataReader> ExecuteReaderCoreAsync(CancellationToken cancellationToken)
     {
         _derivedParameters.Clear();
         var sql = CommandText;
@@ -680,7 +716,7 @@ internal sealed class CosmosDbCommand : DbCommand
         var orderTerms = ParseOrderTerms(sql);
         // DocumentId is already projected, so don't re-select it (Cosmos rejects the duplicate property).
         var extraOrderCols = orderTerms.Select(t => t.Column).Distinct()
-            .Where(col => !col.Equals("DocumentId", StringComparison.OrdinalIgnoreCase)).ToList();
+            .Where(col => col != RandomOrderColumn && !col.Equals("DocumentId", StringComparison.OrdinalIgnoreCase)).ToList();
         var projection = orderTerms.Count == 0
             ? "VALUE c.DocumentId"
             : "c.DocumentId" + string.Concat(extraOrderCols.Select(col => $", c[\"{col}\"]"));
@@ -773,8 +809,23 @@ internal sealed class CosmosDbCommand : DbCommand
     // Translate the SQL ORDER BY (which aggregates index columns as "MAX(a.[Col]) AS order_N" under the
     // GROUP BY) into a Cosmos "ORDER BY c["Col"] [DESC]" clause.
     // Parse the trailing ORDER BY into (column, descending) pairs for client-side sorting.
+    // Stands for the dialect's random-order clause among the parsed order terms. Cosmos cannot order by a function,
+    // so these terms are applied in the client.
+    private const string RandomOrderColumn = "$random";
+
+    private static readonly string RandomOrderClause = new CosmosDbDialect().RandomOrderByClause;
+
+    // The clause contains parentheses, which the ORDER BY parsing treats as the end of the list, so it is replaced
+    // by a plain token before parsing.
+    private const string RandomOrderToken = "__random__";
+
+    private static bool HasRandomOrder(string sql)
+        => ParseOrderTerms(sql).Any(term => term.Column == RandomOrderColumn);
+
     private static System.Collections.Generic.List<(string Column, bool Desc)> ParseOrderTerms(string sql)
     {
+        sql = sql.Replace(RandomOrderClause, RandomOrderToken, StringComparison.OrdinalIgnoreCase);
+
         var result = new System.Collections.Generic.List<(string, bool)>();
         var orderBys = Regex.Matches(sql, @"order\s+by\s+(.+?)(?:\boffset\b|\)|$)", RegexOptions.IgnoreCase | RegexOptions.Singleline);
         if (orderBys.Count == 0)
@@ -786,6 +837,11 @@ internal sealed class CosmosDbCommand : DbCommand
         foreach (Match m in Regex.Matches(sql, @"\(\s*\w+\.\[([^\]]+)\]\s*\)\s+as\s+(order_\d+)", RegexOptions.IgnoreCase))
         {
             aliasToColumn[m.Groups[2].Value] = m.Groups[1].Value;
+        }
+
+        foreach (Match m in Regex.Matches(sql, @"\(\s*" + RandomOrderToken + @"\s*\)\s+as\s+(order_\d+)", RegexOptions.IgnoreCase))
+        {
+            aliasToColumn[m.Groups[1].Value] = RandomOrderColumn;
         }
 
         foreach (var raw in orderBys[^1].Groups[1].Value.Split(','))
@@ -800,7 +856,11 @@ internal sealed class CosmosDbCommand : DbCommand
             var expr = Regex.Replace(term, @"\s+(asc|desc)\b", string.Empty, RegexOptions.IgnoreCase).Trim();
 
             string? column = null;
-            if (aliasToColumn.TryGetValue(expr, out var mapped))
+            if (expr.Equals(RandomOrderToken, StringComparison.Ordinal))
+            {
+                column = RandomOrderColumn;
+            }
+            else if (aliasToColumn.TryGetValue(expr, out var mapped))
             {
                 column = mapped;
             }
@@ -846,13 +906,21 @@ internal sealed class CosmosDbCommand : DbCommand
     // Stable client-side ordering of rows by the parsed order terms (shared by the index/join gatherers).
     private static System.Collections.Generic.IEnumerable<JObject> OrderRows(
         System.Collections.Generic.List<JObject> rows, System.Collections.Generic.List<(string Column, bool Desc)> orderTerms)
-        => rows
+    {
+        // A random term sorts by a random key drawn once per row, so the order is consistent within one sort.
+        var randomKeys = orderTerms.Any(term => term.Column == RandomOrderColumn)
+            ? rows.Select(_ => Random.Shared.NextDouble()).ToArray()
+            : null;
+
+        return rows
             .Select((row, index) => (Row: row, Index: index))
             .OrderBy(x => x, System.Collections.Generic.Comparer<(JObject Row, int Index)>.Create((x, y) =>
             {
                 foreach (var (column, desc) in orderTerms)
                 {
-                    var c = CompareTokens(x.Row[column], y.Row[column]);
+                    var c = column == RandomOrderColumn
+                        ? randomKeys![x.Index].CompareTo(randomKeys[y.Index])
+                        : CompareTokens(x.Row[column], y.Row[column]);
                     if (desc)
                     {
                         c = -c;
@@ -867,6 +935,20 @@ internal sealed class CosmosDbCommand : DbCommand
                 return x.Index.CompareTo(y.Index);
             }))
             .Select(x => x.Row);
+    }
+
+    // The ORDER BY and OFFSET/LIMIT clauses to run in Cosmos. A random order cannot be expressed in Cosmos, so the
+    // rows are fetched unordered and unpaged and ordered and paged in the client.
+    private static string OrderAndPagingClause(string sql, bool random)
+        => random ? string.Empty : BuildOrderClause(sql) + BuildOffsetLimitClause(sql);
+
+    // Applies the statement's OFFSET and LIMIT to rows that are already in their final order.
+    private static IEnumerable<JObject> PageOfRows(IEnumerable<JObject> rows, string sql)
+    {
+        var page = rows.Skip(ExtractOffset(sql));
+        var limit = ExtractLimit(sql);
+        return limit.HasValue ? page.Take(limit.Value) : page;
+    }
 
     private static string BuildOrderClause(string sql)
     {
@@ -1208,7 +1290,8 @@ internal sealed class CosmosDbCommand : DbCommand
             }
         }
 
-        var queryDef = new QueryDefinition("SELECT * FROM c WHERE " + Scoped(docTable) + (typeFilter is not null ? " AND c.Type = @Type" : string.Empty) + BuildOrderClause(sql) + BuildOffsetLimitClause(sql))
+        var random = HasRandomOrder(sql);
+        var queryDef = new QueryDefinition("SELECT * FROM c WHERE " + Scoped(docTable) + (typeFilter is not null ? " AND c.Type = @Type" : string.Empty) + OrderAndPagingClause(sql, random))
             .WithParameter("@pk", PkValue(docTable));
         if (typeFilter is not null)
         {
@@ -1228,8 +1311,8 @@ internal sealed class CosmosDbCommand : DbCommand
             }
         }
 
-        // OFFSET/LIMIT is now applied by Cosmos (BuildOffsetLimitClause); items is already the page.
-        IEnumerable<JObject> page = items;
+        // Cosmos applied ORDER BY and OFFSET/LIMIT, so items is already the page, unless the order is random.
+        IEnumerable<JObject> page = random ? PageOfRows(OrderRows(items, ParseOrderTerms(sql)), sql) : items;
 
         // Honour the SELECT projection. Dapper reads result columns positionally, so a single-column
         // projection (e.g. "SELECT [Content]") must return exactly that column — returning the full
@@ -1298,7 +1381,8 @@ internal sealed class CosmosDbCommand : DbCommand
         var where = ExtractWhere(sql);
         var cosmosWhere = string.IsNullOrWhiteSpace(where) ? string.Empty : " AND " + TranslateWhere(where!);
 
-        var queryDef = new QueryDefinition("SELECT * FROM c WHERE " + Scoped(indexTable) + cosmosWhere + BuildOrderClause(sql) + BuildOffsetLimitClause(sql))
+        var random = HasRandomOrder(sql);
+        var queryDef = new QueryDefinition("SELECT * FROM c WHERE " + Scoped(indexTable) + cosmosWhere + OrderAndPagingClause(sql, random))
             .WithParameter("@pk", PkValue(indexTable));
         queryDef = BindParameters(queryDef);
 
@@ -1315,8 +1399,8 @@ internal sealed class CosmosDbCommand : DbCommand
             }
         }
 
-        // OFFSET/LIMIT is now applied by Cosmos (BuildOffsetLimitClause); all is already the page.
-        var items = all;
+        // Cosmos applied ORDER BY and OFFSET/LIMIT, so all is already the page, unless the order is random.
+        var items = random ? PageOfRows(OrderRows(all, ParseOrderTerms(sql)), sql).ToList() : all;
         var columns = new List<string>();
         foreach (var item in items)
         {
@@ -1452,7 +1536,8 @@ internal sealed class CosmosDbCommand : DbCommand
         if (orderTerms.Count > 0 && documentIds.Count > 0)
         {
             var orderCols = orderTerms.Select(t => t.Column).Distinct()
-                .Where(col => !col.Equals("DocumentId", StringComparison.OrdinalIgnoreCase)).ToList();
+                .Where(col => col != RandomOrderColumn && !col.Equals("DocumentId", StringComparison.OrdinalIgnoreCase)).ToList();
+            var randomKeys = documentIds.ToDictionary(id => id, _ => Random.Shared.NextDouble());
             var orderValues = new Dictionary<long, JObject>();
             foreach (var group in joins.GroupBy(j => j.Table))
             {
@@ -1492,9 +1577,11 @@ internal sealed class CosmosDbCommand : DbCommand
                     orderValues.TryGetValue(y.Id, out var yv);
                     foreach (var (column, desc) in orderTerms)
                     {
-                        var c = column.Equals("DocumentId", StringComparison.OrdinalIgnoreCase)
-                            ? x.Id.CompareTo(y.Id)
-                            : CompareTokens(xv?[column], yv?[column]);
+                        var c = column == RandomOrderColumn
+                            ? randomKeys[x.Id].CompareTo(randomKeys[y.Id])
+                            : column.Equals("DocumentId", StringComparison.OrdinalIgnoreCase)
+                                ? x.Id.CompareTo(y.Id)
+                                : CompareTokens(xv?[column], yv?[column]);
                         if (desc)
                         {
                             c = -c;
@@ -1560,48 +1647,68 @@ internal sealed class CosmosDbCommand : DbCommand
             }
         }
 
-        // 1. matching index rows
-        var indexQuery = new QueryDefinition("SELECT VALUE c.Id FROM c WHERE " + Scoped(indexTable) + indexWhere).WithParameter("@pk", PkValue(indexTable));
+        // 1. matching index rows, with the columns the query orders by. The order columns belong to the reduce
+        // index, so documents are ordered by the index row they belong to.
+        var orderTerms = ParseOrderTerms(sql);
+        var orderColumns = orderTerms.Select(t => t.Column)
+            .Where(col => col != RandomOrderColumn && !col.Equals("Id", StringComparison.OrdinalIgnoreCase)
+                && !col.Equals("DocumentId", StringComparison.OrdinalIgnoreCase))
+            .Distinct().ToList();
+        var indexProjection = "c.Id" + string.Concat(orderColumns.Select(col => $", c[\"{col}\"]"));
+        var indexQuery = new QueryDefinition("SELECT " + indexProjection + " FROM c WHERE " + Scoped(indexTable) + indexWhere).WithParameter("@pk", PkValue(indexTable));
         indexQuery = BindParameters(indexQuery);
 
-        var indexIds = new List<long>();
-        using (var iterator = CosmosContainer.GetItemQueryIterator<long>(indexQuery,
+        var indexRows = new List<JObject>();
+        using (var iterator = CosmosContainer.GetItemQueryIterator<JObject>(indexQuery,
             requestOptions: new QueryRequestOptions { PartitionKey = PartitionKeyFor(indexTable) }))
         {
             while (iterator.HasMoreResults)
             {
-                foreach (var v in await iterator.ReadNextAsync(cancellationToken))
-                {
-                    indexIds.Add(v);
-                }
+                indexRows.AddRange(await iterator.ReadNextAsync(cancellationToken));
             }
         }
 
-        if (indexIds.Count == 0)
+        if (indexRows.Count == 0)
         {
             return new List<long>();
         }
 
+        // The position of each index row in the requested order; without an ORDER BY the order is the query's.
+        var indexIds = (orderTerms.Count == 0 ? indexRows : OrderRows(indexRows, orderTerms))
+            .Select(row => row["Id"]!.ToObject<long>()).ToList();
+        var indexPosition = new Dictionary<long, int>();
+        for (var i = 0; i < indexIds.Count; i++)
+        {
+            indexPosition[indexIds[i]] = i;
+        }
+
         // 2. bridge rows linking those index rows to documents
         var bridgeQuery = new QueryDefinition(
-            "SELECT VALUE c.DocumentId FROM c WHERE " + Scoped(bridgeTable) + $" AND ARRAY_CONTAINS(@__indexIds, c[\"{bridgeForeignKey}\"])")
+            $"SELECT c.DocumentId, c[\"{bridgeForeignKey}\"] AS IndexId FROM c WHERE " + Scoped(bridgeTable) + $" AND ARRAY_CONTAINS(@__indexIds, c[\"{bridgeForeignKey}\"])")
             .WithParameter("@pk", PkValue(bridgeTable))
             .WithParameter("@__indexIds", indexIds);
 
-        var documentIds = new List<long>();
-        var seenDocumentIds = new HashSet<long>();
-        using (var iterator = CosmosContainer.GetItemQueryIterator<long>(bridgeQuery,
+        var bridgeRows = new List<(long DocumentId, int Position)>();
+        using (var iterator = CosmosContainer.GetItemQueryIterator<JObject>(bridgeQuery,
             requestOptions: new QueryRequestOptions { PartitionKey = PartitionKeyFor(bridgeTable) }))
         {
             while (iterator.HasMoreResults)
             {
-                foreach (var v in await iterator.ReadNextAsync(cancellationToken))
+                foreach (var row in await iterator.ReadNextAsync(cancellationToken))
                 {
-                    if (seenDocumentIds.Add(v))
-                    {
-                        documentIds.Add(v);
-                    }
+                    bridgeRows.Add((row["DocumentId"]!.ToObject<long>(), indexPosition[row["IndexId"]!.ToObject<long>()]));
                 }
+            }
+        }
+
+        // Documents follow their index row's position, and a document in several index rows takes the first.
+        var documentIds = new List<long>();
+        var seenDocumentIds = new HashSet<long>();
+        foreach (var (documentId, _) in bridgeRows.OrderBy(row => row.Position))
+        {
+            if (seenDocumentIds.Add(documentId))
+            {
+                documentIds.Add(documentId);
             }
         }
 
