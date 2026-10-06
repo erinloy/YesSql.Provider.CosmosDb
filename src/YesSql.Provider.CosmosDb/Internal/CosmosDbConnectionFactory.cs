@@ -15,6 +15,7 @@ internal sealed class CosmosDbConnectionFactory : IConnectionFactory
     public CosmosDbConnectionFactory(CosmosDbOptions options)
     {
         _options = options ?? throw new ArgumentNullException(nameof(options));
+        _options.Validate();
     }
 
     public Type DbConnectionType => typeof(CosmosDbConnection);

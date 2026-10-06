@@ -23,10 +23,10 @@ internal sealed class CosmosDbConnection : DbConnection
     // the ones that apply. Lazy<T> constructs the client exactly once under concurrent first opens.
     private static readonly ConcurrentDictionary<string, Lazy<CosmosClient>> SharedClients = new();
 
-    // Creating the database and container are control-plane operations, which are rate limited on a real account.
-    // They run once per (endpoint, database, container) for the process, not on every connection open. Lazy<Task>
-    // makes concurrent first opens wait on the same operation.
-    private static readonly ConcurrentDictionary<string, Lazy<Task>> EnsuredContainers = new();
+    // Creating the database and container (and reading the container to check its partition key path) are
+    // control-plane operations, which are rate limited on a real account. They run once per (endpoint, database,
+    // container) for the process, not on every connection open. A failed run is retried by the next open.
+    private static readonly AsyncOnceCache EnsuredContainers = new();
 
     private readonly CosmosDbOptions _options;
     private CosmosClient? _client;
@@ -65,27 +65,41 @@ internal sealed class CosmosDbConnection : DbConnection
                 ? new CosmosClient(_options.AccountEndpoint, _options.AccountKey)
                 : new CosmosClient(_options.AccountEndpoint, _options.AccountKey, _options.ClientOptions))).Value;
 
-        if (_options.CreateIfNotExists)
-        {
-            var client = _client;
-            var options = _options;
-            var ensureKey = $"{options.AccountEndpoint}\n{options.DatabaseId}\n{options.ContainerId}";
-            await EnsuredContainers.GetOrAdd(
-                ensureKey,
-                _ => new Lazy<Task>(() => EnsureDatabaseAndContainerAsync(client, options))).Value;
-        }
+        var client = _client;
+        var options = _options;
+        await EnsuredContainers.EnsureAsync(
+            options.AccountEndpoint + "\n" + options.DatabaseId + "\n" + options.ContainerId,
+            () => EnsureDatabaseAndContainerAsync(client, options)).ConfigureAwait(false);
 
         _container = _client.GetContainer(_options.DatabaseId, _options.ContainerId);
         _state = ConnectionState.Open;
     }
 
-    // Runs the (rate-limited, control-plane) database/container creation a single time per process. Not bound to
-    // any caller's CancellationToken on purpose: the result is shared by all connections, so a per-request cancel
-    // must not poison the shared ensure. Provisioning a database/container is a one-off bootstrap, not a hot path.
+    // Not bound to any caller's CancellationToken on purpose: the result is shared by all connections, so a
+    // per-request cancel must not fail the shared initialization.
     private static async Task EnsureDatabaseAndContainerAsync(CosmosClient client, CosmosDbOptions options)
     {
-        var db = await client.CreateDatabaseIfNotExistsAsync(options.DatabaseId);
-        await db.Database.CreateContainerIfNotExistsAsync(options.ContainerId, options.PartitionKeyPath);
+        ContainerProperties properties;
+        if (options.CreateIfNotExists)
+        {
+            var db = await client.CreateDatabaseIfNotExistsAsync(options.DatabaseId).ConfigureAwait(false);
+            var created = await db.Database.CreateContainerIfNotExistsAsync(options.ContainerId, options.PartitionKeyPath).ConfigureAwait(false);
+            properties = created.Resource;
+        }
+        else
+        {
+            var read = await client.GetContainer(options.DatabaseId, options.ContainerId).ReadContainerAsync().ConfigureAwait(false);
+            properties = read.Resource;
+        }
+
+        // An existing container keeps its own partition key path; items written under a different property
+        // would be rejected or land in the wrong partition, so fail here with a clear message instead.
+        if (!string.Equals(properties.PartitionKeyPath, options.PartitionKeyPath, StringComparison.Ordinal))
+        {
+            throw new InvalidOperationException(
+                $"Container '{options.ContainerId}' in database '{options.DatabaseId}' has partition key path " +
+                $"'{properties.PartitionKeyPath}', but CosmosDbOptions.PartitionKeyPath is '{options.PartitionKeyPath}'.");
+        }
     }
 
     public override void Open() => OpenAsync(CancellationToken.None).GetAwaiter().GetResult();

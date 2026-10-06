@@ -63,6 +63,8 @@ internal sealed class CosmosDbCommand : DbCommand
 
     private PartitionKey PartitionKeyFor(string table) => new(PkValue(table));
 
+    private string PartitionKeyProperty => _connection.Options.PartitionKeyProperty;
+
     // The active unit of work's undo log (set by YesSql on the command), or null when untracked.
     private CosmosDbTransaction? Undo => DbTransaction as CosmosDbTransaction;
 
@@ -70,21 +72,41 @@ internal sealed class CosmosDbCommand : DbCommand
     // In PerStore the single partition holds every table, so the __table discriminator is required.
     private string Scoped(string table, string pkParam = "@pk")
         => _connection.Options.PartitionStrategy == PartitionStrategy.PerStore
-            ? $"c.pk = {pkParam} AND c.__table = \"{table}\""
-            : $"c.pk = {pkParam}";
+            ? $"c[\"{PartitionKeyProperty}\"] = {pkParam} AND c.__table = \"{table}\""
+            : $"c[\"{PartitionKeyProperty}\"] = {pkParam}";
 
     // Stamp the partition key + table discriminator onto an item being written.
     private JObject WithPartition(JObject item, string table)
     {
-        item["pk"] = PkValue(table);
+        item[PartitionKeyProperty] = PkValue(table);
         item["__table"] = table;
         return item;
+    }
+
+    // Parameters derived while translating a statement (for example the value lists of resolved IN subqueries).
+    private readonly List<(string Name, object? Value)> _derivedParameters = new();
+
+    // Binds the command's parameters, and any derived ones, to a Cosmos query.
+    private QueryDefinition BindParameters(QueryDefinition query)
+    {
+        foreach (DbParameter p in _parameters)
+        {
+            query = query.WithParameter("@" + p.ParameterName.TrimStart('@'), p.Value is DBNull ? null : p.Value);
+        }
+
+        foreach (var (name, value) in _derivedParameters)
+        {
+            query = query.WithParameter(name, value);
+        }
+
+        return query;
     }
 
     // ---- async (primary) path, used by Dapper via QueryAsync/ExecuteAsync ----
 
     public override async Task<int> ExecuteNonQueryAsync(CancellationToken cancellationToken)
     {
+        _derivedParameters.Clear();
         var sql = CommandText.TrimStart();
 
         // RenameColumn DDL (emitted by the schema interpreter): rewrite the field on every row in the
@@ -94,7 +116,7 @@ internal sealed class CosmosDbCommand : DbCommand
             var rename = Regex.Match(sql, @"renamecolumn\s+\[([^\]]+)\]\s+\[([^\]]+)\]\s+\[([^\]]+)\]", RegexOptions.IgnoreCase);
             if (!rename.Success)
             {
-                return 0;
+                throw new NotSupportedException($"Unsupported RenameColumn statement: {CommandText}");
             }
 
             var renameTable = rename.Groups[1].Value;
@@ -198,8 +220,15 @@ internal sealed class CosmosDbCommand : DbCommand
                         var fromValue = ResolveSqlValue(replaceArgs[1]);
                         var toValue = ResolveSqlValue(replaceArgs[2]) ?? string.Empty;
 
-                        // A null/absent "from" can't drive a replace — no-op rather than corrupt content.
+                        // SQL REPLACE with a NULL search value yields NULL, which would erase the column. Fail
+                        // rather than rewrite content from what is almost certainly a missing parameter.
                         if (fromValue is null)
+                        {
+                            throw new NotSupportedException($"REPLACE with a NULL search value is not supported: {CommandText}");
+                        }
+
+                        // An empty search string matches nothing in SQL REPLACE, so there is nothing to rewrite.
+                        if (fromValue.Length == 0)
                         {
                             return 0;
                         }
@@ -208,10 +237,7 @@ internal sealed class CosmosDbCommand : DbCommand
                         var cosmosWhere = string.IsNullOrWhiteSpace(replaceWhere) ? string.Empty : " AND " + TranslateWhere(replaceWhere!);
                         var replaceQuery = new QueryDefinition("SELECT * FROM c WHERE " + Scoped(replaceTable) + cosmosWhere)
                             .WithParameter("@pk", PkValue(replaceTable));
-                        foreach (DbParameter p in _parameters)
-                        {
-                            replaceQuery = replaceQuery.WithParameter("@" + p.ParameterName.TrimStart('@'), p.Value is DBNull ? null : p.Value);
-                        }
+                        replaceQuery = BindParameters(replaceQuery);
 
                         var matches = new List<JObject>();
                         using (var iterator = CosmosContainer.GetItemQueryIterator<JObject>(replaceQuery,
@@ -381,10 +407,7 @@ internal sealed class CosmosDbCommand : DbCommand
 
             // SELECT * (not just id) so the full items can be restored on rollback.
             var queryDef = new QueryDefinition("SELECT * FROM c WHERE " + Scoped(table) + cosmosWhere).WithParameter("@pk", PkValue(table));
-            foreach (DbParameter p in _parameters)
-            {
-                queryDef = queryDef.WithParameter("@" + p.ParameterName.TrimStart('@'), p.Value is DBNull ? null : p.Value);
-            }
+            queryDef = BindParameters(queryDef);
 
             var items = new List<JObject>();
             using (var iterator = CosmosContainer.GetItemQueryIterator<JObject>(queryDef,
@@ -421,6 +444,7 @@ internal sealed class CosmosDbCommand : DbCommand
 
     public override async Task<object?> ExecuteScalarAsync(CancellationToken cancellationToken)
     {
+        _derivedParameters.Clear();
         var sql = CommandText;
 
         // DefaultIdGenerator seed: SELECT MAX([Id]) FROM [<table>]
@@ -475,6 +499,7 @@ internal sealed class CosmosDbCommand : DbCommand
 
     protected override async Task<DbDataReader> ExecuteDbDataReaderAsync(CommandBehavior behavior, CancellationToken cancellationToken)
     {
+        _derivedParameters.Clear();
         var sql = CommandText;
 
         // A COUNT over a join run through the reader (raw Dapper QueryFirstOrDefaultAsync<int>, e.g. the
@@ -540,27 +565,16 @@ internal sealed class CosmosDbCommand : DbCommand
                 // Load by id(s): WHERE [Id] = @Id / IN (…) — the only params are ids; point-read each.
                 if (Regex.IsMatch(sql, @"\[id\]\s*(=|in\b)", RegexOptions.IgnoreCase))
                 {
-                    var rows = new System.Collections.Generic.List<object?[]>();
+                    var ids = new List<long>();
                     foreach (DbParameter p in _parameters)
                     {
-                        if (p.Value is null or DBNull)
+                        if (p.Value is not (null or DBNull))
                         {
-                            continue;
-                        }
-
-                        var id = Convert.ToInt64(p.Value);
-                        try
-                        {
-                            var resp = await CosmosContainer.ReadItemAsync<JObject>($"{table}:{id}", PartitionKeyFor(table), cancellationToken: cancellationToken);
-                            rows.Add(ToRow(resp.Resource));
-                        }
-                        catch (CosmosException ex) when (ex.StatusCode == HttpStatusCode.NotFound)
-                        {
-                            // no row for this id
+                            ids.Add(Convert.ToInt64(p.Value));
                         }
                     }
 
-                    return new CosmosDbDataReader(DocumentColumns, rows);
+                    return new CosmosDbDataReader(DocumentColumns, await ReadDocumentRowsAsync(table, ids, cancellationToken));
                 }
 
                 // Otherwise a document query: all documents in the partition, optionally filtered by Type.
@@ -582,6 +596,50 @@ internal sealed class CosmosDbCommand : DbCommand
         => ExecuteDbDataReaderAsync(behavior, CancellationToken.None).GetAwaiter().GetResult();
 
     // ---- helpers ----
+
+    // Number of point reads in flight at once when loading a page of documents.
+    private const int PointReadConcurrency = 8;
+
+    // The ids on the requested page of an id list, after applying the statement's OFFSET and LIMIT.
+    private static List<long> PageOf(List<long> ids, string sql)
+    {
+        IEnumerable<long> page = ids.Skip(ExtractOffset(sql));
+        var limit = ExtractLimit(sql);
+        if (limit.HasValue)
+        {
+            page = page.Take(limit.Value);
+        }
+
+        return page.ToList();
+    }
+
+    // Reads documents by id as result rows, in the order of ids; ids with no document are skipped. The reads run
+    // concurrently up to a limit, since a page would otherwise cost one sequential round trip per document.
+    private async Task<List<object?[]>> ReadDocumentRowsAsync(string table, IReadOnlyList<long> ids, CancellationToken cancellationToken)
+    {
+        var items = new JObject?[ids.Count];
+        using var gate = new SemaphoreSlim(PointReadConcurrency);
+
+        await Task.WhenAll(ids.Select(async (id, index) =>
+        {
+            await gate.WaitAsync(cancellationToken);
+            try
+            {
+                var response = await CosmosContainer.ReadItemAsync<JObject>($"{table}:{id}", PartitionKeyFor(table), cancellationToken: cancellationToken);
+                items[index] = response.Resource;
+            }
+            catch (CosmosException ex) when (ex.StatusCode == HttpStatusCode.NotFound)
+            {
+                // no document for this id
+            }
+            finally
+            {
+                gate.Release();
+            }
+        }));
+
+        return items.Where(item => item is not null).Select(item => ToRow(item!)).ToList();
+    }
 
     // Parse an index-joined query and run the index lookup, returning distinct DocumentIds (ordered if
     // the query has an ORDER BY). Shared by the reader (then point-reads) and CountAsync.
@@ -630,55 +688,46 @@ internal sealed class CosmosDbCommand : DbCommand
         var queryText = "SELECT " + projection + " FROM c WHERE " + Scoped(indexTable)
             + (cosmosWhere.Length > 0 ? " AND " + cosmosWhere : string.Empty);
         var queryDef = new QueryDefinition(queryText).WithParameter("@pk", PkValue(indexTable));
-        foreach (DbParameter p in _parameters)
-        {
-            queryDef = queryDef.WithParameter("@" + p.ParameterName.TrimStart('@'), p.Value is DBNull ? null : p.Value);
-        }
+        queryDef = BindParameters(queryDef);
 
         var documentIds = new System.Collections.Generic.List<long>();
-        try
+        var seenDocumentIds = new System.Collections.Generic.HashSet<long>();
+        if (orderTerms.Count == 0)
         {
-            if (orderTerms.Count == 0)
+            using var iterator = CosmosContainer.GetItemQueryIterator<long>(queryDef,
+                requestOptions: new QueryRequestOptions { PartitionKey = PartitionKeyFor(indexTable) });
+            while (iterator.HasMoreResults)
             {
-                using var iterator = CosmosContainer.GetItemQueryIterator<long>(queryDef,
-                    requestOptions: new QueryRequestOptions { PartitionKey = PartitionKeyFor(indexTable) });
-                while (iterator.HasMoreResults)
+                foreach (var docId in await iterator.ReadNextAsync(cancellationToken))
                 {
-                    foreach (var docId in await iterator.ReadNextAsync(cancellationToken))
-                    {
-                        if (!documentIds.Contains(docId))
-                        {
-                            documentIds.Add(docId);
-                        }
-                    }
-                }
-            }
-            else
-            {
-                var rows = new System.Collections.Generic.List<JObject>();
-                using var iterator = CosmosContainer.GetItemQueryIterator<JObject>(queryDef,
-                    requestOptions: new QueryRequestOptions { PartitionKey = PartitionKeyFor(indexTable) });
-                while (iterator.HasMoreResults)
-                {
-                    foreach (var row in await iterator.ReadNextAsync(cancellationToken))
-                    {
-                        rows.Add(row);
-                    }
-                }
-
-                foreach (var row in OrderRows(rows, orderTerms))
-                {
-                    var docId = row["DocumentId"]!.ToObject<long>();
-                    if (!documentIds.Contains(docId))
+                    if (seenDocumentIds.Add(docId))
                     {
                         documentIds.Add(docId);
                     }
                 }
             }
         }
-        catch (CosmosException ex)
+        else
         {
-            throw new NotSupportedException($"Cosmos rejected the translated index query [{queryText}] (from SQL [{CommandText}]): {ex.Message}", ex);
+            var rows = new System.Collections.Generic.List<JObject>();
+            using var iterator = CosmosContainer.GetItemQueryIterator<JObject>(queryDef,
+                requestOptions: new QueryRequestOptions { PartitionKey = PartitionKeyFor(indexTable) });
+            while (iterator.HasMoreResults)
+            {
+                foreach (var row in await iterator.ReadNextAsync(cancellationToken))
+                {
+                    rows.Add(row);
+                }
+            }
+
+            foreach (var row in OrderRows(rows, orderTerms))
+            {
+                var docId = row["DocumentId"]!.ToObject<long>();
+                if (seenDocumentIds.Add(docId))
+                {
+                    documentIds.Add(docId);
+                }
+            }
         }
 
         // filterType:true adds a "[Document].[Type] = @p" predicate that StripDocTypePredicate removed (it
@@ -877,32 +926,12 @@ internal sealed class CosmosDbCommand : DbCommand
 
         var documentIds = await GatherDocumentIdsAsync(sql, cancellationToken);
 
-        IEnumerable<long> page = documentIds.Skip(ExtractOffset(sql));
-        var limit = ExtractLimit(sql);
-        if (limit.HasValue)
-        {
-            page = page.Take(limit.Value);
-        }
-
-        var rows = new List<object?[]>();
-        foreach (var docId in page)
-        {
-            try
-            {
-                var resp = await CosmosContainer.ReadItemAsync<JObject>($"{documentTable}:{docId}", PartitionKeyFor(documentTable), cancellationToken: cancellationToken);
-                rows.Add(ToRow(resp.Resource));
-            }
-            catch (CosmosException ex) when (ex.StatusCode == HttpStatusCode.NotFound)
-            {
-                // document missing
-            }
-        }
-
+        var rows = await ReadDocumentRowsAsync(documentTable, PageOf(documentIds, sql), cancellationToken);
         return new CosmosDbDataReader(DocumentColumns, rows);
     }
 
     // Resolve "[Col] [NOT] IN (SELECT [c] FROM [t] AS a [WHERE …])" by executing the inner query and
-    // substituting a literal IN list (Cosmos has no cross-partition correlated subqueries).
+    // substituting an ARRAY_CONTAINS test over the values (Cosmos has no cross-partition correlated subqueries).
     private async Task<string> ResolveSubqueriesAsync(string where, CancellationToken cancellationToken)
     {
         while (true)
@@ -951,12 +980,9 @@ internal sealed class CosmosDbCommand : DbCommand
             var innerCosmosWhere = string.IsNullOrWhiteSpace(innerWhere) ? string.Empty : " AND " + TranslateWhere(innerWhere!);
             var queryDef = new QueryDefinition($"SELECT VALUE c[\"{innerColumn}\"] FROM c WHERE " + Scoped(innerTable, "@__itbl") + innerCosmosWhere)
                 .WithParameter("@__itbl", PkValue(innerTable));
-            foreach (DbParameter p in _parameters)
-            {
-                queryDef = queryDef.WithParameter("@" + p.ParameterName.TrimStart('@'), p.Value is DBNull ? null : p.Value);
-            }
+            queryDef = BindParameters(queryDef);
 
-            var literals = new List<string>();
+            var values = new JArray();
             using (var iterator = CosmosContainer.GetItemQueryIterator<JToken>(queryDef,
                 requestOptions: new QueryRequestOptions { PartitionKey = PartitionKeyFor(innerTable) }))
             {
@@ -964,27 +990,18 @@ internal sealed class CosmosDbCommand : DbCommand
                 {
                     foreach (var v in await iterator.ReadNextAsync(cancellationToken))
                     {
-                        literals.Add(ToLiteral(v));
+                        values.Add(v);
                     }
                 }
             }
 
-            var list = literals.Count > 0 ? string.Join(", ", literals) : "null";
-            var replacement = $"{m.Groups[1].Value} {(m.Groups[2].Success ? "NOT " : string.Empty)}IN ({list})";
+            // Pass the values as a parameter rather than writing them into the query text, so their content
+            // cannot change the query and the query size does not grow with the result.
+            var parameterName = "@__sq" + _derivedParameters.Count;
+            _derivedParameters.Add((parameterName, values));
+            var replacement = $"{(m.Groups[2].Success ? "NOT " : string.Empty)}ARRAY_CONTAINS({parameterName}, {m.Groups[1].Value})";
             where = where[..m.Index] + replacement + where[(closeIdx + 1)..];
         }
-    }
-
-    private static string ToLiteral(JToken? token)
-    {
-        if (token is null || token.Type == JTokenType.Null)
-        {
-            return "null";
-        }
-
-        return token.Type == JTokenType.String
-            ? "'" + token.ToString().Replace("'", "\\'") + "'"
-            : token.ToString();
     }
 
     private static bool IsDocumentTable(string table) => table.EndsWith("Document", StringComparison.OrdinalIgnoreCase);
@@ -1020,10 +1037,7 @@ internal sealed class CosmosDbCommand : DbCommand
 
         var queryDef = new QueryDefinition("SELECT VALUE COUNT(1) FROM c WHERE " + Scoped(table) + cosmosWhere)
             .WithParameter("@pk", PkValue(table));
-        foreach (DbParameter p in _parameters)
-        {
-            queryDef = queryDef.WithParameter("@" + p.ParameterName.TrimStart('@'), p.Value is DBNull ? null : p.Value);
-        }
+        queryDef = BindParameters(queryDef);
 
         using var iterator = CosmosContainer.GetItemQueryIterator<long>(queryDef,
             requestOptions: new QueryRequestOptions { PartitionKey = PartitionKeyFor(table) });
@@ -1260,10 +1274,7 @@ internal sealed class CosmosDbCommand : DbCommand
 
         var queryDef = new QueryDefinition($"SELECT VALUE DateTimePart(\"{part}\", c.{column}) FROM c WHERE " + Scoped(table) + cosmosWhere)
             .WithParameter("@pk", PkValue(table));
-        foreach (DbParameter p in _parameters)
-        {
-            queryDef = queryDef.WithParameter("@" + p.ParameterName.TrimStart('@'), p.Value is DBNull ? null : p.Value);
-        }
+        queryDef = BindParameters(queryDef);
 
         var rows = new List<object?[]>();
         using (var iterator = CosmosContainer.GetItemQueryIterator<JToken>(queryDef,
@@ -1289,10 +1300,7 @@ internal sealed class CosmosDbCommand : DbCommand
 
         var queryDef = new QueryDefinition("SELECT * FROM c WHERE " + Scoped(indexTable) + cosmosWhere + BuildOrderClause(sql) + BuildOffsetLimitClause(sql))
             .WithParameter("@pk", PkValue(indexTable));
-        foreach (DbParameter p in _parameters)
-        {
-            queryDef = queryDef.WithParameter("@" + p.ParameterName.TrimStart('@'), p.Value is DBNull ? null : p.Value);
-        }
+        queryDef = BindParameters(queryDef);
 
         var all = new List<JObject>();
         using (var iterator = CosmosContainer.GetItemQueryIterator<JObject>(queryDef,
@@ -1317,7 +1325,7 @@ internal sealed class CosmosDbCommand : DbCommand
                 // Exclude the Cosmos envelope fields by exact (ordinal) name — the lowercase system "id",
                 // "pk", and the "__table" discriminator — while keeping the index's own numeric "Id" column.
                 if (!prop.Name.Equals("id", StringComparison.Ordinal)
-                    && !prop.Name.Equals("pk", StringComparison.Ordinal)
+                    && !prop.Name.Equals(PartitionKeyProperty, StringComparison.Ordinal)
                     && !prop.Name.Equals("__table", StringComparison.Ordinal)
                     && !columns.Contains(prop.Name))
                 {
@@ -1418,10 +1426,7 @@ internal sealed class CosmosDbCommand : DbCommand
             var sub = tableTerms.Count > 0 ? " AND " + TranslateWhere(string.Join(" AND ", tableTerms)) : string.Empty;
 
             var queryDef = new QueryDefinition("SELECT VALUE c.DocumentId FROM c WHERE " + Scoped(group.Key) + sub).WithParameter("@pk", PkValue(group.Key));
-            foreach (DbParameter p in _parameters)
-            {
-                queryDef = queryDef.WithParameter("@" + p.ParameterName.TrimStart('@'), p.Value is DBNull ? null : p.Value);
-            }
+            queryDef = BindParameters(queryDef);
 
             var ids = new HashSet<long>();
             using (var iterator = CosmosContainer.GetItemQueryIterator<long>(queryDef,
@@ -1515,27 +1520,7 @@ internal sealed class CosmosDbCommand : DbCommand
         var documentTable = ExtractTableAfter(sql, "from");
         var documentIds = await GatherMultiIndexDocumentIdsAsync(sql, cancellationToken);
 
-        IEnumerable<long> page = documentIds.Skip(ExtractOffset(sql));
-        var limit = ExtractLimit(sql);
-        if (limit.HasValue)
-        {
-            page = page.Take(limit.Value);
-        }
-
-        var rows = new List<object?[]>();
-        foreach (var docId in page)
-        {
-            try
-            {
-                var resp = await CosmosContainer.ReadItemAsync<JObject>($"{documentTable}:{docId}", PartitionKeyFor(documentTable), cancellationToken: cancellationToken);
-                rows.Add(ToRow(resp.Resource));
-            }
-            catch (CosmosException ex) when (ex.StatusCode == HttpStatusCode.NotFound)
-            {
-                // document missing
-            }
-        }
-
+        var rows = await ReadDocumentRowsAsync(documentTable, PageOf(documentIds, sql), cancellationToken);
         return new CosmosDbDataReader(DocumentColumns, rows);
     }
 
@@ -1577,10 +1562,7 @@ internal sealed class CosmosDbCommand : DbCommand
 
         // 1. matching index rows
         var indexQuery = new QueryDefinition("SELECT VALUE c.Id FROM c WHERE " + Scoped(indexTable) + indexWhere).WithParameter("@pk", PkValue(indexTable));
-        foreach (DbParameter p in _parameters)
-        {
-            indexQuery = indexQuery.WithParameter("@" + p.ParameterName.TrimStart('@'), p.Value is DBNull ? null : p.Value);
-        }
+        indexQuery = BindParameters(indexQuery);
 
         var indexIds = new List<long>();
         using (var iterator = CosmosContainer.GetItemQueryIterator<long>(indexQuery,
@@ -1602,10 +1584,12 @@ internal sealed class CosmosDbCommand : DbCommand
 
         // 2. bridge rows linking those index rows to documents
         var bridgeQuery = new QueryDefinition(
-            $"SELECT VALUE c.DocumentId FROM c WHERE " + Scoped(bridgeTable) + $" AND c[\"{bridgeForeignKey}\"] IN ({string.Join(", ", indexIds)})")
-            .WithParameter("@pk", PkValue(bridgeTable));
+            "SELECT VALUE c.DocumentId FROM c WHERE " + Scoped(bridgeTable) + $" AND ARRAY_CONTAINS(@__indexIds, c[\"{bridgeForeignKey}\"])")
+            .WithParameter("@pk", PkValue(bridgeTable))
+            .WithParameter("@__indexIds", indexIds);
 
         var documentIds = new List<long>();
+        var seenDocumentIds = new HashSet<long>();
         using (var iterator = CosmosContainer.GetItemQueryIterator<long>(bridgeQuery,
             requestOptions: new QueryRequestOptions { PartitionKey = PartitionKeyFor(bridgeTable) }))
         {
@@ -1613,7 +1597,7 @@ internal sealed class CosmosDbCommand : DbCommand
             {
                 foreach (var v in await iterator.ReadNextAsync(cancellationToken))
                 {
-                    if (!documentIds.Contains(v))
+                    if (seenDocumentIds.Add(v))
                     {
                         documentIds.Add(v);
                     }
@@ -1655,27 +1639,7 @@ internal sealed class CosmosDbCommand : DbCommand
         var documentTable = Regex.Match(sql, @"from\s+\[([^\]]+)\]", RegexOptions.IgnoreCase).Groups[1].Value;
         var documentIds = await GatherReduceDocumentIdsAsync(sql, cancellationToken);
 
-        IEnumerable<long> page = documentIds.Skip(ExtractOffset(sql));
-        var limit = ExtractLimit(sql);
-        if (limit.HasValue)
-        {
-            page = page.Take(limit.Value);
-        }
-
-        var rows = new List<object?[]>();
-        foreach (var docId in page)
-        {
-            try
-            {
-                var resp = await CosmosContainer.ReadItemAsync<JObject>($"{documentTable}:{docId}", PartitionKeyFor(documentTable), cancellationToken: cancellationToken);
-                rows.Add(ToRow(resp.Resource));
-            }
-            catch (CosmosException ex) when (ex.StatusCode == HttpStatusCode.NotFound)
-            {
-                // document missing
-            }
-        }
-
+        var rows = await ReadDocumentRowsAsync(documentTable, PageOf(documentIds, sql), cancellationToken);
         return new CosmosDbDataReader(DocumentColumns, rows);
     }
 
@@ -1686,8 +1650,14 @@ internal sealed class CosmosDbCommand : DbCommand
     {
         var seqPk = new PartitionKey("__seq");
 
-        for (var attempt = 0; attempt < 8; attempt++)
+        for (var attempt = 0; attempt < 16; attempt++)
         {
+            if (attempt > 0)
+            {
+                // Concurrent allocators for the same table collide on the counter's ETag; spread the retries.
+                await Task.Delay(Random.Shared.Next(2, 10 * (attempt + 1)), cancellationToken);
+            }
+
             try
             {
                 var current = await CosmosContainer.ReadItemAsync<JObject>(table, seqPk, cancellationToken: cancellationToken);
@@ -1702,7 +1672,7 @@ internal sealed class CosmosDbCommand : DbCommand
                 var seed = (await MaxIdAsync(table, cancellationToken) ?? 0) + 1;
                 try
                 {
-                    await CosmosContainer.CreateItemAsync(new JObject { ["id"] = table, ["pk"] = "__seq", ["next"] = seed }, seqPk, cancellationToken: cancellationToken);
+                    await CosmosContainer.CreateItemAsync(new JObject { ["id"] = table, [PartitionKeyProperty] = "__seq", ["next"] = seed }, seqPk, cancellationToken: cancellationToken);
                     return seed;
                 }
                 catch (CosmosException dup) when (dup.StatusCode == HttpStatusCode.Conflict)

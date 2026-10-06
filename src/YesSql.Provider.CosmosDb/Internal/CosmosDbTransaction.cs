@@ -60,7 +60,11 @@ internal sealed class CosmosDbTransaction : DbTransaction
         }
 
         var container = _connection.CosmosContainer;
-        var ops = Enumerable.Reverse(_undo).ToList(); // undo in reverse order
+
+        // Only the first record for an item matters: it holds the item's state from before the unit of work
+        // touched it, which is what rollback restores. Keeping one operation per item keeps the number of
+        // operations, and so the number of batches, down to the number of items touched.
+        var ops = _undo.GroupBy(op => (op.PartitionKey, op.Id)).Select(group => group.First()).ToList();
         _undo.Clear();
 
         if (_connection.Options.PartitionStrategy == PartitionStrategy.PerStore)
