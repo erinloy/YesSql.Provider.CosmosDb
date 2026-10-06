@@ -11,6 +11,7 @@ All notable changes are listed here. The project is in preview, so minor version
 - `UPDATE [T] SET [Col] = REPLACE([Col], from, to) [WHERE ...]` is supported. Orchard Core issues this to rename serialized `$type` names in stored documents, for example in the Lucene query-type migration. It previously failed with `Parameter 'Id' not found`. The `from` and `to` arguments may be string literals or parameters, and the rewrite is recorded for rollback.
 
 ### Fixed
+- Queries through a reduce index ignored `ORDER BY`, so documents came back in storage order. They are now ordered by the index row they belong to, and `Skip` and `Take` follow that order.
 - Queries with `IN (SELECT ...)` failed, or could be changed by the data, when a stored value contained a backslash or a quote. The values are now passed to Cosmos as a query parameter instead of being written into the query text.
 - A failed attempt to create the database or container was remembered, so every later connection in the process failed the same way. It is now retried on the next connection.
 - A `PartitionKeyPath` other than `/pk` was accepted but did not work. Single-level paths such as `/tenantId` now work, other paths are rejected when the provider is configured, and the container's actual path is checked when the first connection opens.
