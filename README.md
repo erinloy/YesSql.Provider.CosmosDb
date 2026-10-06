@@ -31,7 +31,7 @@ Targets `net8.0` and `net10.0`.
 
 The package is built against YesSql 5.4.7 and works with YesSql 6.0.0: YesSql 6.0.0's own tests pass against it on both partition strategies. No stable Orchard Core release uses YesSql 6 yet.
 
-Orchard Core and YesSql versions have to match. Orchard Core 3.0.x was built against YesSql 5.4.7. If an application references YesSql 6.0.0 next to Orchard Core 3.0.x, Orchard fails at startup with a `MissingMethodException` (for example on `IStore.InitializeCollectionAsync`). The exception is thrown by Orchard Core's own data access setup, not by the database provider. Keep YesSql at 5.4.7 with Orchard Core 3.0.x.
+Orchard Core and YesSql versions have to match. Orchard Core 3.0.x was built against YesSql 5.4.7 and calls overloads that YesSql 6.0.0 removed. Adding YesSql 6.0.0 to a project that uses Orchard Core 3.0.x fails at startup with a `MissingMethodException` (for example on `IStore.InitializeCollectionAsync`), thrown from Orchard Core's own data access setup. Without an explicit YesSql reference, Orchard Core 3.0.x and this package both resolve YesSql 5.4.7. If you see this exception, check which YesSql version your application actually restores (`dotnet list package --include-transitive`), and use 5.4.7 with Orchard Core 3.0.x.
 
 [`samples/OrchardSmokeTest`](samples/OrchardSmokeTest) builds against either line. Select one with `-p:OrchardCoreVersion=<version>`; the default is 3.0.1. See [Orchard Core integration](docs/ORCHARD-INTEGRATION.md).
 
