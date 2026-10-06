@@ -36,6 +36,23 @@ To use an existing YesSql checkout, pass `-p:YesSqlTestsDir=<path to test/YesSql
 
 `CosmosTests` (in `test/Conformance/CosmosTests.cs`) derives from `CoreTests`. It points the configuration at the emulator with one database per run, and its cleanup hooks delete the container's items instead of running `DELETE FROM <table>`. The first run waits until the emulator answers a real request, because the emulator can report its gateway as up before its query engine is ready.
 
+## YesSql 6
+
+The package is built against YesSql 5.4.7. `test/Conformance.YesSql6` runs YesSql 6.0.0's `CoreTests` against that same build, with YesSql 6 supplied by the test project, which is what an application that uses YesSql 6 gets. It uses the same `CosmosTests` class as the YesSql 5 project.
+
+YesSql 6's tests use xunit v3, so the project is an executable:
+
+```bash
+pwsh scripts/clone-yessql.ps1 -Tag v6.0.0 -Directory yessql6
+dotnet build test/Conformance.YesSql6/YesSql.Provider.CosmosDb.Conformance.YesSql6.csproj -c Release
+dotnet ./test/Conformance.YesSql6/bin/Release/net10.0/YesSql.Tests.dll
+
+# PerStore run
+COSMOS_PARTITION=PerStore dotnet ./test/Conformance.YesSql6/bin/Release/net10.0/YesSql.Tests.dll
+```
+
+The YesSql 6 run also includes YesSql's filter and utility tests, so its total is larger than the 249 `CoreTests` that YesSql 5.4.7 has. The classes that need a database server, such as the SQL Server and PostgreSQL fixtures, are excluded.
+
 ## Provider tests
 
 `test/YesSql.Provider.CosmosDb.Tests` covers Cosmos-specific behavior directly:

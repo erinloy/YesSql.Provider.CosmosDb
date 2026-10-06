@@ -10,8 +10,8 @@ YesSql ships providers for SQL Server, PostgreSQL, MySQL and SQLite. This packag
 
 Preview (0.1.x). Interfaces and behavior may still change.
 
-- YesSql's own test suite (`CoreTests`, v5.4.7) passes in full: 249 of 249 tests, on both partition strategies, against the Cosmos DB emulator. See [docs/CONFORMANCE.md](docs/CONFORMANCE.md).
-- A minimal Orchard Core 2.2.1 site runs its setup recipe and serves requests with this provider as its only data store. See [docs/ORCHARD-INTEGRATION.md](docs/ORCHARD-INTEGRATION.md).
+- YesSql's own test suite (`CoreTests`) passes in full against the Cosmos DB emulator on both partition strategies: 249 of 249 tests for YesSql 5.4.7, and the 6.0.0 suite (the tests that do not need a database server). See [docs/CONFORMANCE.md](docs/CONFORMANCE.md).
+- A minimal Orchard Core 3.0.1 site runs its setup recipe and serves requests with this provider as its only data store. See [docs/ORCHARD-INTEGRATION.md](docs/ORCHARD-INTEGRATION.md).
 - Read [Limitations](#limitations) before using this with real data.
 
 ## Installation
@@ -20,7 +20,16 @@ Preview (0.1.x). Interfaces and behavior may still change.
 dotnet add package YesSql.Provider.CosmosDb
 ```
 
-Targets `net8.0` and `net10.0`. Requires YesSql 5.4.7.
+Targets `net8.0` and `net10.0`.
+
+### Compatibility
+
+| | Supported |
+| --- | --- |
+| YesSql | 5.4.7 and 6.0.0. The package is built against 5.4.7, and YesSql 6.0.0's own tests also pass against it. |
+| Orchard Core | 3.0.x, which uses YesSql 5.4.7. |
+
+Orchard Core 3.0.x was built against YesSql 5.4.7. If an application references YesSql 6.0.0 next to Orchard Core 3.0.x, Orchard fails at startup with a `MissingMethodException` (for example on `IStore.InitializeCollectionAsync`). The exception is thrown by Orchard Core's own data access setup, not by the database provider. Keep YesSql at 5.4.7 with Orchard Core 3.0.x. Versions of Orchard Core that use YesSql 6 have not been tested with this provider.
 
 ## Usage
 

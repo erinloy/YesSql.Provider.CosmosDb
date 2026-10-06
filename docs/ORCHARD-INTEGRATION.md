@@ -2,7 +2,7 @@
 
 Orchard Core stores its data through YesSql, so it can use this provider. Orchard does not yet have Cosmos DB as a built-in database option, so the provider has to be wired in by replacing the tenant's `IStore` registration.
 
-[`samples/OrchardSmokeTest`](../samples/OrchardSmokeTest) is a minimal Orchard Core 2.2.1 host that does this. Against the Cosmos emulator it runs the `Headless` setup recipe, creates the tenant, and serves the site and the admin login page. No SQLite file is created; every document and index row goes to Cosmos.
+[`samples/OrchardSmokeTest`](../samples/OrchardSmokeTest) is a minimal Orchard Core 3.0.1 host (net10.0) that does this. Against the Cosmos emulator it runs the `Headless` setup recipe, creates the tenant, and serves the site and the admin login page. No SQLite file is created; every document and index row goes to Cosmos.
 
 The sample uses the default `PerTable` partition strategy. Orchard has not been tested here with `PerStore`.
 
