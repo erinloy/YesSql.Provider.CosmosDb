@@ -54,7 +54,7 @@ The database and container are created on first use unless `CreateIfNotExists` i
 | `AccountEndpoint`, `AccountKey` | required | Cosmos account endpoint and key. |
 | `DatabaseId` | required | Database that holds the store. |
 | `ContainerId` | `yessql` | Container for all documents and index rows. |
-| `PartitionKeyPath` | `/pk` | Must stay `/pk`. Items store their partition key in the `pk` property. |
+| `PartitionKeyPath` | `/pk` | Single-level path such as `/pk` or `/tenantId`. Items store their partition key in that property. An existing container must use the same path. |
 | `PartitionStrategy` | `PerTable` | How items map to logical partitions. See below. |
 | `PartitionScope` | `store` | Partition key value used by `PerStore`, for example a tenant name. |
 | `CreateIfNotExists` | `true` | Create the database and container if they do not exist. |
@@ -67,7 +67,7 @@ Cosmos DB can only commit atomically within a single logical partition. A YesSql
 | Strategy | Partition key | Rollback of a unit of work | Scale limit |
 | --- | --- | --- | --- |
 | `PerTable` (default) | YesSql table name | Best effort, item by item | None beyond Cosmos itself |
-| `PerStore` | `PartitionScope` | One transactional batch per 100 undo operations | 20 GB and 10,000 RU/s per store |
+| `PerStore` | `PartitionScope` | One transactional batch per 100 items changed | 20 GB and 10,000 RU/s per store |
 
 `PerStore` fits workloads with bounded data per store, such as one Orchard Core tenant per `PartitionScope`. A rollback is atomic only while it fits in one batch and the batch is accepted; the exact guarantee and its limits are in [docs/PARTITIONING.md](docs/PARTITIONING.md).
 

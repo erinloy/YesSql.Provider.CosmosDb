@@ -23,7 +23,7 @@ Everything lives in one container. Each item carries the Cosmos system `id`, a p
 | Reduce bridge row | `{ id: "<bridge table>:<index id>:<document id>", pk, __table, <columns> }` |
 | Id counter | `{ id: "<table>", pk: "__seq", next }` |
 
-`pk` is the table name with `PerTable` and `CosmosDbOptions.PartitionScope` with `PerStore`. See [PARTITIONING.md](PARTITIONING.md).
+`pk` is the table name with `PerTable` and `CosmosDbOptions.PartitionScope` with `PerStore`. `pk` is the default name of the partition key property; `CosmosDbOptions.PartitionKeyPath` can name another single-level path. See [PARTITIONING.md](PARTITIONING.md).
 
 `Id` is a numeric field separate from the system `id` string. Cosmos has no auto-increment, so ids for index rows come from the counter item for that table. The counter lives in its own `__seq` partition, so it never appears in queries over a table, and it is advanced with an ETag-conditional replace. Ids are not reused after deletes.
 
@@ -64,7 +64,7 @@ YesSql session
 - Documents by id (`WHERE [Id] = / IN`): point reads.
 - Documents by type, or a document query without an index: a query over the table's items, optionally filtered on `Type`, with the requested columns projected.
 - Index rows (`SELECT ... FROM [index]`): a query over the index's items. Column names come from the properties of the returned items.
-- Index joins (`... JOIN [index] AS a ON a.[DocumentId] = [Document].[Id]`), including joins on several different indexes and the map-plus-reduce form: a query against each index partition collects the matching `DocumentId` values, which are intersected when there are several indexes. Ordering and paging are applied to that id list in the client, then only the documents on the requested page are point-read.
+- Index joins (`... JOIN [index] AS a ON a.[DocumentId] = [Document].[Id]`), including joins on several different indexes and the map-plus-reduce form: a query against each index partition collects the matching `DocumentId` values, which are intersected when there are several indexes. Ordering and paging are applied to that id list in the client, then only the documents on the requested page are point-read, up to eight reads at a time.
 - Reduce index queries (document, bridge and index tables): resolved through the index, then the bridge rows, then the documents.
 - `SELECT DateTimePart(...)` projections: run as a Cosmos `VALUE` query.
 
@@ -73,7 +73,7 @@ YesSql session
 - Column references (`alias.[Col]`, `[table].[Col]`, `[Col]`) are rewritten to `c["Col"]`. `IS NULL` and `IS NOT NULL` map to `IS_DEFINED` and `IS_NULL` tests.
 - The `[Document].[Type] = @p` predicate that YesSql adds to index joins is removed from the index query, because `Type` is not an index column. For `filterType` queries it is applied afterwards against the collected documents.
 - Comparisons against `DateTime` and `DateTimeOffset` parameters use `DateTimeToTimestamp`, so values compare by instant regardless of offset text.
-- `IN (SELECT ...)` subqueries are run first and replaced with a literal list. Cosmos has no correlated subqueries across partitions.
+- `IN (SELECT ...)` subqueries are run first and replaced with an `ARRAY_CONTAINS` test over the resulting values, which are passed as a query parameter. Cosmos has no correlated subqueries across partitions.
 - Document and index-row queries map YesSql's `ORDER BY` (including the `MAX(a.[Col]) AS order_N` form) to a Cosmos `ORDER BY` and push `OFFSET`/`LIMIT` into the query. A lone `OFFSET` is paired with a maximum `LIMIT`, because Cosmos requires both.
 - Index joins sort in the client. Cosmos `ORDER BY` is case-sensitive and cannot order by `LOWER(...)`, and the reference providers order case-insensitively.
 - `byte[]` column values are stored as `{ "$b64": "<base64>" }` so they round-trip as `byte[]`.
