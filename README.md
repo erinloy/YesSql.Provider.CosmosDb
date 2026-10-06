@@ -24,12 +24,16 @@ Targets `net8.0` and `net10.0`.
 
 ### Compatibility
 
-| | Supported |
-| --- | --- |
-| YesSql | 5.4.7 and 6.0.0. The package is built against 5.4.7, and YesSql 6.0.0's own tests also pass against it. |
-| Orchard Core | 3.0.x, which uses YesSql 5.4.7. |
+| Orchard Core | YesSql | Sample status |
+| --- | --- | --- |
+| 3.0.x (stable) | 5.4.7 | Sets up and serves from Cosmos. Run in CI. |
+| 4.0.0 preview (`4.0.0-preview-19175`) | 6.0.0 | Sets up and serves from Cosmos. Run in CI as a non-gating check, because previews change. |
 
-Orchard Core 3.0.x was built against YesSql 5.4.7. If an application references YesSql 6.0.0 next to Orchard Core 3.0.x, Orchard fails at startup with a `MissingMethodException` (for example on `IStore.InitializeCollectionAsync`). The exception is thrown by Orchard Core's own data access setup, not by the database provider. Keep YesSql at 5.4.7 with Orchard Core 3.0.x. Versions of Orchard Core that use YesSql 6 have not been tested with this provider.
+The package is built against YesSql 5.4.7 and works with YesSql 6.0.0: YesSql 6.0.0's own tests pass against it on both partition strategies. No stable Orchard Core release uses YesSql 6 yet.
+
+Orchard Core and YesSql versions have to match. Orchard Core 3.0.x was built against YesSql 5.4.7. If an application references YesSql 6.0.0 next to Orchard Core 3.0.x, Orchard fails at startup with a `MissingMethodException` (for example on `IStore.InitializeCollectionAsync`). The exception is thrown by Orchard Core's own data access setup, not by the database provider. Keep YesSql at 5.4.7 with Orchard Core 3.0.x.
+
+[`samples/OrchardSmokeTest`](samples/OrchardSmokeTest) builds against either line. Select one with `-p:OrchardCoreVersion=<version>`; the default is 3.0.1. See [Orchard Core integration](docs/ORCHARD-INTEGRATION.md).
 
 ## Usage
 

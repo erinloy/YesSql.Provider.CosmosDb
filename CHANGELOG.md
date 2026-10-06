@@ -10,6 +10,8 @@ All notable changes are listed here. The project is in preview, so minor version
 - `CosmosDbException`, a `DbException` that carries the Cosmos status code and retry delay. Failed statements, failed connection opens and failed rollbacks throw it, with the original `CosmosException` as the inner exception. YesSql 6 requires failed queries to surface as `DbException`.
 - `UPDATE [T] SET [Col] = REPLACE([Col], from, to) [WHERE ...]` is supported. Orchard Core issues this to rename serialized `$type` names in stored documents, for example in the Lucene query-type migration. It previously failed with `Parameter 'Id' not found`. The `from` and `to` arguments may be string literals or parameters, and the rewrite is recorded for rollback.
 
+- The Orchard Core sample builds against Orchard Core 3.0.1 (YesSql 5.4.7) or the 4.0 preview (YesSql 6.0.0), selected with `-p:OrchardCoreVersion`. CI sets up and serves it on both. `scripts/smoke-sample.sh` runs the same check locally.
+
 ### Fixed
 - Queries through a reduce index ignored `ORDER BY`, so documents came back in storage order. They are now ordered by the index row they belong to, and `Skip` and `Take` follow that order.
 - Queries with `IN (SELECT ...)` failed, or could be changed by the data, when a stored value contained a backslash or a quote. The values are now passed to Cosmos as a query parameter instead of being written into the query text.

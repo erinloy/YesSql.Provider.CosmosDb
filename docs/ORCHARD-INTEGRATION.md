@@ -2,7 +2,7 @@
 
 Orchard Core stores its data through YesSql, so it can use this provider. Orchard does not yet have Cosmos DB as a built-in database option, so the provider has to be wired in by replacing the tenant's `IStore` registration.
 
-[`samples/OrchardSmokeTest`](../samples/OrchardSmokeTest) is a minimal Orchard Core 3.0.1 host (net10.0) that does this. Against the Cosmos emulator it runs the `Headless` setup recipe, creates the tenant, and serves the site and the admin login page. No SQLite file is created; every document and index row goes to Cosmos.
+[`samples/OrchardSmokeTest`](../samples/OrchardSmokeTest) is a minimal Orchard Core host (net10.0) that does this. It builds against Orchard Core 3.0.1 (YesSql 5.4.7) by default, and against the 4.0 preview (YesSql 6.0.0) with `-p:OrchardCoreVersion=4.0.0-preview-19175`. Against the Cosmos emulator it runs the `Headless` setup recipe, creates the tenant, and serves the site and the admin login page. No SQLite file is created; every document and index row goes to Cosmos.
 
 The sample uses the default `PerTable` partition strategy. Orchard has not been tested here with `PerStore`.
 
@@ -73,6 +73,14 @@ Start the emulator (see the [README](../README.md#running-against-the-emulator))
 ```bash
 dotnet run --project samples/OrchardSmokeTest
 ```
+
+To run it on the Orchard Core 4.0 preview (YesSql 6.0.0), select the version at build time:
+
+```bash
+dotnet run --project samples/OrchardSmokeTest -p:OrchardCoreVersion=4.0.0-preview-19175
+```
+
+`samples/nuget.config` adds Orchard Core's preview feed for the samples only. `scripts/smoke-sample.sh <version>` builds the sample, starts it against a running emulator with a fresh database, and checks that `/`, `/Login` and `/admin` return the site. CI runs it for both versions.
 
 The `Cosmos` section of `appsettings.json` holds the endpoint, key and database name. On first start AutoSetup creates the `Default` tenant and its data in the `orchard_smoke` database.
 

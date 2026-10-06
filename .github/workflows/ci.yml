@@ -74,3 +74,29 @@ jobs:
         env:
           COSMOS_PARTITION: PerStore
         run: dotnet ./test/Conformance.YesSql6/bin/Release/net10.0/YesSql.Tests.dll
+
+  # Orchard Core sample on each supported line. 3.0.x uses YesSql 5.4.7. The 4.0 preview uses YesSql 6.0.0; it is
+  # a moving target, so a failure there is reported but does not fail the run.
+  sample-orchard:
+    name: sample (Orchard Core ${{ matrix.orchard-core }})
+    runs-on: ubuntu-latest
+    continue-on-error: ${{ matrix.preview }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - orchard-core: 3.0.1
+            preview: false
+          - orchard-core: 4.0.0-preview-19175
+            preview: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+
+      - uses: ./.github/actions/start-emulator
+
+      - name: Set up and serve the sample
+        run: scripts/smoke-sample.sh ${{ matrix.orchard-core }}
