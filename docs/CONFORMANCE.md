@@ -8,7 +8,7 @@ All 249 tests in `CoreTests` pass on both partition strategies against the Cosmo
 
 The suite covers document CRUD, map and reduce indexes and their update and delete lifecycle, queries over one or several indexes (including map plus reduce), the raw `INNER`, `LEFT` and `RIGHT JOIN` count API, comparison and `IN` predicates, date and decimal functions, ordering, paging, counts, `byte[]` index columns, `RenameColumn`, optimistic concurrency and rollback.
 
-The two strategies differ on rollback. With `PerStore` it is atomic. With `PerTable` it is best effort, and the autoflush rollback tests still pass because the undo log reverses each write. See [PARTITIONING.md](PARTITIONING.md).
+The two strategies differ on rollback. With `PerStore` the undo log is applied as transactional batches, which are atomic one batch at a time. With `PerTable` it is applied item by item. The rollback tests in `CoreTests` pass on both, but they use small units of work and do not exercise the limits described in [PARTITIONING.md](PARTITIONING.md).
 
 ## Running the conformance suite
 

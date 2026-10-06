@@ -33,7 +33,7 @@ The cost is the per-partition ceiling of 20 GB and 10,000 RU/s for the whole sto
 
 Writes are applied immediately, so YesSql's autoflush (a query inside a session that sees the session's own unsaved changes) keeps working. Each write records its inverse in an undo log held by the transaction. `Commit` discards the log. `Rollback` replays it in reverse order.
 
-With `PerStore`, the inverse operations are sent as transactional batches in the single partition. A batch is all-or-nothing. Batches are limited to 100 operations, so a unit of work with more than 100 recorded writes is rolled back in several batches, and atomicity holds per batch rather than for the whole set. If a batch fails, for example because an item to delete is already gone, the provider applies that batch's operations one at a time.
+With `PerStore`, the inverse operations are sent as transactional batches in the single partition. A batch is all-or-nothing. Batches are limited to 100 operations, so a unit of work with more than 100 recorded writes is rolled back in several batches, and atomicity holds per batch rather than for the whole set. If the service rejects a batch, for example because an item to delete is already gone, the provider applies that batch's operations one at a time, which is not atomic. A rollback is therefore atomic when it fits in one batch and the batch is accepted.
 
 With `PerTable`, the inverse operations are applied one at a time across partitions. If the process stops partway through a rollback, some writes are undone and some are not.
 
@@ -49,7 +49,7 @@ Optimistic concurrency is separate from rollback. A checked `UPDATE` compares th
 
 | If | Use |
 | --- | --- |
-| Data per store is bounded and failed requests must leave nothing behind (typical for an Orchard Core tenant) | `PerStore` |
+| Data per store is bounded and you want failed requests to be reverted as completely as Cosmos allows (typical for an Orchard Core tenant) | `PerStore` |
 | One store may exceed 20 GB or 10,000 RU/s | `PerTable` |
 | Best-effort cleanup on failure is acceptable | `PerTable` |
 

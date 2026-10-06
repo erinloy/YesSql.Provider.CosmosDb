@@ -37,8 +37,9 @@ public sealed class CosmosDbOptions
     /// <item><see cref="PartitionStrategy.PerTable"/> (default): one partition per YesSql table. This
     /// scales out, but a unit of work spans partitions, so rollback is best effort.</item>
     /// <item><see cref="PartitionStrategy.PerStore"/>: one partition (<see cref="PartitionScope"/>) for
-    /// the whole store. A unit of work stays in one logical partition, so its rollback is atomic. The
-    /// store is limited to 20 GB and 10,000 RU/s.</item>
+    /// the whole store. A unit of work stays in one logical partition, so its rollback is applied with
+    /// transactional batches, which are atomic one batch (up to 100 operations) at a time. The store is
+    /// limited to 20 GB and 10,000 RU/s.</item>
     /// </list>
     /// </summary>
     public PartitionStrategy PartitionStrategy { get; init; } = PartitionStrategy.PerTable;

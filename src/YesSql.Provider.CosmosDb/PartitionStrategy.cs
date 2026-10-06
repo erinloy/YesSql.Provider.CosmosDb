@@ -13,8 +13,8 @@ public enum PartitionStrategy
 
     /// <summary>
     /// A single logical partition for the whole store (CosmosDbOptions.PartitionScope). A unit of work
-    /// stays within one logical partition, enabling atomic rollback. Bounded by Cosmos's 20 GB / 10,000
-    /// RU/s per-logical-partition limits.
+    /// stays within one logical partition, so rollback can use transactional batches (atomic one batch of up
+    /// to 100 operations at a time). Bounded by Cosmos's 20 GB / 10,000 RU/s per-logical-partition limits.
     /// </summary>
     PerStore = 1,
 }

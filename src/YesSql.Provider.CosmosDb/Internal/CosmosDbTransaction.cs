@@ -15,8 +15,9 @@ namespace YesSql.Provider.CosmosDb.Internal;
 /// ADO.NET <see cref="DbTransaction"/> shim for a YesSql unit of work. Writes are applied eagerly (so
 /// YesSql's autoflush read-your-writes works), and each one records its inverse in an undo log. On
 /// rollback the unit of work is reverted: in <see cref="PartitionStrategy.PerStore"/> every item shares
-/// one logical partition, so the inverse ops are applied atomically via a Cosmos transactional batch; in
-/// <see cref="PartitionStrategy.PerTable"/> they span partitions, so rollback is best-effort per item.
+/// one logical partition, so the inverse ops are sent as Cosmos transactional batches (atomic per batch of up
+/// to 100 operations; a rejected batch is retried item by item); in <see cref="PartitionStrategy.PerTable"/>
+/// they span partitions, so rollback is best-effort per item.
 /// </summary>
 internal sealed class CosmosDbTransaction : DbTransaction
 {

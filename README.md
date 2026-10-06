@@ -67,9 +67,9 @@ Cosmos DB can only commit atomically within a single logical partition. A YesSql
 | Strategy | Partition key | Rollback of a unit of work | Scale limit |
 | --- | --- | --- | --- |
 | `PerTable` (default) | YesSql table name | Best effort, item by item | None beyond Cosmos itself |
-| `PerStore` | `PartitionScope` | Atomic for up to 100 changed items, chunked beyond that | 20 GB and 10,000 RU/s per store |
+| `PerStore` | `PartitionScope` | One transactional batch per 100 undo operations | 20 GB and 10,000 RU/s per store |
 
-`PerStore` fits workloads with bounded data per store, such as one Orchard Core tenant per `PartitionScope`. Details are in [docs/PARTITIONING.md](docs/PARTITIONING.md).
+`PerStore` fits workloads with bounded data per store, such as one Orchard Core tenant per `PartitionScope`. A rollback is atomic only while it fits in one batch and the batch is accepted; the exact guarantee and its limits are in [docs/PARTITIONING.md](docs/PARTITIONING.md).
 
 ## Limitations
 

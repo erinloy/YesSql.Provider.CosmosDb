@@ -10,7 +10,7 @@ The sample uses the default `PerTable` partition strategy. Orchard has not been 
 
 `AddDataAccess()` in `OrchardCore.Data.YesSql` registers a singleton `IStore` per shell. It reads the shell's `DatabaseProvider` setting and calls the matching YesSql extension (`UseSqlServer`, `UseSqLite`, `UseMySql`, `UsePostgreSql`), then registers the shell's `IIndexProvider`s with the store. The set of providers is fixed in three places: the `DatabaseProviderValue` constants, the `switch` in `AddDataAccess`, and the `switch` in `DbConnectionValidator` used during setup. None of them is extensible from outside Orchard.
 
-Orchard also ties YesSql to the request. A scoped `ISession` is committed through `IDocumentStore.CommitAsync()` when the request scope is disposed, and `IDocumentStore.CancelAsync()` is called when the request throws. With `PerStore` the provider rolls back an unsaved unit of work atomically. With `PerTable` the rollback is best effort. See [PARTITIONING.md](PARTITIONING.md).
+Orchard also ties YesSql to the request. A scoped `ISession` is committed through `IDocumentStore.CommitAsync()` when the request scope is disposed, and `IDocumentStore.CancelAsync()` is called when the request throws. With `PerStore` the provider reverts an unsaved unit of work with transactional batches, which is atomic for a request that changed up to 100 items. With `PerTable` the rollback is best effort. Neither isolates the request from other sessions while it runs. See [PARTITIONING.md](PARTITIONING.md) for the limits.
 
 ## Wiring it in
 
