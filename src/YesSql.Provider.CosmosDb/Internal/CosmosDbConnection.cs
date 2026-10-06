@@ -14,23 +14,18 @@ namespace YesSql.Provider.CosmosDb.Internal;
 /// <see cref="CosmosDbDialect"/>; <see cref="CosmosDbCommand"/> translates that SQL into Cosmos
 /// SDK operations against <see cref="Container"/>.
 /// </summary>
-public sealed class CosmosDbConnection : DbConnection
+internal sealed class CosmosDbConnection : DbConnection
 {
-    // A CosmosClient is expensive — it owns its own socket pool and background monitor threads — and the SDK
-    // mandates a SINGLETON per account for the whole application lifetime. YesSql opens a DbConnection per
-    // unit-of-work, so creating a client per connection spawns one CosmosClient per session; under load (e.g.
-    // Orchard's setup/recipe execution) that exhausts sockets/connections and operations hang. Share ONE client
-    // per (endpoint,key) across all connections; it lives for the process lifetime and is never disposed per-
-    // connection. Lazy<T> guarantees the client is constructed exactly once even under concurrent first-opens.
+    // A CosmosClient owns its own connection pool and background threads, and the SDK expects one instance per
+    // account for the life of the application. YesSql opens a DbConnection per unit of work, so a client per
+    // connection exhausts sockets under load. One client is shared per (endpoint, key) for the process lifetime and
+    // is never disposed by a connection. The CosmosClientOptions of the first connection opened for an account are
+    // the ones that apply. Lazy<T> constructs the client exactly once under concurrent first opens.
     private static readonly ConcurrentDictionary<string, Lazy<CosmosClient>> SharedClients = new();
 
-    // Creating the database/container is a Cosmos CONTROL-PLANE (metadata) operation — cheap on the Postgres-
-    // backed emulator but EXPENSIVE and heavily rate-limited on real Cosmos. YesSql opens a DbConnection per
-    // unit-of-work, so calling CreateDatabaseIfNotExists + CreateContainerIfNotExists on EVERY open hammers the
-    // control plane; under setup load the throttled metadata operation parks forever (the connection never
-    // finishes opening). Ensure the database+container EXACTLY ONCE per (endpoint,db,container) for the process;
-    // Lazy<Task> guarantees the ensure runs a single time even under concurrent first-opens, and every other
-    // open just awaits the already-completed task.
+    // Creating the database and container are control-plane operations, which are rate limited on a real account.
+    // They run once per (endpoint, database, container) for the process, not on every connection open. Lazy<Task>
+    // makes concurrent first opens wait on the same operation.
     private static readonly ConcurrentDictionary<string, Lazy<Task>> EnsuredContainers = new();
 
     private readonly CosmosDbOptions _options;

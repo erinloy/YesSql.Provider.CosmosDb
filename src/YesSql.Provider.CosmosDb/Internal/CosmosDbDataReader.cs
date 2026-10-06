@@ -10,7 +10,7 @@ namespace YesSql.Provider.CosmosDb.Internal;
 /// way YesSql/Dapper materialize <c>Document</c> rows (column-name → value mapping). Columns are the
 /// document fields <c>Id</c>, <c>Type</c>, <c>Content</c>, <c>Version</c>.
 /// </summary>
-public sealed class CosmosDbDataReader : DbDataReader
+internal sealed class CosmosDbDataReader : DbDataReader
 {
     private readonly string[] _columns;
     private readonly Dictionary<string, int> _ordinals;

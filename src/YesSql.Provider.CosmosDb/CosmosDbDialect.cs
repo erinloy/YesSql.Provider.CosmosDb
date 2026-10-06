@@ -6,9 +6,9 @@ using YesSql.Sql;
 namespace YesSql.Provider.CosmosDb;
 
 /// <summary>
-/// YesSql SQL dialect for Cosmos DB. This emits a deliberately small, self-defined SQL surface that the
-/// co-designed ADO.NET shim (<see cref="CosmosDbCommand"/>) parses and maps to Cosmos SDK operations.
-/// We own both sides of this contract, so the dialect only ever produces statements the shim understands.
+/// YesSql SQL dialect for Cosmos DB. It emits a small, restricted SQL surface that the provider's ADO.NET
+/// command implementation translates into Cosmos SDK operations. Most members only need to return a value
+/// YesSql can use; Cosmos is schemaless, so the DDL-related members are placeholders.
 /// </summary>
 public sealed class CosmosDbDialect : BaseDialect
 {
@@ -56,9 +56,10 @@ public sealed class CosmosDbDialect : BaseDialect
         };
     }
 
+    /// <summary>Creates the dialect and registers its SQL function templates.</summary>
     public CosmosDbDialect()
     {
-        // 'now' maps to Cosmos server time at translation; placeholder template for parity.
+        // Template for YesSql's 'now' function.
         Methods.Add("now", new TemplateFunction("GetCurrentDateTime()"));
 
         // Date-part extraction → Cosmos DateTimePart(part, <iso-datetime>). The translator recognises a
@@ -71,35 +72,51 @@ public sealed class CosmosDbDialect : BaseDialect
         Methods.Add("year", new TemplateFunction("DateTimePart(\"year\", {0})"));
     }
 
+    /// <inheritdoc />
     public override string Name => "CosmosDb";
 
     // Execute commands individually (no SQL batch) so the shim sees one well-known statement at a time.
+    /// <inheritdoc />
     public override bool SupportsBatching => false;
 
     // Identity is produced by YesSql's IIdGenerator (block allocation), not by a DB identity column.
     // Cosmos has no auto-increment, so these DDL/identity fragments are unused by the shim.
+    /// <inheritdoc />
     public override string IdentityColumnString => "";
+    /// <inheritdoc />
     public override string LegacyIdentityColumnString => "";
+    /// <inheritdoc />
     public override string IdentitySelectString => "";
+    /// <inheritdoc />
     public override string IdentityLastId => "";
 
+    /// <inheritdoc />
     public override string RandomOrderByClause => "GetCurrentTimestamp()";
 
+    /// <inheritdoc />
     public override byte DefaultDecimalPrecision => 19;
+    /// <inheritdoc />
     public override byte DefaultDecimalScale => 5;
 
     // Bracket quoting — easy and unambiguous for the shim's parser to strip.
+    /// <inheritdoc />
     public override string QuoteForColumnName(string columnName) => "[" + columnName + "]";
+    /// <inheritdoc />
     public override string QuoteForTableName(string tableName, string schema) => "[" + tableName + "]";
+    /// <inheritdoc />
     public override string QuoteForAliasName(string aliasName) => aliasName;
 
+    /// <inheritdoc />
     public override bool SupportsIfExistsBeforeTableName => true;
 
+    /// <inheritdoc />
     public override string GetCreateSchemaString(string schema) => null!;
 
     // DDL is a no-op on a schemaless store; containers are provisioned by the connection.
+    /// <inheritdoc />
     public override string GetDropIndexString(string indexName, string tableName, string schema) => "";
 
+    /// <inheritdoc />
     public override string GetTypeName(DbType dbType, int? length, byte? precision, byte? scale)
         // Cosmos is schemaless; column types are irrelevant since DDL is not executed. Decimal still
         // reports a precision/scale-qualified name so callers that inspect the type definition (and the
@@ -108,6 +125,7 @@ public sealed class CosmosDbDialect : BaseDialect
             ? $"DECIMAL({precision ?? DefaultDecimalPrecision},{scale ?? DefaultDecimalScale})"
             : "TEXT";
 
+    /// <inheritdoc />
     public override void Page(ISqlBuilder sqlBuilder, string offset, string limit)
     {
         sqlBuilder.ClearTrail();

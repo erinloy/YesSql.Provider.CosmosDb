@@ -6,7 +6,7 @@ using System.Data.Common;
 namespace YesSql.Provider.CosmosDb.Internal;
 
 /// <summary>List-backed ADO.NET <see cref="DbParameterCollection"/> for the Cosmos command shim.</summary>
-public sealed class CosmosDbParameterCollection : DbParameterCollection
+internal sealed class CosmosDbParameterCollection : DbParameterCollection
 {
     private readonly List<DbParameter> _parameters = new();
 

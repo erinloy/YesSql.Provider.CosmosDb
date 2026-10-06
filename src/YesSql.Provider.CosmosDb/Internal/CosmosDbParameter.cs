@@ -4,7 +4,7 @@ using System.Data.Common;
 namespace YesSql.Provider.CosmosDb.Internal;
 
 /// <summary>ADO.NET <see cref="DbParameter"/> shim — a plain value holder for the command translator.</summary>
-public sealed class CosmosDbParameter : DbParameter
+internal sealed class CosmosDbParameter : DbParameter
 {
     [System.Diagnostics.CodeAnalysis.AllowNull]
     public override string ParameterName { get; set; } = string.Empty;

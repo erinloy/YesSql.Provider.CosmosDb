@@ -18,7 +18,7 @@ namespace YesSql.Provider.CosmosDb.Internal;
 /// one logical partition, so the inverse ops are applied atomically via a Cosmos transactional batch; in
 /// <see cref="PartitionStrategy.PerTable"/> they span partitions, so rollback is best-effort per item.
 /// </summary>
-public sealed class CosmosDbTransaction : DbTransaction
+internal sealed class CosmosDbTransaction : DbTransaction
 {
     private readonly CosmosDbConnection _connection;
     private readonly List<UndoOp> _undo = new();

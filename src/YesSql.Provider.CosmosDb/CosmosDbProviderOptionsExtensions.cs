@@ -9,11 +9,10 @@ namespace YesSql.Provider.CosmosDb;
 /// store, mirroring the shape of the first-party providers (e.g. <c>UseSqLite</c>).
 /// </summary>
 /// <remarks>
-/// Because YesSql persists through an ADO.NET <see cref="System.Data.Common.DbConnection"/> obtained
-/// from an <see cref="IConnectionFactory"/> and drives it with SQL produced by <see cref="ISqlDialect"/>,
-/// this provider supplies a co-designed pair: the <see cref="CosmosDbConnection"/> ADO.NET shim plus the
-/// <see cref="CosmosDbDialect"/> that emits a constrained SQL surface the shim translates into Cosmos SDK
-/// operations. See SPIKE-NOTES.md.
+/// YesSql persists through an ADO.NET <see cref="System.Data.Common.DbConnection"/> obtained from an
+/// <see cref="IConnectionFactory"/> and drives it with SQL produced by an <see cref="ISqlDialect"/>. The
+/// provider supplies a Cosmos-backed ADO.NET implementation together with <see cref="CosmosDbDialect"/>,
+/// which emits the restricted SQL that implementation translates into Cosmos SDK operations.
 /// </remarks>
 public static class CosmosDbProviderOptionsExtensions
 {

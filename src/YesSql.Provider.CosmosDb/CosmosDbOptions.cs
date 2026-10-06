@@ -7,7 +7,7 @@ namespace YesSql.Provider.CosmosDb;
 /// </summary>
 public sealed class CosmosDbOptions
 {
-    /// <summary>Cosmos account endpoint, e.g. <c>https://localhost:8081/</c> for the emulator.</summary>
+    /// <summary>Cosmos account endpoint, e.g. <c>https://my-account.documents.azure.com:443/</c>.</summary>
     public required string AccountEndpoint { get; init; }
 
     /// <summary>Cosmos account key.</summary>
@@ -23,8 +23,8 @@ public sealed class CosmosDbOptions
     public string ContainerId { get; init; } = "yessql";
 
     /// <summary>
-    /// Partition key path. Kept coarse so a YesSql unit-of-work stays within one logical partition
-    /// (required for atomic stored-procedure commits). Defaults to <c>/pk</c>.
+    /// Partition key path of the container. The provider stores each item's partition key in its
+    /// <c>pk</c> property, so this must remain <c>/pk</c> (the default).
     /// </summary>
     public string PartitionKeyPath { get; init; } = "/pk";
 
@@ -34,12 +34,11 @@ public sealed class CosmosDbOptions
     /// <summary>
     /// How items are mapped to Cosmos logical partitions.
     /// <list type="bullet">
-    /// <item><see cref="PartitionStrategy.PerTable"/> (default): one partition per YesSql table —
-    /// horizontally scalable, but a unit of work spans partitions so there is no cross-table rollback.</item>
-    /// <item><see cref="PartitionStrategy.PerStore"/>: a single partition (<see cref="PartitionScope"/>)
-    /// for the whole store — a unit of work stays in one logical partition, enabling atomic rollback via
-    /// a partition-scoped operation. Capped at 20 GB / 10,000 RU/s per store (ample for typical Orchard
-    /// tenants, whose blobs live outside the DB).</item>
+    /// <item><see cref="PartitionStrategy.PerTable"/> (default): one partition per YesSql table. This
+    /// scales out, but a unit of work spans partitions, so rollback is best effort.</item>
+    /// <item><see cref="PartitionStrategy.PerStore"/>: one partition (<see cref="PartitionScope"/>) for
+    /// the whole store. A unit of work stays in one logical partition, so its rollback is atomic. The
+    /// store is limited to 20 GB and 10,000 RU/s.</item>
     /// </list>
     /// </summary>
     public PartitionStrategy PartitionStrategy { get; init; } = PartitionStrategy.PerTable;

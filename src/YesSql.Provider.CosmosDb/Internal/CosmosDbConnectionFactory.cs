@@ -8,7 +8,7 @@ namespace YesSql.Provider.CosmosDb.Internal;
 /// generic <c>DbConnectionFactory&lt;T&gt;</c>, Cosmos needs structured options (endpoint, key, database,
 /// container, partition key) rather than a single connection string, so this factory carries them.
 /// </summary>
-public sealed class CosmosDbConnectionFactory : IConnectionFactory
+internal sealed class CosmosDbConnectionFactory : IConnectionFactory
 {
     private readonly CosmosDbOptions _options;
 

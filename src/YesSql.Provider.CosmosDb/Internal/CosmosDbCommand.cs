@@ -18,11 +18,12 @@ namespace YesSql.Provider.CosmosDb.Internal;
 /// <see cref="DbParameterCollection"/> (Id/Type/Content/Version) rather than by parsing clauses.
 /// </summary>
 /// <remarks>
-/// Document storage model (single container, type-discriminated): each YesSql document table row becomes
-/// a Cosmos item <c>{ id: "&lt;table&gt;:&lt;Id&gt;", pk: "&lt;table&gt;", Id, Type, Content, Version }</c>.
-/// The partition key is the table name so a unit of work stays within one logical partition.
+/// Storage model (single container): each YesSql table row becomes a Cosmos item
+/// <c>{ id: "&lt;table&gt;:&lt;Id&gt;", pk, __table, Id, ... }</c>. <c>pk</c> is the table name under
+/// <see cref="PartitionStrategy.PerTable"/> and <see cref="CosmosDbOptions.PartitionScope"/> under
+/// <see cref="PartitionStrategy.PerStore"/>. See docs/ARCHITECTURE.md.
 /// </remarks>
-public sealed class CosmosDbCommand : DbCommand
+internal sealed class CosmosDbCommand : DbCommand
 {
     private static readonly string[] DocumentColumns = { "Id", "Type", "Content", "Version" };
 
@@ -149,12 +150,10 @@ public sealed class CosmosDbCommand : DbCommand
         }
 
         // Bulk content rewrite: UPDATE [<table>] SET [<col>] = REPLACE([<col>], <from>, <to>) [WHERE <pred>].
-        // OrchardCore emits this to rename serialized $type names inside stored documents (e.g. the Lucene
-        // query type rename in OrchardCore.Search.Lucene's migration). It is NOT a single-row, @Id-keyed
-        // document write — there is no @Id — so it must not fall through to the patch-by-id UPDATE path below
-        // (which would throw "Parameter 'Id' not found"). Translate it to a query-modify-write: find the
-        // matching items in the partition and string-replace the column on each. (Document.Content is stored
-        // as a JSON string, so REPLACE is a plain string replace; arguments may be 'literals' or @parameters.)
+        // Orchard Core issues this to rename serialized $type names in stored documents. It has no @Id, so it
+        // cannot use the single-row UPDATE path below. Query the matching items, string-replace the column on
+        // each, and write them back. Document.Content is stored as a JSON string, so REPLACE is a plain string
+        // replace; the arguments may be 'literals' or @parameters.
         if (StartsWith(sql, "update"))
         {
             var replaceHead = Regex.Match(sql, @"^update\s+\[([^\]]+)\]\s+set\s+\[([^\]]+)\]\s*=\s*replace\b",
@@ -679,7 +678,7 @@ public sealed class CosmosDbCommand : DbCommand
         }
         catch (CosmosException ex)
         {
-            throw new NotSupportedException($"IDXQ_FAIL cosmos=[{queryText}] orig=[{CommandText}]: {ex.Message}", ex);
+            throw new NotSupportedException($"Cosmos rejected the translated index query [{queryText}] (from SQL [{CommandText}]): {ex.Message}", ex);
         }
 
         // filterType:true adds a "[Document].[Type] = @p" predicate that StripDocTypePredicate removed (it
@@ -1123,11 +1122,8 @@ public sealed class CosmosDbCommand : DbCommand
         return m.Success ? int.Parse(m.Groups[1].Value) : 0;
     }
 
-    // Push paging into the Cosmos query (OFFSET … LIMIT) so a BOUNDED result set is returned. Without this the
-    // provider fetches every matching document in the partition and trims client-side — which is fast on the
-    // Postgres-backed emulator but degrades to an effective hang on real Cosmos as a partition fills (it returns
-    // the entire matching set just to take the first row). Cosmos requires OFFSET and LIMIT together; ORDER BY is
-    // optional (already appended separately when present).
+    // Push paging into the Cosmos query (OFFSET ... LIMIT) so only the requested page is returned instead of every
+    // matching item. Cosmos requires OFFSET and LIMIT together; ORDER BY is optional and appended separately.
     private static string BuildOffsetLimitClause(string sql)
     {
         var limit = ExtractLimit(sql);
@@ -1138,8 +1134,7 @@ public sealed class CosmosDbCommand : DbCommand
         }
 
         // Bare OFFSET with no LIMIT (e.g. .Skip(n) without .Take(...)): Cosmos rejects OFFSET on its own, so
-        // pair it with a sentinel max LIMIT to skip the first n rows and return all the rest. (The in-memory
-        // Skip that used to handle this was removed once paging moved into the Cosmos query.)
+        // pair it with a maximum LIMIT to skip the first n rows and return the rest.
         return offset > 0 ? $" OFFSET {offset} LIMIT {int.MaxValue}" : string.Empty;
     }
 
