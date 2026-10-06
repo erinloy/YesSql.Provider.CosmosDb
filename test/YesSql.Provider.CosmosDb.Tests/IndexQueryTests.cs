@@ -11,8 +11,8 @@ using YesSql.Provider.CosmosDb;
 namespace YesSql.Provider.CosmosDb.Tests;
 
 /// <summary>
-/// Exercises a map index + query through the provider. Initially used to capture the exact SQL YesSql
-/// emits for index writes and index-joined queries, then to verify the translation.
+/// Writes a map index through the provider and queries it, covering the index-write and index-join SQL
+/// translation.
 /// </summary>
 public class IndexQueryTests
 {
@@ -37,6 +37,7 @@ public class IndexQueryTests
     private static CosmosDbOptions EmulatorOptions() => new()
     {
         AccountEndpoint = "http://localhost:8081/",
+        // Microsoft's published, well-known Cosmos DB emulator key (not a secret).
         AccountKey = "C2y6yDjf5/R+ob0N8A7Cgv30VRDJIWEHLM+4QDU5DE2nQ9nDuVTqobD4b8mGGyPMbIZnqyMsEcaGQy67XIw/Jw==",
         DatabaseId = "yessql_idx_" + Guid.NewGuid().ToString("N")[..8],
         ClientOptions = new CosmosClientOptions

@@ -46,6 +46,7 @@ public class RollbackTests
         var configuration = new Configuration().UseCosmosDb(new CosmosDbOptions
         {
             AccountEndpoint = "http://localhost:8081/",
+            // Microsoft's published, well-known Cosmos DB emulator key (not a secret).
             AccountKey = "C2y6yDjf5/R+ob0N8A7Cgv30VRDJIWEHLM+4QDU5DE2nQ9nDuVTqobD4b8mGGyPMbIZnqyMsEcaGQy67XIw/Jw==",
             DatabaseId = "yessql_rollback",
             PartitionStrategy = PartitionStrategy.PerStore,
@@ -79,7 +80,7 @@ public class RollbackTests
             await session.SaveAsync(person);
             id = person.Id;
 
-            // Force an autoflush (eager write to Cosmos + undo recorded), then DO NOT save changes.
+            // Force an autoflush (eager write to Cosmos + undo recorded), then do not save changes.
             var seen = await session.Query<Person, PersonByName>().Where(x => x.SomeName == name).CountAsync();
             Assert.Equal(1, seen); // visible within the session (read-your-writes)
         }

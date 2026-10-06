@@ -9,14 +9,14 @@ using YesSql.Provider.CosmosDb;
 namespace YesSql.Provider.CosmosDb.Tests;
 
 /// <summary>
-/// Live round-trip against the Azure Cosmos DB Linux emulator
-/// (mcr.microsoft.com/cosmosdb/linux/azure-cosmos-emulator:vnext-preview on https://localhost:8081).
+/// Saves and loads a document against the Cosmos DB Linux emulator
+/// (mcr.microsoft.com/cosmosdb/linux/azure-cosmos-emulator:vnext-preview on http://localhost:8081).
 /// </summary>
 public class CosmosRoundTripTests
 {
     private const string Endpoint = "http://localhost:8081/";
 
-    // Well-known Cosmos emulator key.
+    // Microsoft's published, well-known Cosmos DB emulator key (not a secret).
     private const string Key = "C2y6yDjf5/R+ob0N8A7Cgv30VRDJIWEHLM+4QDU5DE2nQ9nDuVTqobD4b8mGGyPMbIZnqyMsEcaGQy67XIw/Jw==";
 
     public sealed class Person

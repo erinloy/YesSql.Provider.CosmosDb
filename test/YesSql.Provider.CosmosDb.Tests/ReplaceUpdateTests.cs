@@ -10,20 +10,18 @@ using YesSql.Provider.CosmosDb;
 namespace YesSql.Provider.CosmosDb.Tests;
 
 /// <summary>
-/// Regression for the bulk content-rewrite UPDATE that Orchard Core emits for serialized-$type renames
-/// (e.g. OrchardCore.Search.Lucene's query-type rename migration):
+/// Covers the bulk content-rewrite UPDATE that Orchard Core issues to rename serialized $type names:
 ///   UPDATE [Document] SET [Content] = REPLACE([Content], '&lt;from&gt;', '&lt;to&gt;') WHERE [Type] = '&lt;literal&gt;'
-/// Before 0.1.3 this fell through the single-row, @Id-keyed UPDATE path and threw
-/// "Parameter 'Id' not found" (there is no @Id). The REPLACE arguments contain COMMAS inside their quoted
-/// literals (JSON type strings), so argument parsing must respect quoting — a naive comma split breaks.
+/// The statement has no @Id. The REPLACE arguments contain commas inside their quoted literals (as .NET type
+/// names do), so argument parsing has to respect quoting.
 ///
-/// Endpoint defaults to the suite's classic-emulator convention (:8081); override with COSMOS_TEST_ENDPOINT
-/// (e.g. the Aspire vnext emulator's gateway) to run it elsewhere.
+/// The endpoint defaults to http://localhost:8081/; set COSMOS_TEST_ENDPOINT to use another one.
 /// </summary>
 public class ReplaceUpdateTests
 {
     private static readonly string Endpoint =
         Environment.GetEnvironmentVariable("COSMOS_TEST_ENDPOINT") ?? "http://localhost:8081/";
+    // Microsoft's published, well-known Cosmos DB emulator key (not a secret).
     private const string Key = "C2y6yDjf5/R+ob0N8A7Cgv30VRDJIWEHLM+4QDU5DE2nQ9nDuVTqobD4b8mGGyPMbIZnqyMsEcaGQy67XIw/Jw==";
     private const string ContainerId = "yessql";
     private const string Scope = "rtest";
@@ -61,7 +59,7 @@ public class ReplaceUpdateTests
         var db = "yessql_replace_" + Guid.NewGuid().ToString("N")[..8];
         var store = await StoreFactory.CreateAndInitializeAsync(new Configuration().UseCosmosDb(Options(db)));
 
-        // Markers with COMMAS inside them — once quoted in the SQL these become commas INSIDE the REPLACE
+        // Markers with commas inside them: once quoted in the SQL they become commas inside the REPLACE
         // literals, the exact shape that broke naive comma-splitting (the OrchardCore $type strings have them).
         // Kept quote-free so they survive JSON-string serialization in [Content] verbatim.
         const string oldFrag = "Old.Lucene.Query, Old.Assembly";

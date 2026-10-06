@@ -12,25 +12,23 @@ using YesSql.Provider.CosmosDb;
 namespace YesSql.Provider.CosmosDb.Tests;
 
 /// <summary>
-/// Regression for OrchardCore CONTENT INDEXING tasks on Cosmos (the empty-Lucene-search bug). OrchardCore's
-/// <c>IndexingTaskManager</c> persists indexing tasks through a RAW Dapper connection (IDbConnectionAccessor),
-/// NOT the YesSql session, inside a transaction:
-///   FLUSH  — delete-by-(Category, RecordId IN @Ids), then a LIST insert (Dapper runs the insert once per task),
-///            then Commit.
-///   RETRIEVE — a dialect-built "SELECT * FROM RecordIndexingTask WHERE Id &gt; @Id AND Category = @Category
-///            ORDER BY Id LIMIT @Count" (the ContentIndexingBackgroundTask pages tasks by Id &gt; afterTaskId).
-/// If any link doesn't round-trip on the Cosmos provider, no tasks are ever retrieved and the content index
-/// never populates. This test replicates that exact lifecycle against the provider.
+/// Orchard Core's <c>IndexingTaskManager</c> stores content-indexing tasks through a raw Dapper connection rather
+/// than a YesSql session, inside a transaction:
+///   flush    - delete by (Category, RecordId IN @Ids), insert the new tasks (Dapper runs the insert once per
+///              task), commit.
+///   retrieve - "SELECT * FROM RecordIndexingTask WHERE Id &gt; @Id AND Category = @Category ORDER BY Id
+///              LIMIT @Count", paging by Id.
+/// This test runs that sequence against the provider and checks that the tasks come back.
 ///
-/// Endpoint defaults to the Aspire vnext emulator gateway (:52611 in this workspace); override with
-/// COSMOS_TEST_ENDPOINT. Uses a throwaway database, so it never touches live data.
+/// Uses a throwaway database. The endpoint defaults to http://localhost:8081/; set COSMOS_TEST_ENDPOINT to
+/// use another one.
 /// </summary>
 public class IndexingTaskRoundTripTests
 {
-    // Defaults to the suite's classic-emulator convention (:8081); override with COSMOS_TEST_ENDPOINT
-    // (e.g. the Aspire vnext emulator's mapped gateway port) to run it elsewhere — same as ReplaceUpdateTests.
+    // Defaults to http://localhost:8081/; set COSMOS_TEST_ENDPOINT to use another endpoint.
     private static readonly string Endpoint =
         Environment.GetEnvironmentVariable("COSMOS_TEST_ENDPOINT") ?? "http://localhost:8081/";
+    // Microsoft's published, well-known Cosmos DB emulator key (not a secret).
     private const string Key = "C2y6yDjf5/R+ob0N8A7Cgv30VRDJIWEHLM+4QDU5DE2nQ9nDuVTqobD4b8mGGyPMbIZnqyMsEcaGQy67XIw/Jw==";
     private const string ContainerId = "yessql";
     private const string Scope = "Default";

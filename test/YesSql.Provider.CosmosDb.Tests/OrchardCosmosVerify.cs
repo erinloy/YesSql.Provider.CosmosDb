@@ -1,12 +1,12 @@
 using System;
 using System.Collections.Generic;
-using System.IO;
 using System.Linq;
 using System.Net.Http;
 using System.Threading.Tasks;
 using Microsoft.Azure.Cosmos;
 using Newtonsoft.Json.Linq;
 using Xunit;
+using Xunit.Abstractions;
 
 namespace YesSql.Provider.CosmosDb.Tests;
 
@@ -14,11 +14,16 @@ namespace YesSql.Provider.CosmosDb.Tests;
 // (database "orchard_smoke"), proving Sqlite was a label only and the Cosmos IStore handled everything.
 public class OrchardCosmosVerify
 {
+    private readonly ITestOutputHelper _output;
+
+    public OrchardCosmosVerify(ITestOutputHelper output) => _output = output;
+
     [Fact(Skip = "Diagnostic — run manually after the Orchard smoke test (samples/OrchardSmokeTest) provisions the 'orchard_smoke' database.")]
     public async Task Dump_orchard_cosmos_contents()
     {
         using var client = new CosmosClient(
             "http://localhost:8081/",
+            // Microsoft's published, well-known Cosmos DB emulator key (not a secret).
             "C2y6yDjf5/R+ob0N8A7Cgv30VRDJIWEHLM+4QDU5DE2nQ9nDuVTqobD4b8mGGyPMbIZnqyMsEcaGQy67XIw/Jw==",
             new CosmosClientOptions
             {
@@ -48,7 +53,7 @@ public class OrchardCosmosVerify
             lines.Add($"{kv.Value,6}  {kv.Key}");
         }
 
-        File.WriteAllText(@"Z:\SOURCE\SCRATCH\YesSqlCosmosSpike\orchard-cosmos-contents.txt", string.Join("\n", lines));
+        _output.WriteLine(string.Join("\n", lines));
         Assert.True(total > 0, "Expected Orchard to have written documents/index rows to Cosmos.");
     }
 }
