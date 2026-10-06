@@ -2,57 +2,39 @@ NOTICE: AI GENERATED SLOP. KNOWN TO WORK, BUT BARELY REVIEWED. TAKE APPROPRIATE 
 
 # YesSql.Provider.CosmosDb
 
-An [Azure Cosmos DB](https://learn.microsoft.com/azure/cosmos-db/) (NoSQL API) storage provider for
-[YesSql](https://github.com/sebastienros/yessql) — the document-database layer used by
-[Orchard Core](https://orchardcore.net/).
+A [YesSql](https://github.com/sebastienros/yessql) storage provider for [Azure Cosmos DB](https://learn.microsoft.com/azure/cosmos-db/) (NoSQL API). It lets YesSql, and applications built on it such as [Orchard Core](https://orchardcore.net/), keep their documents and indexes in a Cosmos DB container.
 
-> **Status: Orchard Core boots and runs on this provider** (validated — see
-> [`docs/ORCHARD-INTEGRATION.md`](docs/ORCHARD-INTEGRATION.md) and `samples/OrchardSmokeTest`), and
-> **YesSql's own conformance suite passes in full (249/249, 100%)** — verified on both the `PerTable`
-> and `PerStore` partition strategies against the Cosmos emulator. Document CRUD, map + reduce indexes
-> (full lifecycle), single- and multi-index queries (incl. raw LEFT/RIGHT joins), ordering, paging,
-> counts, `IN`-subqueries, SQL date/decimal functions, DDL, **optimistic concurrency** (version + ETag),
-> and **unit-of-work rollback** (atomic in `PerStore`, best-effort in `PerTable`) all work end-to-end.
-> The only structural limit is true cross-partition ACID, which Cosmos does not offer (PerStore makes a
-> unit of work single-partition so its rollback is atomic). See [`docs/CONFORMANCE.md`](docs/CONFORMANCE.md) for the matrix,
-> [`docs/CROSS-PARTITION-ACID.md`](docs/CROSS-PARTITION-ACID.md) for the partitioning/ACID model, and
-> [`docs/ORCHARD-INTEGRATION.md`](docs/ORCHARD-INTEGRATION.md) for the Orchard wiring.
+YesSql ships providers for SQL Server, PostgreSQL, MySQL and SQLite. This package adds Cosmos DB without forking YesSql.
 
-## Why
+## Status
 
-YesSql ships first-party providers for SQL Server, PostgreSQL, MySQL, and SQLite only — all
-relational. This project closes the loop so YesSql (and therefore Orchard Core and any YesSql-based
-domain store) can run on Cosmos DB, enabling a single-Cosmos deployment topology.
+Preview (0.1.x). Interfaces and behavior may still change.
 
-## Approach
+- YesSql's own test suite (`CoreTests`, v5.4.7) passes in full: 249 of 249 tests, on both partition strategies, against the Cosmos DB emulator. See [docs/CONFORMANCE.md](docs/CONFORMANCE.md).
+- A minimal Orchard Core 2.2.1 site runs its setup recipe and serves requests with this provider as its only data store. See [docs/ORCHARD-INTEGRATION.md](docs/ORCHARD-INTEGRATION.md).
+- Read [Limitations](#limitations) before using this with real data.
 
-This is a **standalone NuGet package** that depends on YesSql — **not a fork**. YesSql persists
-through an ADO.NET `DbConnection` (from `IConnectionFactory`) driven by SQL from `ISqlDialect`, so the
-provider supplies a co-designed pair:
+## Installation
 
-- a **Cosmos-backed ADO.NET shim** (`DbConnection`/`DbCommand`/`DbDataReader`/`DbTransaction`), and
-- an **`ISqlDialect`** that emits a constrained SQL surface the shim translates into Cosmos SDK
-  operations.
+```bash
+dotnet add package YesSql.Provider.CosmosDb
+```
 
-Documents and index rows live as type-discriminated items in a single container, partitioned by their
-source table name. See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
+Targets `net8.0` and `net10.0`. Requires YesSql 5.4.7.
 
 ## Usage
 
 ```csharp
+using Microsoft.Azure.Cosmos;
 using YesSql;
 using YesSql.Provider.CosmosDb;
-using Microsoft.Azure.Cosmos;
 
 var configuration = new Configuration()
     .UseCosmosDb(new CosmosDbOptions
     {
         AccountEndpoint = "https://my-account.documents.azure.com:443/",
-        AccountKey      = "<key>",
-        DatabaseId      = "myapp",
-        ContainerId     = "yessql",      // default
-        PartitionKeyPath = "/pk",        // default
-        // ClientOptions = ...           // only needed for the emulator (see below)
+        AccountKey = "<key>",
+        DatabaseId = "myapp",
     })
     .UseDefaultIdGenerator();
 
@@ -63,12 +45,44 @@ await session.SaveAsync(new Person { Name = "Alice" });
 await session.SaveChangesAsync();
 ```
 
-### Local emulator
+The database and container are created on first use unless `CreateIfNotExists` is `false`.
 
-The provider is developed against the **Azure Cosmos DB Linux emulator (vnext preview)**. Two gotchas:
+### Options
 
-- The vnext emulator gateway serves **HTTP on `:8081`, not HTTPS** — use `http://localhost:8081/`.
-- Use `ConnectionMode.Gateway` + `LimitToEndpoint = true`, and accept the self-signed cert.
+| Option | Default | Description |
+| --- | --- | --- |
+| `AccountEndpoint`, `AccountKey` | required | Cosmos account endpoint and key. |
+| `DatabaseId` | required | Database that holds the store. |
+| `ContainerId` | `yessql` | Container for all documents and index rows. |
+| `PartitionKeyPath` | `/pk` | Must stay `/pk`. Items store their partition key in the `pk` property. |
+| `PartitionStrategy` | `PerTable` | How items map to logical partitions. See below. |
+| `PartitionScope` | `store` | Partition key value used by `PerStore`, for example a tenant name. |
+| `CreateIfNotExists` | `true` | Create the database and container if they do not exist. |
+| `ClientOptions` | `null` | `CosmosClientOptions` passed to the SDK client. Needed for the emulator. |
+
+### Partition strategies
+
+Cosmos DB can only commit atomically within a single logical partition. A YesSql unit of work writes several items (the document, its index rows and any bridge rows), so the partitioning choice decides what rollback can guarantee.
+
+| Strategy | Partition key | Rollback of a unit of work | Scale limit |
+| --- | --- | --- | --- |
+| `PerTable` (default) | YesSql table name | Best effort, item by item | None beyond Cosmos itself |
+| `PerStore` | `PartitionScope` | Atomic for up to 100 changed items, chunked beyond that | 20 GB and 10,000 RU/s per store |
+
+`PerStore` fits workloads with bounded data per store, such as one Orchard Core tenant per `PartitionScope`. Details are in [docs/PARTITIONING.md](docs/PARTITIONING.md).
+
+## Limitations
+
+- The provider is not a SQL engine. YesSql talks to it through ADO.NET and SQL text, and it recognizes the statement shapes that YesSql and Orchard Core generate. Other statements generally fail with `NotSupportedException`.
+- There is no isolation between sessions. Writes are applied as they happen, so another session can read changes from a unit of work that has not committed. On rollback the provider restores the previous version of each item, which can overwrite a concurrent writer's changes to the same item.
+- With `PerTable`, a failed unit of work is rolled back item by item, and a crash during rollback can leave partial writes.
+- Queries that join an index to its documents first collect the matching document ids from the index partition, apply any ordering and paging in the client, and then read the page's documents. Request unit cost grows with the number of matching index rows.
+- `PerStore` limits the whole store to 20 GB of data and 10,000 RU/s.
+- The automated tests run against the emulator. Behavior and request unit cost on a live account at scale have not been measured.
+
+## Running against the emulator
+
+Development uses the Linux emulator image (`vnext-preview`). It serves plain HTTP on port 8081, so use `http://localhost:8081/`. Use gateway mode and accept its self-signed certificate:
 
 ```bash
 docker run -d --name cosmos-emu -p 8081:8081 -p 10250-10255:10250-10255 \
@@ -87,28 +101,37 @@ ClientOptions = new CosmosClientOptions
 }
 ```
 
+The account key in this repository's tests and sample is the emulator's published default key. It is not a secret.
+
 ## Building and testing
 
 ```bash
 dotnet build YesSql.Provider.CosmosDb.slnx
 
-# Hand-written provider tests (need the emulator running)
+# Provider tests (emulator must be running)
 dotnet test test/YesSql.Provider.CosmosDb.Tests
 
-# YesSql's own conformance suite against Cosmos (see docs/CONFORMANCE.md)
+# YesSql's CoreTests against Cosmos. Fetch the YesSql sources first.
+pwsh scripts/clone-yessql.ps1
 dotnet test test/Conformance/YesSql.Provider.CosmosDb.Conformance.csproj
 ```
 
-## Targets
+See [docs/CONFORMANCE.md](docs/CONFORMANCE.md) for how the conformance project works, including the `PerStore` run.
 
-`net8.0;net10.0` — matching YesSql 5.4.7.
+## Documentation
 
-## Continuous integration
+- [Architecture](docs/ARCHITECTURE.md): storage model and how SQL is translated to Cosmos operations
+- [Partitioning and transactions](docs/PARTITIONING.md)
+- [Conformance and tests](docs/CONFORMANCE.md)
+- [Orchard Core integration](docs/ORCHARD-INTEGRATION.md)
+- [Changelog](CHANGELOG.md)
 
-A ready-to-use GitHub Actions workflow (build + Cosmos emulator + tests + pack) lives at
-[`docs/github-actions-ci.yml`](docs/github-actions-ci.yml). To enable it, copy it to
-`.github/workflows/ci.yml` and push (adding a workflow file requires a token with the `workflow` scope).
+## Contributing
+
+Issues and pull requests are welcome. Run both test projects against the emulator before submitting a change that touches `CosmosDbCommand`, since that is where SQL is translated.
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT. See [LICENSE](LICENSE).
+
+This is an independent project and is not affiliated with Microsoft, the YesSql project or the Orchard Core project.

@@ -1,106 +1,88 @@
-# Running Orchard Core on this provider
+# Orchard Core integration
 
-> ## ✅ VALIDATED — Orchard Core boots and runs on this provider
-> `samples/OrchardSmokeTest` is a minimal Orchard Core CMS host (OrchardCore 2.2.1, net8, YesSql 5.4.7)
-> configured with the Cosmos `IStore` override + AutoSetup. On launch against the Cosmos emulator it
-> **provisioned a full tenant via the setup recipe with zero errors**, then served the site
-> (`<title>Cosmos Smoke Test</title>`, admin login HTTP 200). The Cosmos `orchard_smoke` database held
-> 20 items spanning the whole data layer — `Document`s, map indexes (`UserIndex`,
-> `OpenId_OpenIdScopeIndex`), a **reduce index + bridge** (`UserByRoleNameIndex` +
-> `UserByRoleNameIndex_Document`), and the provider's `__seq` id counters. **No `OrchardCore.db`
-> sqlite file was created** — the `Sqlite` provider label only satisfies setup validation; all data
-> went to Cosmos.
->
-> ### What made it work (3 things)
-> 1. `OrchardCore_AutoSetup` config must be nested **under `"OrchardCore"`** in appsettings.json (the
->    shell config is rooted there) — at the JSON root it is silently ignored.
-> 2. Enable the feature on the setup shell: `.AddOrchardCms().AddSetupFeatures("OrchardCore.AutoSetup")`.
-> 3. Override the per-tenant `IStore` (registered last → wins) to call `UseCosmosDb`, declaring
->    `DatabaseProvider: "Sqlite"` in AutoSetup only so the connection validator passes.
->
-> See `samples/OrchardSmokeTest/Program.cs` + `appsettings.json` for the working configuration.
-> (Caveat unchanged: request-scoped rollback on error is not supported — Cosmos has no cross-partition ACID.)
+Orchard Core stores its data through YesSql, so it can use this provider. Orchard does not yet have Cosmos DB as a built-in database option, so the provider has to be wired in by replacing the tenant's `IStore` registration.
 
----
+[`samples/OrchardSmokeTest`](../samples/OrchardSmokeTest) is a minimal Orchard Core 2.2.1 host that does this. Against the Cosmos emulator it runs the `Headless` setup recipe, creates the tenant, and serves the site and the admin login page. No SQLite file is created; every document and index row goes to Cosmos.
 
-Based on reading Orchard Core's source (`OrchardCore.Data.YesSql` / `OrchardCore.Data.Abstractions`,
-cloned to `Z:\SOURCE\REFERENCE\libraries\orchardcore`).
+The sample uses the default `PerTable` partition strategy. Orchard has not been tested here with `PerStore`.
 
-## How Orchard Core wires up YesSql
+## How Orchard selects a database
 
-All data access is set up in `OrchardCore.Data.YesSql/OrchardCoreBuilderExtensions.AddDataAccess()`:
+`AddDataAccess()` in `OrchardCore.Data.YesSql` registers a singleton `IStore` per shell. It reads the shell's `DatabaseProvider` setting and calls the matching YesSql extension (`UseSqlServer`, `UseSqLite`, `UseMySql`, `UsePostgreSql`), then registers the shell's `IIndexProvider`s with the store. The set of providers is fixed in three places: the `DatabaseProviderValue` constants, the `switch` in `AddDataAccess`, and the `switch` in `DbConnectionValidator` used during setup. None of them is extensible from outside Orchard.
 
-1. **Provider registration (setup UI).** It calls `services.TryAddDataProvider(name, value, …)` once per
-   database — Sql Server, Sqlite (default), MySql, Postgres. These populate the dropdown on the setup
-   screen. The string values live in `DatabaseProviderValue` (`SqlConnection`, `Sqlite`, `MySql`,
-   `Postgres`).
+Orchard also ties YesSql to the request. A scoped `ISession` is committed through `IDocumentStore.CommitAsync()` when the request scope is disposed, and `IDocumentStore.CancelAsync()` is called when the request throws. With `PerStore` the provider rolls back an unsaved unit of work atomically. With `PerTable` the rollback is best effort. See [PARTITIONING.md](PARTITIONING.md).
 
-2. **Store construction.** It registers a singleton `IStore` factory that:
-   - returns `null` if the shell is uninitialized or has no `DatabaseProvider` (pre-setup);
-   - builds a `YesSql.Configuration` (`GetStoreConfiguration`: table-name convention, content
-     serializer, `IdentityColumnSize`, logger, isolation level);
-   - **`switch (shellSettings["DatabaseProvider"])`** → calls the YesSql provider extension:
-     ```
-     SqlConnection → storeConfiguration.UseSqlServer(conn, isolation, schema).UseBlockIdGenerator()
-     Sqlite        → storeConfiguration.UseSqLite(conn, isolation).UseDefaultIdGenerator()
-     MySql         → storeConfiguration.UseMySql(conn, isolation, schema).UseBlockIdGenerator()
-     Postgres      → storeConfiguration.UsePostgreSql(conn, isolation, schema).UseBlockIdGenerator()
-     default       → throw
-     ```
-   - sets the table prefix, then `StoreFactory.Create(storeConfiguration)` and
-     `store.RegisterIndexes(indexes)` (all registered `IIndexProvider`s).
+## Wiring it in
 
-3. **Connection validation (setup).** `DbConnectionValidator` has its **own** `switch` mapping each
-   provider to a `(IConnectionFactory, ISqlDialect)` — used to test the connection string before setup
-   commits.
-
-4. **Session + transaction lifecycle.** A scoped `ISession` is created from `store.CreateSession()`. On
-   the shell scope, Orchard registers `IDocumentStore.CommitAsync()` on **before-dispose** (success) and
-   `IDocumentStore.CancelAsync()` on **exception**. So each request commits at the end, or *cancels
-   (rolls back)* on error.
-
-   > **This is where our Cosmos limitation lands.** `CancelAsync()` expects the session's writes to be
-   > undone. Cosmos has no cross-partition transaction, and this provider writes eagerly, so a failed
-   > Orchard request will **not** roll back partial writes. Most requests commit successfully, but error
-   > paths can leave partial data. (Conformance: `NoSavingChangesShouldRollbackAutoFlush`, etc.)
-
-## Where Cosmos has to plug in
-
-Orchard's provider selection is **three hardcoded switches** (`DatabaseProviderValue`,
-`AddDataAccess`, `DbConnectionValidator`) plus the `TryAddDataProvider` list — none are extensible
-points, so there are two ways in:
-
-### Option A — override the `IStore` singleton (no fork; recommended for the smoke test)
-After `AddOrchardCore()`, register our own `IStore` last (last registration wins for `GetService`):
+Register an `IStore` after `AddOrchardCms()` so that it replaces Orchard's own. The registration mirrors Orchard's `GetStoreConfiguration` and calls `UseCosmosDb`:
 
 ```csharp
-services.AddSingleton<IStore>(sp =>
-{
-    var config = /* mirror GetStoreConfiguration: TableNameConvention, ContentSerializer, … */
-        new YesSql.Configuration { /* … */ }
-        .UseCosmosDb(new CosmosDbOptions { AccountEndpoint = …, AccountKey = …, DatabaseId = … })
-        .UseDefaultIdGenerator();
-    var store = StoreFactory.Create(config);
-    store.RegisterIndexes(sp.GetServices<IIndexProvider>());
-    return store;
-});
+builder.Services
+    .AddOrchardCms()
+    .AddSetupFeatures("OrchardCore.AutoSetup")
+    .ConfigureServices(services =>
+    {
+        services.AddSingleton<IStore>(sp =>
+        {
+            var shellSettings = sp.GetRequiredService<ShellSettings>();
+            if (shellSettings.IsUninitialized() || shellSettings["DatabaseProvider"] is null)
+            {
+                return null;
+            }
+
+            var serializerOptions = sp.GetRequiredService<IOptions<DocumentJsonSerializerOptions>>();
+
+            var configuration = new YesSql.Configuration
+            {
+                IdentityColumnSize = IdentityColumnSize.Int64,
+                Logger = sp.GetRequiredService<ILoggerFactory>().CreateLogger("YesSql"),
+                ContentSerializer = new DefaultContentJsonSerializer(serializerOptions.Value.SerializerOptions),
+            };
+
+            configuration
+                .UseCosmosDb(new CosmosDbOptions { /* endpoint, key, database */ })
+                .UseDefaultIdGenerator();
+
+            var tablePrefix = shellSettings["TablePrefix"];
+            if (!string.IsNullOrWhiteSpace(tablePrefix))
+            {
+                configuration.SetTablePrefix(tablePrefix.Trim() + "_");
+            }
+
+            var store = StoreFactory.Create(configuration);
+            store.RegisterIndexes(sp.GetServices<IIndexProvider>());
+            return store;
+        });
+    });
 ```
-Combine with **AutoSetup** (`OrchardCore.AutoSetup`) so the interactive setup screen (and
-`DbConnectionValidator`) is skipped, and register a permissive `IDbConnectionValidator` if needed.
 
-### Option B — first-class provider (upstream contribution)
-Add a `CosmosDb` constant to `DatabaseProviderValue`, a `case` to both switches, and a
-`TryAddDataProvider(name: "Cosmos DB", value: DatabaseProviderValue.CosmosDb, …)`. Cleanest long-term,
-but makes Orchard depend on the Cosmos provider package; best done as a PR or a small Orchard module.
+The complete working version is [`samples/OrchardSmokeTest/Program.cs`](../samples/OrchardSmokeTest/Program.cs).
 
-## Smoke-test plan
+Setup validates a database provider and connection string before it commits. The sample avoids the interactive setup screen by using the `OrchardCore.AutoSetup` feature, and declares `"DatabaseProvider": "Sqlite"` in the tenant settings only so that Orchard's validation passes. The label is never used to open a connection, because the replacement `IStore` handles all data access.
 
-Steps 1–2 are **done and validated** (see the banner above — `samples/OrchardSmokeTest` boots a tenant
-via AutoSetup on Cosmos and serves the site). Steps 3–4 remain as deeper manual exercises, not yet run:
+Three details are easy to get wrong:
 
-1. ✅ Minimal ASP.NET Core host + `AddOrchardCore().AddDataAccess()` (or the `OrchardCore.Application.*`
-   meta-package) targeting the Cosmos emulator.
-2. ✅ Use Option A to force `UseCosmosDb`, AutoSetup to provision a tenant.
-3. ⬜ Exercise: create a content type, create/edit/publish/delete content items, list and filter them.
-4. ⬜ Watch the request-rollback path (intentional failure) to confirm the documented limitation
-   (`PerTable` best-effort vs `PerStore` atomic).
+1. In `appsettings.json`, `OrchardCore_AutoSetup` must sit under the `OrchardCore` section. At the root of the file it is ignored without any message.
+2. Enable the feature on the setup shell with `.AddSetupFeatures("OrchardCore.AutoSetup")`.
+3. Register the `IStore` after `AddOrchardCms()` so that it is the registration Orchard resolves.
+
+## Running the sample
+
+Start the emulator (see the [README](../README.md#running-against-the-emulator)), then:
+
+```bash
+dotnet run --project samples/OrchardSmokeTest
+```
+
+The `Cosmos` section of `appsettings.json` holds the endpoint, key and database name. On first start AutoSetup creates the `Default` tenant and its data in the `orchard_smoke` database.
+
+## Not covered yet
+
+- Creating, editing, publishing and deleting content items, and listing and filtering them, have not been exercised through the Orchard UI on this provider.
+- Request rollback through `CancelAsync` is covered by the provider's rollback tests and YesSql's conformance suite, but not through an Orchard request that fails.
+
+## Making it a built-in option
+
+The cleaner long-term route is an upstream change to Orchard Core: add a `CosmosDb` value to `DatabaseProviderValue`, a case in both `switch` statements, and a data provider entry for the setup screen. That would make Orchard depend on this package, so it would need agreement from the Orchard maintainers.
+
+Reference: [Orchard Core source](https://github.com/OrchardCMS/OrchardCore), `src/OrchardCore/OrchardCore.Data.YesSql`.

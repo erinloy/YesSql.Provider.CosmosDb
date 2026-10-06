@@ -1,91 +1,59 @@
-# Conformance status
+# Conformance and tests
 
-The provider is validated against **YesSql's own test suite** (`CoreTests`, v5.4.7), the same suite
-the first-party SQL Server / PostgreSQL / MySQL / SQLite providers pass.
+The provider is checked against YesSql's own test suite (`CoreTests`, v5.4.7), the suite the SQL Server, PostgreSQL, MySQL and SQLite providers run. It also has its own tests for behavior that is specific to Cosmos.
 
-**Current: 249 / 249 passing (100%)** — verified on **both** the `PerTable` and `PerStore` partition
-strategies (the suite self-warms the emulator before measuring; see "Running the conformance suite").
-Plus the hand-written provider tests (incl. rollback), all green.
-**Validated end-to-end: Orchard Core 2.2.1 boots and runs on this provider** (see ORCHARD-INTEGRATION.md).
+## Results
 
-## Coverage
+All 249 tests in `CoreTests` pass on both partition strategies against the Cosmos DB emulator.
 
-**Every operation YesSql (and therefore Orchard) exercises is supported:** document CRUD; map indexes and
-their update/delete lifecycle; reduce indexes (aggregate, merge, query); single- and multi-index
-(`.With<I1>().With<I2>()`) queries, **including map+reduce intersection** (`.With<Map>().With<Reduce>()`);
-the **raw `INNER`/`LEFT`/`RIGHT JOIN` count API** (cross-document joins emulated by gather-then-point-read);
-`Where`/range/boolean/`IS NULL`/`IN`-subquery predicates; **`DateTime`/`DateTimeOffset` comparison by
-instant** (cross-type, via `DateTimeToTimestamp`); `OrderBy` (case-insensitive, matching the reference
-dialects); paging; `CountAsync` (scalar and via the reader path); SQL date-part / `now()` / decimal type
-functions; **`filterType` CLR-type polymorphism** (`Query<SubClass>(filterType: true)`); **`byte[]` index
-columns** (self-describing base64 round-trip); **`RenameColumn` DDL** (data rewrite) and literal-value
-`INSERT`; monotonic (append-only) index ids; **optimistic concurrency** (version check + ETag, so
-`ConcurrencyException` is raised on stale/concurrent writes); and **unit-of-work rollback** (undo log —
-atomic in `PerStore`, best-effort in `PerTable`).
+The suite covers document CRUD, map and reduce indexes and their update and delete lifecycle, queries over one or several indexes (including map plus reduce), the raw `INNER`, `LEFT` and `RIGHT JOIN` count API, comparison and `IN` predicates, date and decimal functions, ordering, paging, counts, `byte[]` index columns, `RenameColumn`, optimistic concurrency and rollback.
 
-The one previously Orchard-relevant gap — request rollback / concurrency — is now **closed** (rollback
-via the undo log, concurrency via version+ETag). True cross-partition ACID remains impossible on Cosmos;
-`PerStore` makes a unit of work single-partition so its rollback is atomic (see CROSS-PARTITION-ACID.md).
+The two strategies differ on rollback. With `PerStore` it is atomic. With `PerTable` it is best effort, and the autoflush rollback tests still pass because the undo log reverses each write. See [PARTITIONING.md](PARTITIONING.md).
 
 ## Running the conformance suite
 
-The harness lives in `test/Conformance`. It **source-links** YesSql's v5.4.7 `CoreTests` (and its
-models/indexes) and compiles them against the same NuGet `YesSql 5.4.7` the provider references — one
-assembly, no version conflict. To reach YesSql internals that `CoreTests` uses (`Session._commands`,
-`NullableThumbprintFactory`), the conformance assembly is named `YesSql.Tests` and signed with
-`YesSqlKey.snk` to satisfy YesSql's `[InternalsVisibleTo("YesSql.Tests", PublicKey=…)]`.
+The project in `test/Conformance` source-links YesSql's test sources and compiles them against the same `YesSql 5.4.7` package that the provider references, so there is a single YesSql assembly.
+
+`CoreTests` uses YesSql internals (`Session._commands`, `NullableThumbprintFactory`). YesSql exposes those to an assembly named `YesSql.Tests` signed with its own key, so the conformance assembly takes that name and is signed with `YesSqlKey.snk` from the YesSql sources.
+
+1. Start the emulator. See the [README](../README.md#running-against-the-emulator).
+2. Fetch the YesSql sources into `external/yessql`:
+
+   ```bash
+   pwsh scripts/clone-yessql.ps1
+   ```
+
+3. Run the suite. It takes a few minutes.
+
+   ```bash
+   dotnet test test/Conformance/YesSql.Provider.CosmosDb.Conformance.csproj
+
+   # PerStore run
+   COSMOS_PARTITION=PerStore dotnet test test/Conformance/YesSql.Provider.CosmosDb.Conformance.csproj
+   ```
+
+To use an existing YesSql checkout, pass `-p:YesSqlTestsDir=<path to test/YesSql.Tests>`. The signing key is read from `src/YesSqlKey.snk` two directories above that path.
+
+`CosmosTests` (in `test/Conformance/CosmosTests.cs`) derives from `CoreTests`. It points the configuration at the emulator with one database per run, and its cleanup hooks delete the container's items instead of running `DELETE FROM <table>`. The first run waits until the emulator answers a real request, because the emulator can report its gateway as up before its query engine is ready.
+
+## Provider tests
+
+`test/YesSql.Provider.CosmosDb.Tests` covers Cosmos-specific behavior directly:
+
+| Tests | Covers |
+| --- | --- |
+| `CrudTests`, `CosmosRoundTripTests` | Document save, load, update and delete |
+| `IndexQueryTests`, `QueryFeaturesTests` | Index queries, ordering, paging |
+| `RollbackTests` | Rollback on both strategies |
+| `ReplaceUpdateTests` | `UPDATE ... SET col = REPLACE(...)` statements |
+| `IndexingTaskRoundTripTests` | Identity-table inserts and queries of the kind Orchard Core uses for content indexing |
+
+`OrchardCosmosVerify` is a skipped diagnostic. It lists what the Orchard Core sample wrote to the emulator.
 
 ```bash
-# 1. start the emulator (HTTP on :8081 — see README)
-docker run -d --name cosmos-emu -p 8081:8081 -p 10250-10255:10250-10255 \
-  mcr.microsoft.com/cosmosdb/linux/azure-cosmos-emulator:vnext-preview
-
-# 2. run the suite (~4 minutes)
-dotnet test test/Conformance/YesSql.Provider.CosmosDb.Conformance.csproj -c Debug
+dotnet test test/YesSql.Provider.CosmosDb.Tests
 ```
 
-`CosmosTests : CoreTests` (in `test/Conformance/CosmosTests.cs`) overrides `CreateConfiguration`
-(points at the emulator, one database per run) and the clean/clear hooks (each test wipes the
-container instead of the raw `DELETE FROM <table>` `CoreTests` uses).
+## Scope
 
-> The conformance project's source-link path (`YesSqlTestsDir` in the `.csproj`) currently points at a
-> local YesSql v5.4.7 checkout. Adjust it if your checkout lives elsewhere.
-
-## What works
-
-- Document CRUD: save, load-by-id, update (read-and-patch), delete.
-- Map indexes: write, update, delete-by-`DocumentId`.
-- Queries: `FirstOrDefaultAsync`, `ListAsync`, `CountAsync`; equality, range/comparison, boolean
-  `AND`/`OR`, `IS [NOT] NULL`; `OrderBy` (asc/desc); `OFFSET`/`LIMIT` paging.
-- `IN`/`NOT IN` subqueries (resolved by pre-executing the inner query).
-- Document-by-`Type` queries (`Query<T>()`), index-row queries (`Query<TIndex>()`).
-- **Reduce indexes — full lifecycle** (`ShouldReduce`, `ShouldQueryByReducedIndex`,
-  `UpdatingDocumentShouldUpdateReducedIndex`, `ShouldReduceAndMergeWithDatabase`, `ShouldAddGroupKey`,
-  `ShouldRemoveGroupKey`, `ShouldJoinReduceIndex`, …): aggregated index rows are written, composite-key
-  bridge rows link them to documents, the doc↔bridge↔index three-way query/count resolves, and
-  merge/update/delete on subsequent saves keep the aggregate and bridge rows correct.
-
-## What's left
-
-Nothing within YesSql's `CoreTests` suite — all 249 pass on both partition strategies. The buckets that
-were previously failing (reduce-index lifecycle, transactions/autoflush/rollback, multi-index and
-LEFT/RIGHT joins, ordering edge cases, SQL date/decimal functions, binary-in-index, `DateTimeOffset`
-compare, rename-column DDL, subclasses) are all now covered. See the "What works" matrix above and the
-git history (207 → 224 → 226 → 229 → 242 → 249) for the progression.
-
-### Structural limit — cross-partition ACID (not a test failure)
-
-The one thing Cosmos genuinely cannot do is **atomic ACID across more than one logical partition**. A
-YesSql unit of work writes a *set* of items (document + index rows + bridge rows); under `PerTable`
-those span partitions, so rollback on error is **best-effort per item**. Under `PerStore` the whole
-unit of work shares one logical partition, so its rollback is **atomic** (undo log applied via a Cosmos
-transactional batch — see `Internal/CosmosDbTransaction.cs` and CROSS-PARTITION-ACID.md). That makes
-`NoSavingChangesShouldRollbackAutoFlush` and the dedicated rollback tests pass on `PerStore`; the cost
-is the per-logical-partition 20 GB / 10,000 RU/s ceiling, which typical Orchard tenants never reach.
-
-## Verdict
-
-100% of YesSql's own conformance suite passes on both partition strategies, plus the hand-written
-provider tests and an end-to-end Orchard Core boot. The provider is a complete, shippable implementation
-for document + map-index + reduce-index + query + rollback workloads. The only remaining trade-off is
-architectural — true cross-partition ACID — and `PerStore` resolves it for the bounded-tenant case.
+Passing `CoreTests` means the provider handles every operation that suite exercises. It does not cover SQL that YesSql users issue by hand through the session's connection, workloads at production scale, or a live Cosmos account. See the limitations in the [README](../README.md#limitations).
