@@ -1,0 +1,65 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- Runs YesSql 6's own CoreTests against the provider. The provider project is built as for a release, against
+       YesSql 5.4.7, so this checks that the shipped assembly works when the application brings YesSql 6. -->
+
+  <!-- Clone YesSql v6.0.0 into ./external/yessql6 first (scripts/clone-yessql.ps1 -Tag v6.0.0 -Directory yessql6, or
+       the CI workflow), or override YesSqlTestsDir to point at an existing clone. The provider-specific and
+       container-based test classes of YesSql are excluded. -->
+  <PropertyGroup>
+    <YesSqlTestsDir Condition="'$(YesSqlTestsDir)' == ''">$(MSBuildThisFileDirectory)..\..\external\yessql6\test\YesSql.Tests</YesSqlTestsDir>
+  </PropertyGroup>
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>disable</Nullable>
+    <IsPackable>false</IsPackable>
+    <OutputType>Exe</OutputType>
+    <AssemblyName>YesSql.Tests</AssemblyName>
+    <DefineConstants>$(DefineConstants);YESSQL6</DefineConstants>
+    <!-- YesSql 6's test project is xunit v3 (Microsoft Testing Platform) and is signed with YesSql's key so that
+         CoreTests can reach YesSql internals. The key pair ships in the YesSql clone (src/YesSqlKey.snk). -->
+    <SignAssembly>true</SignAssembly>
+    <AssemblyOriginatorKeyFile>$(YesSqlTestsDir)\..\..\src\YesSqlKey.snk</AssemblyOriginatorKeyFile>
+    <NoWarn>$(NoWarn);CS0618;CS8002;xUnit1013;xUnit1026;xUnit1051;CA1861;CA1826;CA1829;IDE0005</NoWarn>
+    <TreatWarningsAsErrors>false</TreatWarningsAsErrors>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <LangVersion>latest</LangVersion>
+    <TestingPlatformDotnetTestSupport>true</TestingPlatformDotnetTestSupport>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="$(YesSqlTestsDir)\**\*.cs"
+             Exclude="$(YesSqlTestsDir)\obj\**\*.cs;
+                      $(YesSqlTestsDir)\bin\**\*.cs;
+                      $(YesSqlTestsDir)\Properties\**\*.cs;
+                      $(YesSqlTestsDir)\Fixtures\**\*.cs;
+                      $(YesSqlTestsDir)\TestCollections.cs;
+                      $(YesSqlTestsDir)\SqliteTests.cs;
+                      $(YesSqlTestsDir)\SqliteLegacyIdentityTests.cs;
+                      $(YesSqlTestsDir)\MySqlTests.cs;
+                      $(YesSqlTestsDir)\PostgreSqlTests.cs;
+                      $(YesSqlTestsDir)\PostgreSqlLegacyIdentityTests.cs;
+                      $(YesSqlTestsDir)\SqlServerTests.cs;
+                      $(YesSqlTestsDir)\SqlServer2017Tests.cs;
+                      $(YesSqlTestsDir)\SqlServer2019Tests.cs;
+                      $(YesSqlTestsDir)\ProviderTests.cs;
+                      $(YesSqlTestsDir)\AggregateOrdersTests.cs;
+                      $(YesSqlTestsDir)\CommandInterpreterTests.cs;
+                      $(YesSqlTestsDir)\SqlBuilderTests.cs">
+      <Link>YesSqlTests\%(RecursiveDir)%(Filename)%(Extension)</Link>
+    </Compile>
+    <Compile Include="..\Conformance\CosmosTests.cs" Link="CosmosTests.cs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="xunit.v3.mtp-v2" Version="3.2.2" />
+    <PackageReference Include="YesSql.Core" Version="6.0.0" />
+    <PackageReference Include="YesSql.Filters.Query" Version="6.0.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\YesSql.Provider.CosmosDb\YesSql.Provider.CosmosDb.csproj" />
+  </ItemGroup>
+
+</Project>

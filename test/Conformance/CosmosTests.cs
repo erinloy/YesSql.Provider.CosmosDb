@@ -4,7 +4,11 @@ using System.Net.Http;
 using System.Threading.Tasks;
 using Microsoft.Azure.Cosmos;
 using Newtonsoft.Json.Linq;
+#if YESSQL6
+using Xunit;
+#else
 using Xunit.Abstractions;
+#endif
 using YesSql.Provider.CosmosDb;
 
 namespace YesSql.Tests
@@ -93,6 +97,9 @@ namespace YesSql.Tests
                     PartitionScope = "conf",
                 })
                 .SetTablePrefix(TablePrefix)
+#if YESSQL6
+                .WithThreadSafetyChecks()
+#endif
                 .UseDefaultIdGenerator()
                 .SetIdentityColumnSize(IdentityColumnSize.Int64);
         }

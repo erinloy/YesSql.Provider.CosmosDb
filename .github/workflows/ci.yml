@@ -5,6 +5,7 @@ on:
     branches: [ main, master ]
   pull_request:
   workflow_dispatch:
+  workflow_call:
 
 jobs:
   build-test-pack:
@@ -18,20 +19,7 @@ jobs:
             8.0.x
             10.0.x
 
-      - name: Start Cosmos DB emulator
-        run: |
-          docker run -d --name cosmos -p 8081:8081 \
-            mcr.microsoft.com/cosmosdb/linux/azure-cosmos-emulator:vnext-preview
-          for i in $(seq 1 60); do
-            if docker logs cosmos 2>&1 | grep -q "PostgreSQL=OK, Gateway=OK"; then
-              echo "Emulator ready"
-              exit 0
-            fi
-            sleep 5
-          done
-          echo "Emulator did not become ready" >&2
-          docker logs cosmos >&2
-          exit 1
+      - uses: ./.github/actions/start-emulator
 
       - name: Fetch YesSql sources (v5.4.7)
         run: git clone --depth 1 --branch v5.4.7 https://github.com/sebastienros/yessql external/yessql
@@ -56,4 +44,33 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: nupkg
-          path: ./artifacts/*.nupkg
+          path: ./artifacts/*
+
+  # YesSql 6's own tests, run against the provider as it is released (built against YesSql 5.4.7). This checks
+  # that the package works in an application that uses YesSql 6.
+  conformance-yessql6:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: |
+            8.0.x
+            10.0.x
+
+      - uses: ./.github/actions/start-emulator
+
+      - name: Fetch YesSql sources (v6.0.0)
+        run: git clone --depth 1 --branch v6.0.0 https://github.com/sebastienros/yessql external/yessql6
+
+      - name: Build
+        run: dotnet build test/Conformance.YesSql6/YesSql.Provider.CosmosDb.Conformance.YesSql6.csproj -c Release
+
+      - name: Conformance, YesSql 6 (PerTable)
+        run: dotnet ./test/Conformance.YesSql6/bin/Release/net10.0/YesSql.Tests.dll
+
+      - name: Conformance, YesSql 6 (PerStore)
+        env:
+          COSMOS_PARTITION: PerStore
+        run: dotnet ./test/Conformance.YesSql6/bin/Release/net10.0/YesSql.Tests.dll
