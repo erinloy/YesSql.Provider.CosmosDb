@@ -4,6 +4,9 @@ All notable changes are listed here. The project is in preview, so minor version
 
 ## Unreleased
 
+### Fixed
+- A `DateTimeOffset` with a UTC offset east of +01:00 could not be found by an equality or `<=` query on a real Cosmos DB account. Cosmos DB compares `DateTimeToTimestamp(c.x)` wrongly in a `WHERE` clause when the stored text carries such an offset (`...+05:30` never equals its own instant). The emulator does not reproduce this. The provider now stores and binds moments in time as UTC instants (`...Z`): a `DateTimeOffset` is written as UTC, and a `DateTime` of kind `Local` is converted to UTC. `DateTime` values of unspecified or UTC kind are unchanged. Rows written earlier with an east offset still cannot be found by equality on a real account; a range query finds them.
+
 ### Changed
 - Statements are now parsed, not matched with regular expressions. Each statement is read once into a tree, and the provider runs it from the tree. Reading a statement takes about 3 microseconds, against about 1 millisecond for the regular expressions, and a statement is no longer at the mercy of a pattern that matches it wrongly.
 - A statement the parser cannot read throws a `DbException` that says where. A malformed `renamecolumn` now does too, where it used to throw `NotSupportedException`. An `ORDER BY` term the provider cannot apply (a function, an unknown alias, a document column other than `Id` on an index query) throws instead of being dropped, and so does a reduce index query ordered by document id.

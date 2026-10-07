@@ -10,7 +10,7 @@ YesSql ships providers for SQL Server, PostgreSQL, MySQL and SQLite. This packag
 
 Preview (0.1.x). Interfaces and behavior may still change.
 
-- YesSql's own test suite (`CoreTests`) passes in full against the Cosmos DB emulator on both partition strategies: 249 of 249 tests for YesSql 5.4.7, and the 6.0.0 suite (the tests that do not need a database server). See [docs/CONFORMANCE.md](docs/CONFORMANCE.md).
+- YesSql's own test suite (`CoreTests`) passes in full against the Cosmos DB emulator on both partition strategies: 249 of 249 tests for YesSql 5.4.7, and the 6.0.0 suite (the tests that do not need a database server). The 5.4.7 suite also passes 249 of 249 against a real serverless account on both strategies. See [docs/CONFORMANCE.md](docs/CONFORMANCE.md).
 - A minimal Orchard Core 3.0.1 site runs its setup recipe and serves requests with this provider as its only data store. See [docs/ORCHARD-INTEGRATION.md](docs/ORCHARD-INTEGRATION.md).
 - Read [Limitations](#limitations) before using this with real data.
 
@@ -91,7 +91,7 @@ Cosmos DB can only commit atomically within a single logical partition. A YesSql
 - With `PerTable`, a failed unit of work is rolled back item by item, and a crash during rollback can leave partial writes.
 - Queries that join an index to its documents first collect the matching document ids from the index partition, apply any ordering and paging in the client, and then read the page's documents. Request unit cost grows with the number of matching index rows.
 - `PerStore` limits the whole store to 20 GB of data and 10,000 RU/s.
-- The automated tests run against the emulator. Behavior and request unit cost on a live account at scale have not been measured.
+- The automated tests in CI run against the emulator. The 5.4.7 conformance suite has also been run against one real serverless account (West US); that run found a date comparison the emulator does not reproduce (see the changelog). Behavior and request unit cost on a live account at scale have not been measured.
 
 ## Running against the emulator
 
