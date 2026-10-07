@@ -5,6 +5,7 @@ All notable changes are listed here. The project is in preview, so minor version
 ## Unreleased
 
 ### Fixed
+- Concurrent saves could fail with `Could not allocate a sequence id`. Each index row id was taken with a read and a conditional write on one counter document per table, and writers that shared a counter collided and retried 16 times. At the emulator's latency that was rare, but on a real account (about 60 ms per round trip) 16 concurrent sessions exhausted the retries. Ids are now reserved 32 at a time and handed out from memory, so most inserts never touch the counter. Ids remain unique across processes and across versions that share a database, but a restart leaves a gap of up to 31 unused ids. A save also makes about 25% fewer requests: 6 instead of 8 for a document with a map and a reduce index, measured on a real account.
 - A `DateTimeOffset` with a UTC offset east of +01:00 could not be found by an equality or `<=` query on a real Cosmos DB account. Cosmos DB compares `DateTimeToTimestamp(c.x)` wrongly in a `WHERE` clause when the stored text carries such an offset (`...+05:30` never equals its own instant). The emulator does not reproduce this. The provider now stores and binds moments in time as UTC instants (`...Z`): a `DateTimeOffset` is written as UTC, and a `DateTime` of kind `Local` is converted to UTC. `DateTime` values of unspecified or UTC kind are unchanged. Rows written earlier with an east offset still cannot be found by equality on a real account; a range query finds them.
 
 ### Changed
