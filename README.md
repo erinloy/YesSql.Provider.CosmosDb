@@ -2,6 +2,15 @@ NOTICE: AI GENERATED SLOP. KNOWN TO WORK, BUT BARELY REVIEWED. TAKE APPROPRIATE 
 
 # YesSql.Provider.CosmosDb
 
+[![CI](https://github.com/erinloy/YesSql.Provider.CosmosDb/actions/workflows/ci.yml/badge.svg?branch=master)](https://github.com/erinloy/YesSql.Provider.CosmosDb/actions/workflows/ci.yml)
+[![Release](https://github.com/erinloy/YesSql.Provider.CosmosDb/actions/workflows/release.yml/badge.svg)](https://github.com/erinloy/YesSql.Provider.CosmosDb/actions/workflows/release.yml)
+[![NuGet](https://img.shields.io/nuget/v/YesSql.Provider.CosmosDb.svg)](https://www.nuget.org/packages/YesSql.Provider.CosmosDb)
+[![NuGet downloads](https://img.shields.io/nuget/dt/YesSql.Provider.CosmosDb.svg)](https://www.nuget.org/packages/YesSql.Provider.CosmosDb)
+[![License: MIT](https://img.shields.io/github/license/erinloy/YesSql.Provider.CosmosDb.svg)](https://github.com/erinloy/YesSql.Provider.CosmosDb/blob/master/LICENSE)
+![.NET 8 | 10](https://img.shields.io/badge/.NET-8.0%20%7C%2010.0-512BD4)
+![YesSql 5.4.7 | 6.0.0](https://img.shields.io/badge/YesSql-5.4.7%20%7C%206.0.0-blue)
+![Orchard Core 3.0](https://img.shields.io/badge/Orchard%20Core-3.0.x-blue)
+
 A [YesSql](https://github.com/sebastienros/yessql) storage provider for [Azure Cosmos DB](https://learn.microsoft.com/azure/cosmos-db/) (NoSQL API). It lets YesSql, and applications built on it such as [Orchard Core](https://orchardcore.net/), keep their documents and indexes in a Cosmos DB container.
 
 YesSql ships providers for SQL Server, PostgreSQL, MySQL and SQLite. This package adds Cosmos DB without forking YesSql.
@@ -90,7 +99,7 @@ Cosmos DB can only commit atomically within a single logical partition. A YesSql
 - There is no isolation between sessions. Writes are applied as they happen, so another session can read changes from a unit of work that has not committed. On rollback the provider restores the previous version of each item, which can overwrite a concurrent writer's changes to the same item.
 - With `PerTable`, a failed unit of work is rolled back item by item, and a crash during rollback can leave partial writes.
 - A count, a first match, or a page ordered by document id (the order YesSql gives a paged query that has no order of its own) over one map index is answered by Cosmos from the distinct document ids. Orders on an index column, queries through a reduce index or several indexes, and queries that filter on the document type read every matching index row to the client, then order and page there, so their request unit cost grows with the number of matching index rows. At 500 rows per key on a real account, a count cost 7 RU and an ordered page of 20 documents cost 24 RU.
-- A save makes about 6 requests for a document with a map and a reduce index (50 RU before ids were reserved in blocks, 38 RU now), so its latency is several round trips. Over a real network that is roughly 400 ms.
+- A save makes about 6 requests for a document with a map and a reduce index (50 RU before ids were reserved in blocks, 38 RU now). Writes inside a unit of work are started without waiting for the response, so requests that do not depend on each other overlap and a save waits for about 3 round trips in a row. An update or delete first reads the index rows it changes, and those reads cannot overlap, so it takes more.
 - `PerStore` limits the whole store to 20 GB of data and 10,000 RU/s.
 - The automated tests in CI run against the emulator. The 5.4.7 conformance suite has also been run against one real serverless account (West US); that run found a date comparison the emulator does not reproduce (see the changelog). Behavior and request unit cost on a live account at scale have not been measured.
 
@@ -147,7 +156,7 @@ See [docs/CONFORMANCE.md](docs/CONFORMANCE.md) for how the conformance project w
 
 ## Contributing
 
-Issues and pull requests are welcome. Run both test projects against the emulator before submitting a change that touches `CosmosDbCommand`, since that is where SQL is translated and run.
+Issues and pull requests are welcome. Before submitting a change that touches `CosmosDbCommand` or `CosmosDbTransaction`, where SQL is translated and writes are run, run the provider tests and both conformance projects (YesSql 5.4.7 and 6.0.0) against the emulator, on both partition strategies. CI runs them on every pull request, together with the Orchard Core sample.
 
 ## License
 

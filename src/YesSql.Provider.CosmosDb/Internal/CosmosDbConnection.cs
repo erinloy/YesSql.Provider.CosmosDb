@@ -118,8 +118,19 @@ internal sealed class CosmosDbConnection : DbConnection
 
     protected override DbCommand CreateDbCommand() => new CosmosDbCommand(this);
 
+    // The unit of work that is open on this connection, so a command can wait for its pending writes before it reads.
+    internal CosmosDbTransaction? ActiveTransaction { get; private set; }
+
+    internal void EndTransaction(CosmosDbTransaction transaction)
+    {
+        if (ReferenceEquals(ActiveTransaction, transaction))
+        {
+            ActiveTransaction = null;
+        }
+    }
+
     protected override DbTransaction BeginDbTransaction(IsolationLevel isolationLevel)
-        => new CosmosDbTransaction(this, isolationLevel);
+        => ActiveTransaction = new CosmosDbTransaction(this, isolationLevel);
 
     protected override void Dispose(bool disposing)
     {

@@ -4,7 +4,11 @@ All notable changes are listed here. The project is in preview, so minor version
 
 ## Unreleased
 
+### Changed
+- A write inside a unit of work is started without waiting for Cosmos to answer, so the writes of one save overlap. A query, an update of the same item, commit and rollback wait for the writes in flight, and a write that fails is thrown by the next of those, never dropped, after which the unit of work is rolled back as before. Traced against the emulator, a save of a document with a map and a reduce index waits for 3 round trips in a row instead of 5 (6 requests either way), and with 60 ms added to every request a save took about 330 ms instead of about 650 ms. Deletes are started the same way. The effect on a real account has not been measured.
+
 ### Fixed
+- A process could hand out an id for an index row twice if the stored counter of that table was missing or behind: the counter is rebuilt from the largest stored id, and writes that carry ids already issued may not be stored yet. One row then overwrote the other. A process now never issues an id it has already issued, and the counter is moved past it. Production keeps its counter, so this showed only where counters are deleted, as the conformance harness does between tests.
 - A query ordered by a date column on an index (`OrderBy(x => x.CreatedUtc)`) could return rows out of order. The provider sorts these in the client, and compared the dates as the culture's text, which drops the fractions of a second and sorts `9:59 AM` after `10:00 AM`, so items created within the same second tied and kept index order. Dates are now compared as moments in time. Found by running content operations through a real Orchard Core site.
 
 ### Added
