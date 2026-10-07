@@ -5,8 +5,11 @@ namespace YesSql.Provider.CosmosDb.Internal.Sql;
 /// <summary>A node of a parsed SQL expression. The tree keeps explicit parentheses as <see cref="ParenExpr"/> nodes.</summary>
 internal abstract record SqlExpr;
 
-/// <summary><c>[Name]</c>, <c>[Qualifier].[Name]</c> or <c>alias.[Name]</c>.</summary>
-internal sealed record ColumnRef(string? Qualifier, string Name) : SqlExpr;
+/// <summary>
+/// <c>[Name]</c>, <c>[Qualifier].[Name]</c> or <c>alias.[Name]</c>. <see cref="QualifierIsTable"/> is true when the
+/// qualifier was written in brackets, which is how YesSql names a table, as opposed to a bare alias.
+/// </summary>
+internal sealed record ColumnRef(string? Qualifier, string Name, bool QualifierIsTable = false) : SqlExpr;
 
 /// <summary><c>@name</c>; <see cref="Name"/> excludes the <c>@</c>.</summary>
 internal sealed record ParamRef(string Name) : SqlExpr;

@@ -36,7 +36,7 @@ public class SqlParserExpressionTests
 
         Assert.Equal(new ColumnRef("PersonByName_a1", "SomeName"), tree.Left);
         Assert.Equal(new ParamRef("p0"), tree.Right);
-        Assert.Equal(new ColumnRef("Document", "Id"), Assert.IsType<BinaryExpr>(Parse("[Document].[Id] = @p")).Left);
+        Assert.Equal(new ColumnRef("Document", "Id", QualifierIsTable: true), Assert.IsType<BinaryExpr>(Parse("[Document].[Id] = @p")).Left);
         Assert.Equal(new ColumnRef(null, "Id"), Assert.IsType<BinaryExpr>(Parse("[Id] = @p")).Left);
     }
 

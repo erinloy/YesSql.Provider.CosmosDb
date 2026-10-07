@@ -9,6 +9,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.Azure.Cosmos;
 using Newtonsoft.Json.Linq;
+using YesSql.Provider.CosmosDb.Internal.Sql;
 
 namespace YesSql.Provider.CosmosDb.Internal;
 
@@ -23,7 +24,7 @@ namespace YesSql.Provider.CosmosDb.Internal;
 /// <see cref="PartitionStrategy.PerTable"/> and <see cref="CosmosDbOptions.PartitionScope"/> under
 /// <see cref="PartitionStrategy.PerStore"/>. See docs/ARCHITECTURE.md.
 /// </remarks>
-internal sealed class CosmosDbCommand : DbCommand
+internal sealed partial class CosmosDbCommand : DbCommand
 {
     private static readonly string[] DocumentColumns = { "Id", "Type", "Content", "Version" };
 
@@ -246,7 +247,7 @@ internal sealed class CosmosDbCommand : DbCommand
                         }
 
                         var replaceWhere = trailingWhere.Success ? trailingWhere.Groups[1].Value.Trim() : null;
-                        var cosmosWhere = string.IsNullOrWhiteSpace(replaceWhere) ? string.Empty : " AND " + TranslateWhere(replaceWhere!);
+                        var cosmosWhere = string.IsNullOrWhiteSpace(replaceWhere) ? string.Empty : " AND " + await TranslateWhereAsync(replaceWhere!, cancellationToken);
                         var replaceQuery = new QueryDefinition("SELECT * FROM c WHERE " + Scoped(replaceTable) + cosmosWhere)
                             .WithParameter("@pk", PkValue(replaceTable));
                         replaceQuery = BindParameters(replaceQuery);
@@ -415,7 +416,7 @@ internal sealed class CosmosDbCommand : DbCommand
             // by [DocumentId] for map indexes, by composite key for reduce bridge rows), then delete each.
             var table = ExtractTable(sql);
             var where = ExtractWhere(sql);
-            var cosmosWhere = string.IsNullOrWhiteSpace(where) ? string.Empty : " AND " + TranslateWhere(where!);
+            var cosmosWhere = string.IsNullOrWhiteSpace(where) ? string.Empty : " AND " + await TranslateWhereAsync(where!, cancellationToken);
 
             // SELECT * (not just id) so the full items can be restored on rollback.
             var queryDef = new QueryDefinition("SELECT * FROM c WHERE " + Scoped(table) + cosmosWhere).WithParameter("@pk", PkValue(table));
@@ -697,16 +698,15 @@ internal sealed class CosmosDbCommand : DbCommand
 
         // WHERE predicate over index columns → Cosmos predicate. Strip the document-Type predicate
         // YesSql adds (it does not apply inside the index partition), then rewrite column refs.
-        _ = alias; // columns are rewritten generically by TranslateWhere
+        _ = alias; // columns are rewritten generically by the writer
         var cosmosWhere = string.Empty;
         var where = ExtractWhere(sql);
         if (!string.IsNullOrWhiteSpace(where))
         {
-            var stripped = StripDocTypePredicate(where!).Trim();
-            stripped = await ResolveSubqueriesAsync(stripped, cancellationToken);
-            if (stripped.Length > 0)
+            var predicate = SqlTree.WithoutDocumentTypePredicate(SqlParser.ParseExpression(where!));
+            if (predicate is not null)
             {
-                cosmosWhere = TranslateWhere(stripped);
+                cosmosWhere = await WriteWhereAsync(predicate, cancellationToken);
             }
         }
 
@@ -1012,80 +1012,6 @@ internal sealed class CosmosDbCommand : DbCommand
         return new CosmosDbDataReader(DocumentColumns, rows);
     }
 
-    // Resolve "[Col] [NOT] IN (SELECT [c] FROM [t] AS a [WHERE …])" by executing the inner query and
-    // substituting an ARRAY_CONTAINS test over the values (Cosmos has no cross-partition correlated subqueries).
-    private async Task<string> ResolveSubqueriesAsync(string where, CancellationToken cancellationToken)
-    {
-        while (true)
-        {
-            var m = Regex.Match(where, @"((?:(?:\w+|\[[^\]]+\])\.)?\[[^\]]+\])\s+(not\s+)?in\s*\(\s*select\b",
-                RegexOptions.IgnoreCase);
-            if (!m.Success)
-            {
-                return where;
-            }
-
-            // Balanced scan for the subquery's closing paren.
-            var openIdx = where.IndexOf('(', m.Index);
-            int depth = 0, closeIdx = -1;
-            for (var i = openIdx; i < where.Length; i++)
-            {
-                if (where[i] == '(')
-                {
-                    depth++;
-                }
-                else if (where[i] == ')' && --depth == 0)
-                {
-                    closeIdx = i;
-                    break;
-                }
-            }
-
-            if (closeIdx < 0)
-            {
-                return where; // malformed; leave as-is
-            }
-
-            var subquery = where.Substring(openIdx + 1, closeIdx - openIdx - 1);
-            var sm = Regex.Match(subquery,
-                @"select\s+(?:(?:\w+|\[[^\]]+\])\.)?\[([^\]]+)\]\s+from\s+\[([^\]]+)\]\s+as\s+\w+(?:\s+where\s+(.*))?$",
-                RegexOptions.IgnoreCase | RegexOptions.Singleline);
-            if (!sm.Success)
-            {
-                return where;
-            }
-
-            var innerColumn = sm.Groups[1].Value;
-            var innerTable = sm.Groups[2].Value;
-            var innerWhere = sm.Groups[3].Success ? sm.Groups[3].Value.Trim() : null;
-
-            var innerCosmosWhere = string.IsNullOrWhiteSpace(innerWhere) ? string.Empty : " AND " + TranslateWhere(innerWhere!);
-            var queryDef = new QueryDefinition($"SELECT VALUE c[\"{innerColumn}\"] FROM c WHERE " + Scoped(innerTable, "@__itbl") + innerCosmosWhere)
-                .WithParameter("@__itbl", PkValue(innerTable));
-            queryDef = BindParameters(queryDef);
-
-            var values = new JArray();
-            using (var iterator = CosmosContainer.GetItemQueryIterator<JToken>(queryDef,
-                requestOptions: new QueryRequestOptions { PartitionKey = PartitionKeyFor(innerTable) }))
-            {
-                while (iterator.HasMoreResults)
-                {
-                    foreach (var v in await iterator.ReadNextAsync(cancellationToken))
-                    {
-                        values.Add(v);
-                    }
-                }
-            }
-
-            // Pass the values as a parameter rather than writing them into the query text, so their content
-            // cannot change the query and the query size does not grow with the result.
-            var parameterName = "@__sq" + _derivedParameters.Count;
-            _derivedParameters.Add((parameterName, values));
-            var replacement = $"{(m.Groups[2].Success ? "NOT " : string.Empty)}ARRAY_CONTAINS({parameterName}, {m.Groups[1].Value})";
-            where = where[..m.Index] + replacement + where[(closeIdx + 1)..];
-        }
-    }
-
     private static bool IsDocumentTable(string table) => table.EndsWith("Document", StringComparison.OrdinalIgnoreCase);
 
     // Count the matching DocumentIds for a COUNT over a join (reduce / multi-index / single-index). Shared
@@ -1115,7 +1041,7 @@ internal sealed class CosmosDbCommand : DbCommand
     {
         var table = ExtractTableAfter(sql, "from");
         var where = ExtractWhere(sql);
-        var cosmosWhere = string.IsNullOrWhiteSpace(where) ? string.Empty : " AND " + TranslateWhere(where!);
+        var cosmosWhere = string.IsNullOrWhiteSpace(where) ? string.Empty : " AND " + await TranslateWhereAsync(where!, cancellationToken);
 
         var queryDef = new QueryDefinition("SELECT VALUE COUNT(1) FROM c WHERE " + Scoped(table) + cosmosWhere)
             .WithParameter("@pk", PkValue(table));
@@ -1234,44 +1160,6 @@ internal sealed class CosmosDbCommand : DbCommand
         return offset > 0 ? $" OFFSET {offset} LIMIT {int.MaxValue}" : string.Empty;
     }
 
-    // Rewrite SQL column refs (alias.[Col], [table].[Col], or bare [Col]) → Cosmos c["Col"] (single
-    // pass so an already-rewritten c["Col"] is not reprocessed), then map SQL null tests to Cosmos.
-    internal string TranslateWhere(string where)
-    {
-        where = Regex.Replace(where, @"(?:(?:\w+|\[[^\]]+\])\.)?\[([^\]]+)\]", "c[\"$1\"]");
-        where = Regex.Replace(where, @"(c\[""[^""]+""\])\s+is\s+not\s+null", "(IS_DEFINED($1) AND NOT IS_NULL($1))", RegexOptions.IgnoreCase);
-        where = Regex.Replace(where, @"(c\[""[^""]+""\])\s+is\s+null", "(NOT IS_DEFINED($1) OR IS_NULL($1))", RegexOptions.IgnoreCase);
-
-        // Compare DateTime/DateTimeOffset parameters by instant (DateTimeToTimestamp) rather than by the raw
-        // ISO text, so a DateTimeOffset field ("…+00:00") matches a DateTime value ("…Z") for the same moment.
-        // Only predicates against a date parameter are wrapped, so non-date comparisons are untouched.
-        foreach (DbParameter p in _parameters)
-        {
-            if (p.Value is not (DateTime or DateTimeOffset))
-            {
-                continue;
-            }
-
-            var paramRef = "@" + p.ParameterName.TrimStart('@');
-            var escaped = Regex.Escape(paramRef);
-            where = Regex.Replace(where, @"(c\[""[^""]+""\])\s*(=|!=|<>|<=|>=|<|>)\s*" + escaped + @"(?![\w])",
-                "DateTimeToTimestamp($1) $2 DateTimeToTimestamp(" + paramRef + ")");
-            where = Regex.Replace(where, escaped + @"(?![\w])\s*(=|!=|<>|<=|>=|<|>)\s*(c\[""[^""]+""\])",
-                "DateTimeToTimestamp(" + paramRef + ") $1 DateTimeToTimestamp($2)");
-        }
-
-        return where;
-    }
-
-    // Remove the document-Type predicate ([Doc].[Type] = @p) YesSql adds to index joins.
-    private static string StripDocTypePredicate(string where)
-    {
-        where = Regex.Replace(where, @"\[[^\]]+\]\.\[Type\]\s*=\s*@\w+\s+and\s+", "", RegexOptions.IgnoreCase);
-        where = Regex.Replace(where, @"\s+and\s+\[[^\]]+\]\.\[Type\]\s*=\s*@\w+", "", RegexOptions.IgnoreCase);
-        where = Regex.Replace(where, @"^\s*\[[^\]]+\]\.\[Type\]\s*=\s*@\w+\s*$", "", RegexOptions.IgnoreCase);
-        return where;
-    }
-
     // Query<T>() — all documents in the partition, optionally filtered by Type.
     private async Task<DbDataReader> QueryDocumentsAsync(string sql, CancellationToken cancellationToken)
     {
@@ -1353,7 +1241,7 @@ internal sealed class CosmosDbCommand : DbCommand
     private async Task<DbDataReader> ExecuteDatePartAsync(string sql, string table, string part, string column, CancellationToken cancellationToken)
     {
         var where = ExtractWhere(sql);
-        var cosmosWhere = string.IsNullOrWhiteSpace(where) ? string.Empty : " AND " + TranslateWhere(where!);
+        var cosmosWhere = string.IsNullOrWhiteSpace(where) ? string.Empty : " AND " + await TranslateWhereAsync(where!, cancellationToken);
 
         var queryDef = new QueryDefinition($"SELECT VALUE DateTimePart(\"{part}\", c.{column}) FROM c WHERE " + Scoped(table) + cosmosWhere)
             .WithParameter("@pk", PkValue(table));
@@ -1379,7 +1267,7 @@ internal sealed class CosmosDbCommand : DbCommand
     private async Task<DbDataReader> QueryIndexRowsAsync(string sql, string indexTable, CancellationToken cancellationToken)
     {
         var where = ExtractWhere(sql);
-        var cosmosWhere = string.IsNullOrWhiteSpace(where) ? string.Empty : " AND " + TranslateWhere(where!);
+        var cosmosWhere = string.IsNullOrWhiteSpace(where) ? string.Empty : " AND " + await TranslateWhereAsync(where!, cancellationToken);
 
         var random = HasRandomOrder(sql);
         var queryDef = new QueryDefinition("SELECT * FROM c WHERE " + Scoped(indexTable) + cosmosWhere + OrderAndPagingClause(sql, random))
@@ -1429,69 +1317,6 @@ internal sealed class CosmosDbCommand : DbCommand
 
     private static IEnumerable<string> IndexJoinTables(string sql) => IndexJoins(sql).Select(j => j.Table);
 
-    // Strip redundant outer parentheses that wrap the whole expression: "((A) AND (B))" → "(A) AND (B)".
-    private static string UnwrapOuterParens(string s)
-    {
-        s = s.Trim();
-        while (s.Length >= 2 && s[0] == '(' && s[^1] == ')')
-        {
-            var depth = 0;
-            var wraps = true;
-            for (var i = 0; i < s.Length; i++)
-            {
-                if (s[i] == '(')
-                {
-                    depth++;
-                }
-                else if (s[i] == ')')
-                {
-                    depth--;
-                    if (depth == 0 && i < s.Length - 1)
-                    {
-                        wraps = false;
-                        break;
-                    }
-                }
-            }
-
-            if (!wraps)
-            {
-                break;
-            }
-
-            s = s[1..^1].Trim();
-        }
-
-        return s;
-    }
-
-    // Split a WHERE clause on top-level " AND " (respecting parentheses).
-    private static List<string> SplitTopLevelAnd(string where)
-    {
-        var parts = new List<string>();
-        int depth = 0, start = 0;
-        for (var i = 0; i < where.Length; i++)
-        {
-            if (where[i] == '(')
-            {
-                depth++;
-            }
-            else if (where[i] == ')')
-            {
-                depth--;
-            }
-            else if (depth == 0 && i + 5 <= where.Length && where.Substring(i, 5).Equals(" and ", StringComparison.OrdinalIgnoreCase))
-            {
-                parts.Add(where[start..i]);
-                i += 4;
-                start = i + 1;
-            }
-        }
-
-        parts.Add(where[start..]);
-        return parts.Select(p => p.Trim()).Where(p => p.Length > 0).ToList();
-    }
-
     // Multi-index join across distinct index tables: query each index's DocumentId set (filtered by its
     // own aliases' predicates) and intersect them.
     private async Task<List<long>> GatherMultiIndexDocumentIdsAsync(string sql, CancellationToken cancellationToken)
@@ -1499,15 +1324,15 @@ internal sealed class CosmosDbCommand : DbCommand
         var joins = IndexJoins(sql);
         var where = ExtractWhere(sql);
         var terms = string.IsNullOrWhiteSpace(where)
-            ? new List<string>()
-            : SplitTopLevelAnd(UnwrapOuterParens(StripDocTypePredicate(where!).Trim()));
+            ? SqlTree.Conjuncts(null)
+            : SqlTree.Conjuncts(SqlTree.WithoutDocumentTypePredicate(SqlParser.ParseExpression(where!)));
 
         List<long>? result = null;
         foreach (var group in joins.GroupBy(j => j.Table))
         {
             var aliases = group.Select(j => j.Alias).ToList();
-            var tableTerms = terms.Where(t => aliases.Any(a => Regex.IsMatch(t, @"\b" + Regex.Escape(a) + @"\.", RegexOptions.IgnoreCase))).ToList();
-            var sub = tableTerms.Count > 0 ? " AND " + TranslateWhere(string.Join(" AND ", tableTerms)) : string.Empty;
+            var tableTerms = terms.Where(t => SqlTree.Qualifiers(t).Overlaps(aliases)).ToList();
+            var sub = tableTerms.Count > 0 ? " AND " + await WriteWhereAsync(SqlTree.And(tableTerms)!, cancellationToken) : string.Empty;
 
             var queryDef = new QueryDefinition("SELECT VALUE c.DocumentId FROM c WHERE " + Scoped(group.Key) + sub).WithParameter("@pk", PkValue(group.Key));
             queryDef = BindParameters(queryDef);
@@ -1640,10 +1465,10 @@ internal sealed class CosmosDbCommand : DbCommand
         var indexWhere = string.Empty;
         if (!string.IsNullOrWhiteSpace(where))
         {
-            var stripped = StripDocTypePredicate(where!).Trim();
-            if (stripped.Length > 0)
+            var predicate = SqlTree.WithoutDocumentTypePredicate(SqlParser.ParseExpression(where!));
+            if (predicate is not null)
             {
-                indexWhere = " AND " + TranslateWhere(stripped);
+                indexWhere = " AND " + await WriteWhereAsync(predicate, cancellationToken);
             }
         }
 
