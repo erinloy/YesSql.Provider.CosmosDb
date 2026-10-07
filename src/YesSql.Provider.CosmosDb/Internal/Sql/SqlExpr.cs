@@ -14,7 +14,7 @@ internal sealed record ColumnRef(string? Qualifier, string Name, bool QualifierI
 /// <summary><c>@name</c>; <see cref="Name"/> excludes the <c>@</c>.</summary>
 internal sealed record ParamRef(string Name) : SqlExpr;
 
-/// <summary>A number, a <c>'string'</c> or <c>NULL</c>. <see cref="Value"/> is a <see cref="long"/>, a <see cref="decimal"/>, a <see cref="string"/> or null.</summary>
+/// <summary>A number, a <c>'string'</c>, <c>TRUE</c>, <c>FALSE</c> or <c>NULL</c>. <see cref="Value"/> is a <see cref="long"/>, a <see cref="decimal"/>, a <see cref="string"/>, a <see cref="bool"/> or null.</summary>
 internal sealed record LiteralExpr(object? Value) : SqlExpr;
 
 /// <summary>A comparison, <c>LIKE</c>, <c>NOT LIKE</c> or an arithmetic or concatenation operator, in upper case.</summary>

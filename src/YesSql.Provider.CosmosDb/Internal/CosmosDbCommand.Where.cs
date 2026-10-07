@@ -13,10 +13,6 @@ namespace YesSql.Provider.CosmosDb.Internal;
 // out with column names as properties and string literals as query parameters.
 internal sealed partial class CosmosDbCommand
 {
-    /// <summary>Translates the text of a WHERE clause (without the keyword) into a Cosmos predicate.</summary>
-    internal Task<string> TranslateWhereAsync(string where, CancellationToken cancellationToken)
-        => WriteWhereAsync(SqlParser.ParseExpression(where), cancellationToken);
-
     /// <summary>
     /// Writes a parsed predicate as a Cosmos predicate. <c>IN (SELECT ...)</c> subqueries are run first and their
     /// values passed as query parameters, and string literals become query parameters too, so neither can change the

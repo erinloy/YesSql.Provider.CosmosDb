@@ -90,8 +90,12 @@ public sealed class CosmosDbDialect : BaseDialect
     /// <inheritdoc />
     public override string IdentityLastId => "";
 
+    // Cosmos cannot order by a function, so the provider recognises this one in a parsed statement and orders the rows
+    // itself. The clause is written here only so that YesSql has something to emit.
+    internal const string RandomFunction = "GetCurrentTimestamp";
+
     /// <inheritdoc />
-    public override string RandomOrderByClause => "GetCurrentTimestamp()";
+    public override string RandomOrderByClause => RandomFunction + "()";
 
     /// <inheritdoc />
     public override byte DefaultDecimalPrecision => 19;

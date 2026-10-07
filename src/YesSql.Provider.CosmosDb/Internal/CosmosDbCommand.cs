@@ -4,7 +4,6 @@ using System.Data;
 using System.Data.Common;
 using System.Linq;
 using System.Net;
-using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.Azure.Cosmos;
@@ -117,344 +116,6 @@ internal sealed partial class CosmosDbCommand : DbCommand
         }
     }
 
-    private async Task<int> ExecuteNonQueryCoreAsync(CancellationToken cancellationToken)
-    {
-        _derivedParameters.Clear();
-        var sql = CommandText.TrimStart();
-
-        // RenameColumn DDL (emitted by the schema interpreter): rewrite the field on every row in the
-        // partition. Cosmos is schemaless, so a column rename is a data rewrite, not metadata.
-        if (StartsWith(sql, "renamecolumn"))
-        {
-            var rename = Regex.Match(sql, @"renamecolumn\s+\[([^\]]+)\]\s+\[([^\]]+)\]\s+\[([^\]]+)\]", RegexOptions.IgnoreCase);
-            if (!rename.Success)
-            {
-                throw new NotSupportedException($"Unsupported RenameColumn statement: {CommandText}");
-            }
-
-            var renameTable = rename.Groups[1].Value;
-            var oldColumn = rename.Groups[2].Value;
-            var newColumn = rename.Groups[3].Value;
-
-            var renameQuery = new QueryDefinition("SELECT * FROM c WHERE " + Scoped(renameTable)).WithParameter("@pk", PkValue(renameTable));
-            var renamed = 0;
-            using var renameIterator = CosmosContainer.GetItemQueryIterator<JObject>(renameQuery,
-                requestOptions: new QueryRequestOptions { PartitionKey = PartitionKeyFor(renameTable) });
-            while (renameIterator.HasMoreResults)
-            {
-                foreach (var item in await renameIterator.ReadNextAsync(cancellationToken))
-                {
-                    if (item.Property(oldColumn) is null)
-                    {
-                        continue;
-                    }
-
-                    item[newColumn] = item[oldColumn];
-                    item.Remove(oldColumn);
-                    await CosmosContainer.UpsertItemAsync(item, PartitionKeyFor(renameTable), cancellationToken: cancellationToken);
-                    renamed++;
-                }
-            }
-
-            return renamed;
-        }
-
-        // Reduce-index bridge row (Index↔Document link). The columns (e.g. [ArticlesByDayId],
-        // [DocumentId]) don't match the param names (@Id, @DocumentId), so map columns→params by
-        // position. Composite key (<indexFk>:<documentId>) — many rows share an index Id.
-        if (StartsWith(sql, "insert") && TryParam("DocumentId", out var bridgeDocId) && !TryParam("Type", out _) && !TryParam("Content", out _))
-        {
-            var bridgeTable = ExtractTable(sql);
-            var cv = Regex.Match(sql, @"\(([^)]*)\)\s*values\s*\(([^)]*)\)", RegexOptions.IgnoreCase);
-            var columns = cv.Groups[1].Value.Split(',').Select(c => c.Trim().Trim('[', ']')).ToArray();
-            var values = cv.Groups[2].Value.Split(',').Select(v => v.Trim().TrimStart('@')).ToArray();
-
-            var bridge = new JObject();
-            for (var i = 0; i < columns.Length && i < values.Length; i++)
-            {
-                bridge[columns[i]] = ToToken(TryParam(values[i], out var pv) ? pv : null);
-            }
-
-            var indexFk = columns.Length > 0 ? bridge[columns[0]]?.ToString() : "0";
-            bridge["id"] = $"{bridgeTable}:{indexFk}:{bridgeDocId}";
-            WithPartition(bridge, bridgeTable);
-
-            await CosmosContainer.UpsertItemAsync(bridge, PartitionKeyFor(bridgeTable), cancellationToken: cancellationToken);
-            Undo?.Record(bridge["id"]!.ToString(), PkValue(bridgeTable), null);
-            return 1;
-        }
-
-        // Bulk content rewrite: UPDATE [<table>] SET [<col>] = REPLACE([<col>], <from>, <to>) [WHERE <pred>].
-        // Orchard Core issues this to rename serialized $type names in stored documents. It has no @Id, so it
-        // cannot use the single-row UPDATE path below. Query the matching items, string-replace the column on
-        // each, and write them back. Document.Content is stored as a JSON string, so REPLACE is a plain string
-        // replace; the arguments may be 'literals' or @parameters.
-        if (StartsWith(sql, "update"))
-        {
-            var replaceHead = Regex.Match(sql, @"^update\s+\[([^\]]+)\]\s+set\s+\[([^\]]+)\]\s*=\s*replace\b",
-                RegexOptions.IgnoreCase);
-            var replaceOpen = replaceHead.Success ? sql.IndexOf('(', replaceHead.Index + replaceHead.Length) : -1;
-            if (replaceOpen >= 0)
-            {
-                // Balanced scan to REPLACE's closing paren, ignoring parens inside single-quoted literals
-                // (a doubled '' inside a literal nets to no toggle, so it stays "in string").
-                int depth = 0, replaceClose = -1;
-                var inLiteral = false;
-                for (var i = replaceOpen; i < sql.Length; i++)
-                {
-                    var ch = sql[i];
-                    if (ch == '\'')
-                    {
-                        inLiteral = !inLiteral;
-                    }
-                    else if (!inLiteral && ch == '(')
-                    {
-                        depth++;
-                    }
-                    else if (!inLiteral && ch == ')' && --depth == 0)
-                    {
-                        replaceClose = i;
-                        break;
-                    }
-                }
-
-                var trailing = replaceClose > 0 ? sql[(replaceClose + 1)..].Trim().TrimEnd(';').Trim() : "?";
-                var trailingWhere = Regex.Match(trailing, @"^where\s+(.*)$", RegexOptions.IgnoreCase | RegexOptions.Singleline);
-
-                // Only handle the clean "= REPLACE(col, from, to) [WHERE pred]" shape; anything else trailing
-                // (e.g. a second SET assignment) falls through to the generic path below.
-                if (replaceClose > replaceOpen && (trailing.Length == 0 || trailingWhere.Success))
-                {
-                    var replaceTable = replaceHead.Groups[1].Value;
-                    var replaceColumn = replaceHead.Groups[2].Value;
-                    var replaceArgs = SplitTopLevelCommas(sql[(replaceOpen + 1)..replaceClose]);
-                    if (replaceArgs.Count >= 3)
-                    {
-                        var fromValue = ResolveSqlValue(replaceArgs[1]);
-                        var toValue = ResolveSqlValue(replaceArgs[2]) ?? string.Empty;
-
-                        // SQL REPLACE with a NULL search value yields NULL, which would erase the column. Fail
-                        // rather than rewrite content from what is almost certainly a missing parameter.
-                        if (fromValue is null)
-                        {
-                            throw new NotSupportedException($"REPLACE with a NULL search value is not supported: {CommandText}");
-                        }
-
-                        // An empty search string matches nothing in SQL REPLACE, so there is nothing to rewrite.
-                        if (fromValue.Length == 0)
-                        {
-                            return 0;
-                        }
-
-                        var replaceWhere = trailingWhere.Success ? trailingWhere.Groups[1].Value.Trim() : null;
-                        var cosmosWhere = string.IsNullOrWhiteSpace(replaceWhere) ? string.Empty : " AND " + await TranslateWhereAsync(replaceWhere!, cancellationToken);
-                        var replaceQuery = new QueryDefinition("SELECT * FROM c WHERE " + Scoped(replaceTable) + cosmosWhere)
-                            .WithParameter("@pk", PkValue(replaceTable));
-                        replaceQuery = BindParameters(replaceQuery);
-
-                        var matches = new List<JObject>();
-                        using (var iterator = CosmosContainer.GetItemQueryIterator<JObject>(replaceQuery,
-                            requestOptions: new QueryRequestOptions { PartitionKey = PartitionKeyFor(replaceTable) }))
-                        {
-                            while (iterator.HasMoreResults)
-                            {
-                                foreach (var item in await iterator.ReadNextAsync(cancellationToken))
-                                {
-                                    matches.Add(item);
-                                }
-                            }
-                        }
-
-                        var replacedCount = 0;
-                        foreach (var item in matches)
-                        {
-                            if (item[replaceColumn]?.Type != JTokenType.String)
-                            {
-                                continue;
-                            }
-
-                            var current = item[replaceColumn]!.ToObject<string>()!;
-                            if (!current.Contains(fromValue, StringComparison.Ordinal))
-                            {
-                                continue;
-                            }
-
-                            var prior = (JObject)item.DeepClone();
-                            item[replaceColumn] = current.Replace(fromValue, toValue, StringComparison.Ordinal);
-                            await CosmosContainer.UpsertItemAsync(item, PartitionKeyFor(replaceTable), cancellationToken: cancellationToken);
-                            Undo?.Record(item["id"]!.ToString(), PkValue(replaceTable), prior);
-                            replacedCount++;
-                        }
-
-                        return replacedCount;
-                    }
-                }
-            }
-        }
-
-        if (StartsWith(sql, "insert") || StartsWith(sql, "update"))
-        {
-            var table = ExtractTable(sql);
-
-            // UPDATE only carries the columns in its SET clause (Content/Version), so read the existing
-            // item and patch the provided fields; INSERT carries all of them.
-            var isUpdate = StartsWith(sql, "update");
-
-            // Resolve the row Id. UPDATE always carries @Id (its key). An INSERT into an identity table
-            // (e.g. Orchard's [RecordIndexingTask]) carries no @Id — Cosmos has no auto-increment, so
-            // allocate Id = next sequence, mirroring the scalar-insert path above.
-            long id;
-            if (TryParam("Id", out var idParam) && idParam is not null and not DBNull)
-            {
-                id = Convert.ToInt64(idParam);
-            }
-            else if (!isUpdate)
-            {
-                id = await NextSequenceAsync(table, cancellationToken);
-            }
-            else
-            {
-                id = Convert.ToInt64(Param("Id")); // UPDATE without its key — preserve the original error
-            }
-            JObject? item = null;
-            string? etag = null;
-            if (isUpdate)
-            {
-                try
-                {
-                    var existing = await CosmosContainer.ReadItemAsync<JObject>($"{table}:{id}", PartitionKeyFor(table), cancellationToken: cancellationToken);
-                    item = existing.Resource;
-                    etag = existing.ETag;
-                }
-                catch (CosmosException ex) when (ex.StatusCode == HttpStatusCode.NotFound)
-                {
-                    // fall through to a fresh item
-                }
-            }
-
-            // Optimistic concurrency: a checked update adds "and [Version] = <n>" (or "IS NULL OR = <n>");
-            // YesSql throws ConcurrencyException when the affected count is not 1, so return 0 on mismatch.
-            var versionCheck = isUpdate ? Regex.Match(sql, @"\[version\]\s*=\s*(\d+)", RegexOptions.IgnoreCase) : Match.Empty;
-            if (versionCheck.Success)
-            {
-                var checkVersion = long.Parse(versionCheck.Groups[1].Value);
-                var allowNull = Regex.IsMatch(sql, @"\[version\]\s+is\s+null", RegexOptions.IgnoreCase);
-                var current = item?["Version"];
-                var currentVersion = current is null || current.Type == JTokenType.Null ? (long?)null : current.ToObject<long>();
-                if (item is null || !(currentVersion == checkVersion || (allowNull && currentVersion is null)))
-                {
-                    return 0;
-                }
-            }
-
-            // Snapshot the prior state (for rollback) before patching; null ⇒ this is an insert.
-            var prior = item is null ? null : (JObject)item.DeepClone();
-
-            item ??= new JObject { ["id"] = $"{table}:{id}", ["Id"] = id };
-
-            // Patch every provided column (documents: Type/Content/Version; indexes: their own fields).
-            // Id is the key and already set.
-            foreach (DbParameter p in _parameters)
-            {
-                var name = p.ParameterName.TrimStart('@');
-                if (!name.Equals("Id", StringComparison.OrdinalIgnoreCase))
-                {
-                    item[name] = ToToken(p.Value is DBNull ? null : p.Value);
-                }
-            }
-
-            // INSERT with literal VALUES (no parameters), e.g. "INSERT INTO [T] ([C1]) VALUES ('v')" — map
-            // each "[Column]" to its parsed literal. Parameterised positions (@p) are already handled above.
-            if (!isUpdate)
-            {
-                var insertMatch = Regex.Match(sql, @"insert\s+into\s+\[[^\]]+\]\s*\(([^)]*)\)\s*values\s*\((.*)\)", RegexOptions.IgnoreCase | RegexOptions.Singleline);
-                if (insertMatch.Success)
-                {
-                    var insertCols = Regex.Matches(insertMatch.Groups[1].Value, @"\[([^\]]+)\]").Select(m => m.Groups[1].Value).ToList();
-                    var insertVals = SplitTopLevelCommas(insertMatch.Groups[2].Value);
-                    for (var i = 0; i < insertCols.Count && i < insertVals.Count; i++)
-                    {
-                        var raw = insertVals[i].Trim();
-                        if (raw.StartsWith('@') || insertCols[i].Equals("Id", StringComparison.OrdinalIgnoreCase))
-                        {
-                            continue;
-                        }
-
-                        item[insertCols[i]] = ParseSqlLiteral(raw);
-                    }
-                }
-            }
-
-            WithPartition(item, table);
-
-            // Version-checked updates use an ETag-conditional replace so a concurrent write between the
-            // read and the write is also detected (412 ⇒ treat as a concurrency failure).
-            if (versionCheck.Success && etag is not null)
-            {
-                try
-                {
-                    await CosmosContainer.ReplaceItemAsync(item, $"{table}:{id}", PartitionKeyFor(table),
-                        new ItemRequestOptions { IfMatchEtag = etag }, cancellationToken);
-                }
-                catch (CosmosException ex) when (ex.StatusCode == HttpStatusCode.PreconditionFailed)
-                {
-                    return 0;
-                }
-            }
-            else
-            {
-                await CosmosContainer.UpsertItemAsync(item, PartitionKeyFor(table), cancellationToken: cancellationToken);
-            }
-
-            Undo?.Record($"{table}:{id}", PkValue(table), prior);
-            return 1;
-        }
-
-        if (StartsWith(sql, "delete"))
-        {
-            // General delete: query items in the partition matching the WHERE (by [Id] for documents,
-            // by [DocumentId] for map indexes, by composite key for reduce bridge rows), then delete each.
-            var table = ExtractTable(sql);
-            var where = ExtractWhere(sql);
-            var cosmosWhere = string.IsNullOrWhiteSpace(where) ? string.Empty : " AND " + await TranslateWhereAsync(where!, cancellationToken);
-
-            // SELECT * (not just id) so the full items can be restored on rollback.
-            var queryDef = new QueryDefinition("SELECT * FROM c WHERE " + Scoped(table) + cosmosWhere).WithParameter("@pk", PkValue(table));
-            queryDef = BindParameters(queryDef);
-
-            var items = new List<JObject>();
-            using (var iterator = CosmosContainer.GetItemQueryIterator<JObject>(queryDef,
-                requestOptions: new QueryRequestOptions { PartitionKey = PartitionKeyFor(table) }))
-            {
-                while (iterator.HasMoreResults)
-                {
-                    foreach (var item in await iterator.ReadNextAsync(cancellationToken))
-                    {
-                        items.Add(item);
-                    }
-                }
-            }
-
-            foreach (var item in items)
-            {
-                var id = item["id"]!.ToString();
-                Undo?.Record(id, PkValue(table), item); // restore the deleted item on rollback
-                try
-                {
-                    await CosmosContainer.DeleteItemAsync<JObject>(id, PartitionKeyFor(table), cancellationToken: cancellationToken);
-                }
-                catch (CosmosException ex) when (ex.StatusCode == HttpStatusCode.NotFound)
-                {
-                    // already gone
-                }
-            }
-
-            return items.Count;
-        }
-
-        throw new NotSupportedException($"Unsupported non-query statement: {CommandText}");
-    }
-
     public override async Task<object?> ExecuteScalarAsync(CancellationToken cancellationToken)
     {
         try
@@ -470,53 +131,51 @@ internal sealed partial class CosmosDbCommand : DbCommand
     private async Task<object?> ExecuteScalarCoreAsync(CancellationToken cancellationToken)
     {
         _derivedParameters.Clear();
-        var sql = CommandText;
 
-        // DefaultIdGenerator seed: SELECT MAX([Id]) FROM [<table>]
-        if (Regex.IsMatch(sql, @"max\s*\(", RegexOptions.IgnoreCase))
+        switch (SqlParser.ParseStatement(CommandText))
         {
-            var table = ExtractTableAfter(sql, "from");
-            return await MaxIdAsync(table, cancellationToken);
-        }
+            case SelectStatement select:
+                var shape = SelectShape.Of(select, CommandText);
+                switch (shape.Scalar)
+                {
+                    // DefaultIdGenerator seed: SELECT MAX([Id]) FROM [<table>]
+                    case ScalarRoute.MaxId:
+                        return await MaxIdAsync(shape.RequiredFromTable, cancellationToken);
 
-        // CountAsync over an index join: SELECT count(distinct [Document].[Id]) FROM [Document] INNER
-        // JOIN [Index] … WHERE … → count the matching DocumentIds.
-        if (Regex.IsMatch(sql, @"count\s*\(", RegexOptions.IgnoreCase) && Regex.IsMatch(sql, @"\bjoin\b", RegexOptions.IgnoreCase))
-        {
-            return await CountJoinAsync(sql, cancellationToken);
-        }
+                    // CountAsync over an index join: SELECT count(distinct [Document].[Id]) FROM [Document] INNER
+                    // JOIN [Index] … WHERE … → count the matching DocumentIds.
+                    case ScalarRoute.CountJoin:
+                        return await CountJoinAsync(shape, cancellationToken);
 
-        // CountAsync without a join: SELECT count(*) FROM [<table>] [WHERE <predicate>] — count items in
-        // that partition (documents by Type, or index rows).
-        if (Regex.IsMatch(sql, @"count\s*\(", RegexOptions.IgnoreCase))
-        {
-            return await CountItemsAsync(sql, cancellationToken);
-        }
+                    // CountAsync without a join: SELECT count(*) FROM [<table>] [WHERE <predicate>] — count items in
+                    // that partition (documents by Type, or index rows).
+                    case ScalarRoute.CountItems:
+                        return await CountItemsAsync(shape, cancellationToken);
+                }
 
-        // Map-index write: insert into [<index>] ([Col]…) values (@Col…) — executed as scalar to
-        // return the new index row Id. Cosmos has no auto-increment, so we allocate Id = MAX+1 and
-        // store every parameter as a field on the index item.
-        if (StartsWith(sql.TrimStart(), "insert"))
-        {
-            var table = ExtractTable(sql);
-            var newId = await NextSequenceAsync(table, cancellationToken);
+                break;
 
-            var item = new JObject
-            {
-                ["id"] = $"{table}:{newId}",
-                ["Id"] = newId,
-            };
+            // Map-index write: insert into [<index>] ([Col]…) values (@Col…) — executed as scalar to return the new
+            // index row Id. Cosmos has no auto-increment, so allocate Id from the table's sequence and store every
+            // parameter as a field on the index item.
+            case InsertStatement insert:
+                var newId = await NextSequenceAsync(insert.Table, cancellationToken);
+                var item = new JObject
+                {
+                    ["id"] = $"{insert.Table}:{newId}",
+                    ["Id"] = newId,
+                };
 
-            foreach (DbParameter p in _parameters)
-            {
-                var name = p.ParameterName.TrimStart('@');
-                item[name] = ToToken(p.Value is DBNull ? null : p.Value);
-            }
+                foreach (DbParameter p in _parameters)
+                {
+                    var name = p.ParameterName.TrimStart('@');
+                    item[name] = ToToken(p.Value is DBNull ? null : p.Value);
+                }
 
-            WithPartition(item, table);
-            await CosmosContainer.UpsertItemAsync(item, PartitionKeyFor(table), cancellationToken: cancellationToken);
-            Undo?.Record(item["id"]!.ToString(), PkValue(table), null);
-            return newId;
+                WithPartition(item, insert.Table);
+                await CosmosContainer.UpsertItemAsync(item, PartitionKeyFor(insert.Table), cancellationToken: cancellationToken);
+                Undo?.Record(item["id"]!.ToString(), PkValue(insert.Table), null);
+                return newId;
         }
 
         throw new NotSupportedException($"Unsupported scalar statement: {CommandText}");
@@ -537,92 +196,77 @@ internal sealed partial class CosmosDbCommand : DbCommand
     private async Task<DbDataReader> ExecuteReaderCoreAsync(CancellationToken cancellationToken)
     {
         _derivedParameters.Clear();
-        var sql = CommandText;
 
-        // A COUNT over a join run through the reader (raw Dapper QueryFirstOrDefaultAsync<int>, e.g. the
-        // Inner/Left/Right join count API) — compute the matching-DocumentId count and yield it as a single
-        // "count" column, before the join branches treat it as a row-returning query.
-        if (Regex.IsMatch(sql, @"\bcount\s*\(", RegexOptions.IgnoreCase) && Regex.IsMatch(sql, @"\bjoin\b", RegexOptions.IgnoreCase))
+        if (SqlParser.ParseStatement(CommandText) is not SelectStatement select)
         {
-            var joinCount = await CountJoinAsync(sql, cancellationToken);
-            return new CosmosDbDataReader(["count"], [[(object?)joinCount]]);
+            throw new NotSupportedException($"Unsupported query statement: {CommandText}");
         }
 
-        // Reduce-index query — a doc↔bridge↔index three-way join, recognised by the index↔bridge join
-        // "ON a.[Id] = b.[<X>Id]". Resolve via index → bridge → documents.
-        if (Regex.IsMatch(sql, @"\bon\s+\w+\.\[Id\]\s*=\s*\w+\.\[\w+Id\]", RegexOptions.IgnoreCase))
+        var shape = SelectShape.Of(select, CommandText);
+        switch (shape.Reader)
         {
-            return await ExecuteReduceJoinQueryAsync(sql, cancellationToken);
-        }
+            // A COUNT over a join run through the reader (raw Dapper QueryFirstOrDefaultAsync<int>, e.g. the
+            // Inner/Left/Right join count API) — compute the matching-DocumentId count and yield it as a single
+            // "count" column.
+            case ReaderRoute.CountJoinRow:
+                return new CosmosDbDataReader(["count"], [[(object?)await CountJoinAsync(shape, cancellationToken)]]);
 
-        // Multi-index join across DISTINCT index tables (.With<I1>().With<I2>()) — intersect each
-        // index's DocumentId set (INNER JOIN = AND). The same index joined repeatedly (scope / boolean
-        // queries) stays on the single-index path, where its combined WHERE translates correctly.
-        if (IndexJoinTables(sql).Distinct().Count() >= 2)
-        {
-            return await ExecuteMultiIndexJoinQueryAsync(sql, cancellationToken);
-        }
+            // Reduce-index query — a doc↔bridge↔index three-way join, recognised by the index↔bridge join
+            // "ON a.[Id] = b.[<X>Id]". Resolve via index → bridge → documents.
+            case ReaderRoute.ReduceJoin:
+                return await DocumentsOfAsync(shape, await GatherReduceDocumentIdsAsync(shape, cancellationToken), cancellationToken);
 
-        // An index join ("JOIN [index] AS a ON a.[DocumentId] = …") — whether flat (FirstOrDefault) or
-        // wrapped in a "(SELECT … GROUP BY …)" dedup subquery (ListAsync) — is an index query.
-        if (Regex.IsMatch(sql, @"join\s+\[[^\]]+\]\s+as\s+\w+\s+on\s+\w+\.\[DocumentId\]", RegexOptions.IgnoreCase))
-        {
-            return await ExecuteIndexJoinQueryAsync(sql, cancellationToken);
-        }
+            // Multi-index join across DISTINCT index tables (.With<I1>().With<I2>()) — intersect each index's
+            // DocumentId set (INNER JOIN = AND). The same index joined repeatedly (scope / boolean queries) stays on
+            // the single-index path, where its combined WHERE translates correctly.
+            case ReaderRoute.MultiIndexJoin:
+                return await DocumentsOfAsync(shape, await GatherMultiIndexDocumentIdsAsync(shape, cancellationToken), cancellationToken);
 
-        // A join onto a "(SELECT … )" subquery with no index inside is the document-by-type form of
-        // Query<T>().ListAsync().
-        if (Regex.IsMatch(sql, @"\bjoin\b", RegexOptions.IgnoreCase))
-        {
-            return await QueryDocumentsAsync(sql, cancellationToken);
-        }
+            // An index join ("JOIN [index] AS a ON a.[DocumentId] = …") — whether flat (FirstOrDefault) or wrapped in
+            // a "(SELECT … GROUP BY …)" dedup subquery (ListAsync) — is an index query.
+            case ReaderRoute.IndexJoin:
+                return await DocumentsOfAsync(shape, await GatherDocumentIdsAsync(shape, cancellationToken), cancellationToken);
 
-        // A non-join COUNT executed through a reader (e.g. raw Dapper QueryFirstOrDefaultAsync<int>) rather
-        // than ExecuteScalar — return the scalar count as a single "count" column so the reader yields it.
-        if (Regex.IsMatch(sql, @"\bcount\s*\(", RegexOptions.IgnoreCase))
-        {
-            var count = await CountItemsAsync(sql, cancellationToken);
-            return new CosmosDbDataReader(["count"], [[(object?)count]]);
-        }
+            // A join onto a "(SELECT … )" subquery with no index inside is the document-by-type form of
+            // Query<T>().ListAsync().
+            case ReaderRoute.DocumentsByJoin:
+            case ReaderRoute.Documents:
+                return await QueryDocumentsAsync(shape, cancellationToken);
 
-        if (StartsWith(sql.TrimStart(), "select"))
-        {
-            var table = ExtractTableAfter(sql, "from");
+            // A non-join COUNT executed through a reader (e.g. raw Dapper QueryFirstOrDefaultAsync<int>) rather than
+            // ExecuteScalar — return the scalar count as a single "count" column so the reader yields it.
+            case ReaderRoute.CountRow:
+                return new CosmosDbDataReader(["count"], [[(object?)await CountItemsAsync(shape, cancellationToken)]]);
 
-            // Scalar date-part projection: SELECT DateTimePart("<part>", [<col>]) FROM [<table>] — run it
-            // as a Cosmos VALUE query over the partition so the computed int is returned, not a raw column.
-            var dateFn = Regex.Match(sql, @"DateTimePart\(\s*""(\w+)""\s*,\s*\[(\w+)\]\s*\)", RegexOptions.IgnoreCase);
-            if (dateFn.Success)
-            {
-                return await ExecuteDatePartAsync(sql, table, dateFn.Groups[1].Value, dateFn.Groups[2].Value, cancellationToken);
-            }
+            // Scalar date-part projection: SELECT DateTimePart("<part>", [<col>]) FROM [<table>] — run it as a Cosmos
+            // VALUE query over the partition so the computed int is returned, not a raw column.
+            case ReaderRoute.DatePart:
+                return await ExecuteDatePartAsync(shape, cancellationToken);
 
-            if (IsDocumentTable(table))
-            {
-                // Load by id(s): WHERE [Id] = @Id / IN (…) — the only params are ids; point-read each.
-                if (Regex.IsMatch(sql, @"\[id\]\s*(=|in\b)", RegexOptions.IgnoreCase))
+            // Load by id(s): WHERE [Id] = @Id / IN (…) — the only params are ids; point-read each.
+            case ReaderRoute.DocumentsById:
+                var ids = new List<long>();
+                foreach (DbParameter p in _parameters)
                 {
-                    var ids = new List<long>();
-                    foreach (DbParameter p in _parameters)
+                    if (p.Value is not (null or DBNull))
                     {
-                        if (p.Value is not (null or DBNull))
-                        {
-                            ids.Add(Convert.ToInt64(p.Value));
-                        }
+                        ids.Add(Convert.ToInt64(p.Value));
                     }
-
-                    return new CosmosDbDataReader(DocumentColumns, await ReadDocumentRowsAsync(table, ids, cancellationToken));
                 }
 
-                // Otherwise a document query: all documents in the partition, optionally filtered by Type.
-                return await QueryDocumentsAsync(sql, cancellationToken);
-            }
+                return new CosmosDbDataReader(DocumentColumns, await ReadDocumentRowsAsync(shape.RequiredFromTable, ids, cancellationToken));
 
             // Index-row query: SELECT * FROM [index] AS a [WHERE …] [LIMIT n] → return index items.
-            return await QueryIndexRowsAsync(sql, table, cancellationToken);
+            default:
+                return await QueryIndexRowsAsync(shape, cancellationToken);
         }
+    }
 
-        throw new NotSupportedException($"Unsupported query statement: {CommandText}");
+    // The documents with the given ids, on the requested page of them, as the result of a query over the document table.
+    private async Task<DbDataReader> DocumentsOfAsync(SelectShape shape, List<long> documentIds, CancellationToken cancellationToken)
+    {
+        var rows = await ReadDocumentRowsAsync(shape.RequiredFromTable, PageOf(documentIds, shape), cancellationToken);
+        return new CosmosDbDataReader(DocumentColumns, rows);
     }
 
     // ---- sync path delegates to async ----
@@ -638,17 +282,19 @@ internal sealed partial class CosmosDbCommand : DbCommand
     private const int PointReadConcurrency = 8;
 
     // The ids on the requested page of an id list, after applying the statement's OFFSET and LIMIT.
-    private static List<long> PageOf(List<long> ids, string sql)
+    private static List<long> PageOf(List<long> ids, SelectShape shape)
     {
-        IEnumerable<long> page = ids.Skip(ExtractOffset(sql));
-        var limit = ExtractLimit(sql);
-        if (limit.HasValue)
+        IEnumerable<long> page = ids.Skip(ClampToInt(shape.Offset));
+        if (shape.Limit is { } limit)
         {
-            page = page.Take(limit.Value);
+            page = page.Take(ClampToInt(limit));
         }
 
         return page.ToList();
     }
+
+    // Paging counts beyond what a list can hold are the same as no bound.
+    private static int ClampToInt(long value) => (int)Math.Min(value, int.MaxValue);
 
     // Reads documents by id as result rows, in the order of ids; ids with no document are skipped. The reads run
     // concurrently up to a limit, since a page would otherwise cost one sequential round trip per document.
@@ -680,46 +326,32 @@ internal sealed partial class CosmosDbCommand : DbCommand
 
     // Parse an index-joined query and run the index lookup, returning distinct DocumentIds (ordered if
     // the query has an ORDER BY). Shared by the reader (then point-reads) and CountAsync.
-    private async Task<System.Collections.Generic.List<long>> GatherDocumentIdsAsync(string sql, CancellationToken cancellationToken)
+    private async Task<List<long>> GatherDocumentIdsAsync(SelectShape shape, CancellationToken cancellationToken)
     {
-        // Accept both the .With() form ("… = [Document].[Id]") and the raw SqlBuilder join form
-        // ("… = d.[Id]", aliased) so InnerJoin/LeftJoin/RightJoin over Document⋈Index parse.
-        var join = Regex.Match(sql,
-            @"join\s+\[([^\]]+)\]\s+as\s+(\w+)\s+on\s+\w+\.\[DocumentId\]\s*=\s*(?:\w+|\[[^\]]+\])\.\[Id\]",
-            RegexOptions.IgnoreCase);
+        // Accept both the .With() form ("… = [Document].[Id]") and the raw SqlBuilder join form ("… = d.[Id]",
+        // aliased) so InnerJoin/LeftJoin/RightJoin over Document⋈Index work.
+        var join = shape.LinkJoin ?? throw new NotSupportedException($"Unsupported join query: {CommandText}");
+        var indexTable = join.Table;
 
-        if (!join.Success)
-        {
-            throw new NotSupportedException($"Unsupported join query: {CommandText}");
-        }
-
-        var indexTable = join.Groups[1].Value;
-        var alias = join.Groups[2].Value;
-
-        // WHERE predicate over index columns → Cosmos predicate. Strip the document-Type predicate
-        // YesSql adds (it does not apply inside the index partition), then rewrite column refs.
-        _ = alias; // columns are rewritten generically by the writer
+        // WHERE predicate over index columns → Cosmos predicate. Strip the document-Type predicate YesSql adds (it
+        // does not apply inside the index partition), then rewrite column refs.
         var cosmosWhere = string.Empty;
-        var where = ExtractWhere(sql);
-        if (!string.IsNullOrWhiteSpace(where))
+        var predicate = SqlTree.WithoutDocumentTypePredicate(shape.Where);
+        if (predicate is not null)
         {
-            var predicate = SqlTree.WithoutDocumentTypePredicate(SqlParser.ParseExpression(where!));
-            if (predicate is not null)
-            {
-                cosmosWhere = await WriteWhereAsync(predicate, cancellationToken);
-            }
+            cosmosWhere = await WriteWhereAsync(predicate, cancellationToken);
         }
 
         // Ordering: Cosmos ORDER BY is case-sensitive and can't ORDER BY LOWER(...), so when the query is
         // ordered we fetch DocumentId + the order columns and sort client-side (case-insensitive, matching
         // the reference dialects). Unordered queries keep the cheap "SELECT VALUE c.DocumentId".
-        var orderTerms = ParseOrderTerms(sql);
+        var orderTerms = shape.Order;
         // DocumentId is already projected, so don't re-select it (Cosmos rejects the duplicate property).
         var extraOrderCols = orderTerms.Select(t => t.Column).Distinct()
-            .Where(col => col != RandomOrderColumn && !col.Equals("DocumentId", StringComparison.OrdinalIgnoreCase)).ToList();
+            .Where(col => col != SelectShape.RandomColumn && !col.Equals("DocumentId", StringComparison.OrdinalIgnoreCase)).ToList();
         var projection = orderTerms.Count == 0
             ? "VALUE c.DocumentId"
-            : "c.DocumentId" + string.Concat(extraOrderCols.Select(col => $", c[\"{col}\"]"));
+            : "c.DocumentId" + string.Concat(extraOrderCols.Select(col => ", " + CosmosExpressionWriter.Property(col)));
 
         var queryText = "SELECT " + projection + " FROM c WHERE " + Scoped(indexTable)
             + (cosmosWhere.Length > 0 ? " AND " + cosmosWhere : string.Empty);
@@ -766,24 +398,23 @@ internal sealed partial class CosmosDbCommand : DbCommand
             }
         }
 
-        // filterType:true adds a "[Document].[Type] = @p" predicate that StripDocTypePredicate removed (it
-        // can't run inside the index partition). Re-apply it: keep only gathered ids whose document has that
-        // exact Type. Without this, a Query<SubClass>(filterType:true) counts every subclass, not just one.
-        var typeMatch = where is null ? Match.Empty : Regex.Match(where, @"\[[^\]]+\]\.\[Type\]\s*=\s*@(\w+)", RegexOptions.IgnoreCase);
-        if (typeMatch.Success && documentIds.Count > 0)
+        // filterType:true adds a "[Document].[Type] = @p" predicate that WithoutDocumentTypePredicate removed (it can't
+        // run inside the index partition). Re-apply it: keep only gathered ids whose document has that exact Type.
+        // Without this, a Query<SubClass>(filterType:true) counts every subclass, not just one.
+        var typeParameter = SqlTree.DocumentTypeParameter(shape.Where);
+        if (typeParameter is not null && documentIds.Count > 0)
         {
-            var typeParam = typeMatch.Groups[1].Value;
             object? typeValue = null;
             foreach (DbParameter p in _parameters)
             {
-                if (p.ParameterName.TrimStart('@').Equals(typeParam, StringComparison.OrdinalIgnoreCase))
+                if (p.ParameterName.TrimStart('@').Equals(typeParameter, StringComparison.OrdinalIgnoreCase))
                 {
                     typeValue = p.Value is DBNull ? null : p.Value;
                     break;
                 }
             }
 
-            var docTable = ExtractTableAfter(sql, "from");
+            var docTable = shape.RequiredFromTable;
             var matching = new System.Collections.Generic.HashSet<long>();
             var typeQuery = new QueryDefinition("SELECT VALUE c.Id FROM c WHERE " + Scoped(docTable) + " AND c.Type = @__type AND ARRAY_CONTAINS(@__ids, c.Id)")
                 .WithParameter("@pk", PkValue(docTable))
@@ -804,82 +435,6 @@ internal sealed partial class CosmosDbCommand : DbCommand
         }
 
         return documentIds;
-    }
-
-    // Translate the SQL ORDER BY (which aggregates index columns as "MAX(a.[Col]) AS order_N" under the
-    // GROUP BY) into a Cosmos "ORDER BY c["Col"] [DESC]" clause.
-    // Parse the trailing ORDER BY into (column, descending) pairs for client-side sorting.
-    // Stands for the dialect's random-order clause among the parsed order terms. Cosmos cannot order by a function,
-    // so these terms are applied in the client.
-    private const string RandomOrderColumn = "$random";
-
-    private static readonly string RandomOrderClause = new CosmosDbDialect().RandomOrderByClause;
-
-    // The clause contains parentheses, which the ORDER BY parsing treats as the end of the list, so it is replaced
-    // by a plain token before parsing.
-    private const string RandomOrderToken = "__random__";
-
-    private static bool HasRandomOrder(string sql)
-        => ParseOrderTerms(sql).Any(term => term.Column == RandomOrderColumn);
-
-    private static System.Collections.Generic.List<(string Column, bool Desc)> ParseOrderTerms(string sql)
-    {
-        sql = sql.Replace(RandomOrderClause, RandomOrderToken, StringComparison.OrdinalIgnoreCase);
-
-        var result = new System.Collections.Generic.List<(string, bool)>();
-        var orderBys = Regex.Matches(sql, @"order\s+by\s+(.+?)(?:\boffset\b|\)|$)", RegexOptions.IgnoreCase | RegexOptions.Singleline);
-        if (orderBys.Count == 0)
-        {
-            return result;
-        }
-
-        var aliasToColumn = new System.Collections.Generic.Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-        foreach (Match m in Regex.Matches(sql, @"\(\s*\w+\.\[([^\]]+)\]\s*\)\s+as\s+(order_\d+)", RegexOptions.IgnoreCase))
-        {
-            aliasToColumn[m.Groups[2].Value] = m.Groups[1].Value;
-        }
-
-        foreach (Match m in Regex.Matches(sql, @"\(\s*" + RandomOrderToken + @"\s*\)\s+as\s+(order_\d+)", RegexOptions.IgnoreCase))
-        {
-            aliasToColumn[m.Groups[1].Value] = RandomOrderColumn;
-        }
-
-        foreach (var raw in orderBys[^1].Groups[1].Value.Split(','))
-        {
-            var term = raw.Trim();
-            if (term.Length == 0)
-            {
-                continue;
-            }
-
-            var desc = Regex.IsMatch(term, @"\bdesc\b", RegexOptions.IgnoreCase);
-            var expr = Regex.Replace(term, @"\s+(asc|desc)\b", string.Empty, RegexOptions.IgnoreCase).Trim();
-
-            string? column = null;
-            if (expr.Equals(RandomOrderToken, StringComparison.Ordinal))
-            {
-                column = RandomOrderColumn;
-            }
-            else if (aliasToColumn.TryGetValue(expr, out var mapped))
-            {
-                column = mapped;
-            }
-            else
-            {
-                var col = Regex.Match(expr, @"\[([^\]]+)\]");
-                if (col.Success)
-                {
-                    column = col.Groups[1].Value;
-                }
-            }
-
-            if (column != null)
-            {
-                result.Add((column, desc));
-            }
-        }
-
-        return result;
     }
 
     // Order comparison matching the reference dialects: nulls first, numbers numerically, everything else
@@ -904,11 +459,10 @@ internal sealed partial class CosmosDbCommand : DbCommand
     }
 
     // Stable client-side ordering of rows by the parsed order terms (shared by the index/join gatherers).
-    private static System.Collections.Generic.IEnumerable<JObject> OrderRows(
-        System.Collections.Generic.List<JObject> rows, System.Collections.Generic.List<(string Column, bool Desc)> orderTerms)
+    private static IEnumerable<JObject> OrderRows(List<JObject> rows, IReadOnlyList<OrderColumn> orderTerms)
     {
         // A random term sorts by a random key drawn once per row, so the order is consistent within one sort.
-        var randomKeys = orderTerms.Any(term => term.Column == RandomOrderColumn)
+        var randomKeys = orderTerms.Any(term => term.Column == SelectShape.RandomColumn)
             ? rows.Select(_ => Random.Shared.NextDouble()).ToArray()
             : null;
 
@@ -918,7 +472,7 @@ internal sealed partial class CosmosDbCommand : DbCommand
             {
                 foreach (var (column, desc) in orderTerms)
                 {
-                    var c = column == RandomOrderColumn
+                    var c = column == SelectShape.RandomColumn
                         ? randomKeys![x.Index].CompareTo(randomKeys[y.Index])
                         : CompareTokens(x.Row[column], y.Row[column]);
                     if (desc)
@@ -939,97 +493,41 @@ internal sealed partial class CosmosDbCommand : DbCommand
 
     // The ORDER BY and OFFSET/LIMIT clauses to run in Cosmos. A random order cannot be expressed in Cosmos, so the
     // rows are fetched unordered and unpaged and ordered and paged in the client.
-    private static string OrderAndPagingClause(string sql, bool random)
-        => random ? string.Empty : BuildOrderClause(sql) + BuildOffsetLimitClause(sql);
+    private static string OrderAndPagingClause(SelectShape shape)
+        => shape.HasRandomOrder ? string.Empty : OrderByClause(shape.Order) + OffsetLimitClause(shape);
 
     // Applies the statement's OFFSET and LIMIT to rows that are already in their final order.
-    private static IEnumerable<JObject> PageOfRows(IEnumerable<JObject> rows, string sql)
+    private static IEnumerable<JObject> PageOfRows(IEnumerable<JObject> rows, SelectShape shape)
     {
-        var page = rows.Skip(ExtractOffset(sql));
-        var limit = ExtractLimit(sql);
-        return limit.HasValue ? page.Take(limit.Value) : page;
+        var page = rows.Skip(ClampToInt(shape.Offset));
+        return shape.Limit is { } limit ? page.Take(ClampToInt(limit)) : page;
     }
 
-    private static string BuildOrderClause(string sql)
+    // "ORDER BY c["Col"] [DESC], ..." for the order columns, or nothing when there are none.
+    internal static string OrderByClause(IEnumerable<OrderColumn> order)
     {
-        var orderBys = Regex.Matches(sql, @"order\s+by\s+(.+?)(?:\boffset\b|\)|$)", RegexOptions.IgnoreCase | RegexOptions.Singleline);
-        if (orderBys.Count == 0)
-        {
-            return string.Empty;
-        }
-
-        // GROUP BY form aggregates the order column as "MAX(a.[Col]) AS order_N"; map alias → column.
-        var aliasToColumn = new System.Collections.Generic.Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-        foreach (Match m in Regex.Matches(sql, @"\(\s*\w+\.\[([^\]]+)\]\s*\)\s+as\s+(order_\d+)", RegexOptions.IgnoreCase))
-        {
-            aliasToColumn[m.Groups[2].Value] = m.Groups[1].Value;
-        }
-
-        var terms = new System.Collections.Generic.List<string>();
-        foreach (var raw in orderBys[orderBys.Count - 1].Groups[1].Value.Split(','))
-        {
-            var term = raw.Trim();
-            if (term.Length == 0)
-            {
-                continue;
-            }
-
-            var desc = Regex.IsMatch(term, @"\bdesc\b", RegexOptions.IgnoreCase);
-            var expr = Regex.Replace(term, @"\s+(asc|desc)\b", string.Empty, RegexOptions.IgnoreCase).Trim();
-
-            string? column = null;
-            if (aliasToColumn.TryGetValue(expr, out var mapped))
-            {
-                column = mapped;       // aggregate alias (order_N)
-            }
-            else
-            {
-                var col = Regex.Match(expr, @"\[([^\]]+)\]");   // direct column ref: alias.[Col] or [Col]
-                if (col.Success)
-                {
-                    column = col.Groups[1].Value;
-                }
-            }
-
-            if (column != null)
-            {
-                terms.Add($"c[\"{column}\"]" + (desc ? " DESC" : string.Empty));
-            }
-        }
-
+        var terms = order.Where(term => term.Column != SelectShape.RandomColumn)
+            .Select(term => CosmosExpressionWriter.Property(term.Column) + (term.Descending ? " DESC" : string.Empty))
+            .ToList();
         return terms.Count > 0 ? " ORDER BY " + string.Join(", ", terms) : string.Empty;
     }
 
-    private async Task<DbDataReader> ExecuteIndexJoinQueryAsync(string sql, CancellationToken cancellationToken)
-    {
-        var documentTable = Regex.Match(sql,
-            @"join\s+\[[^\]]+\]\s+as\s+\w+\s+on\s+\w+\.\[DocumentId\]\s*=\s*\[([^\]]+)\]\.\[Id\]",
-            RegexOptions.IgnoreCase).Groups[1].Value;
-
-        var documentIds = await GatherDocumentIdsAsync(sql, cancellationToken);
-
-        var rows = await ReadDocumentRowsAsync(documentTable, PageOf(documentIds, sql), cancellationToken);
-        return new CosmosDbDataReader(DocumentColumns, rows);
-    }
-
-    private static bool IsDocumentTable(string table) => table.EndsWith("Document", StringComparison.OrdinalIgnoreCase);
-
     // Count the matching DocumentIds for a COUNT over a join (reduce / multi-index / single-index). Shared
     // by the scalar path (CountAsync) and the reader path (raw Inner/Left/Right join count API).
-    private async Task<long> CountJoinAsync(string sql, CancellationToken cancellationToken)
+    private async Task<long> CountJoinAsync(SelectShape shape, CancellationToken cancellationToken)
     {
-        System.Collections.Generic.List<long> ids;
-        if (Regex.IsMatch(sql, @"\bon\s+\w+\.\[Id\]\s*=\s*\w+\.\[\w+Id\]", RegexOptions.IgnoreCase))
+        List<long> ids;
+        if (shape.HasReduceJoin)
         {
-            ids = await GatherReduceDocumentIdsAsync(sql, cancellationToken);
+            ids = await GatherReduceDocumentIdsAsync(shape, cancellationToken);
         }
-        else if (IndexJoinTables(sql).Distinct().Count() >= 2)
+        else if (shape.IndexJoins.Select(join => join.Table).Distinct().Count() >= 2)
         {
-            ids = await GatherMultiIndexDocumentIdsAsync(sql, cancellationToken);
+            ids = await GatherMultiIndexDocumentIdsAsync(shape, cancellationToken);
         }
         else
         {
-            ids = await GatherDocumentIdsAsync(sql, cancellationToken);
+            ids = await GatherDocumentIdsAsync(shape, cancellationToken);
         }
 
         return ids.Count;
@@ -1037,11 +535,10 @@ internal sealed partial class CosmosDbCommand : DbCommand
 
     // Count items in a partition: SELECT count(...) FROM [<table>] [WHERE <predicate>]. Shared by the
     // scalar path (CountAsync) and the reader path (raw Dapper QueryFirstOrDefaultAsync<int>).
-    private async Task<long> CountItemsAsync(string sql, CancellationToken cancellationToken)
+    private async Task<long> CountItemsAsync(SelectShape shape, CancellationToken cancellationToken)
     {
-        var table = ExtractTableAfter(sql, "from");
-        var where = ExtractWhere(sql);
-        var cosmosWhere = string.IsNullOrWhiteSpace(where) ? string.Empty : " AND " + await TranslateWhereAsync(where!, cancellationToken);
+        var table = shape.RequiredFromTable;
+        var cosmosWhere = shape.Where is null ? string.Empty : " AND " + await WriteWhereAsync(shape.Where, cancellationToken);
 
         var queryDef = new QueryDefinition("SELECT VALUE COUNT(1) FROM c WHERE " + Scoped(table) + cosmosWhere)
             .WithParameter("@pk", PkValue(table));
@@ -1060,99 +557,14 @@ internal sealed partial class CosmosDbCommand : DbCommand
         return 0L;
     }
 
-    // Split a comma-separated list at top level, respecting single-quoted strings and nested parentheses.
-    private static System.Collections.Generic.List<string> SplitTopLevelCommas(string s)
-    {
-        var parts = new System.Collections.Generic.List<string>();
-        var depth = 0;
-        var inString = false;
-        var start = 0;
-        for (var i = 0; i < s.Length; i++)
-        {
-            var ch = s[i];
-            if (ch == '\'')
-            {
-                inString = !inString;
-            }
-            else if (!inString && ch == '(')
-            {
-                depth++;
-            }
-            else if (!inString && ch == ')')
-            {
-                depth--;
-            }
-            else if (!inString && depth == 0 && ch == ',')
-            {
-                parts.Add(s[start..i]);
-                start = i + 1;
-            }
-        }
-
-        parts.Add(s[start..]);
-        return parts;
-    }
-
-    // Parse a SQL literal (quoted string, number, bool, or NULL) into a JToken.
-    private static JToken ParseSqlLiteral(string raw)
-    {
-        raw = raw.Trim();
-        if (raw.Equals("null", StringComparison.OrdinalIgnoreCase))
-        {
-            return JValue.CreateNull();
-        }
-
-        if (raw.Length >= 2 && raw[0] == '\'' && raw[^1] == '\'')
-        {
-            return new JValue(raw[1..^1].Replace("''", "'"));
-        }
-
-        if (raw.Equals("true", StringComparison.OrdinalIgnoreCase) || raw.Equals("false", StringComparison.OrdinalIgnoreCase))
-        {
-            return new JValue(bool.Parse(raw));
-        }
-
-        if (long.TryParse(raw, out var l))
-        {
-            return new JValue(l);
-        }
-
-        if (double.TryParse(raw, System.Globalization.NumberStyles.Any, System.Globalization.CultureInfo.InvariantCulture, out var d))
-        {
-            return new JValue(d);
-        }
-
-        return new JValue(raw);
-    }
-
-    internal static string? ExtractWhere(string sql)
-    {
-        var m = Regex.Match(sql, @"\bwhere\b(.*?)(?:\bgroup\s+by\b|\border\s+by\b|\blimit\b|\boffset\b|\)\s*as\b|;|$)",
-            RegexOptions.IgnoreCase | RegexOptions.Singleline);
-        return m.Success ? m.Groups[1].Value.Trim().TrimEnd(';').Trim() : null;
-    }
-
-    private static int? ExtractLimit(string sql)
-    {
-        var m = Regex.Match(sql, @"\blimit\s+(\d+)", RegexOptions.IgnoreCase);
-        return m.Success ? int.Parse(m.Groups[1].Value) : (int?)null;
-    }
-
-    private static int ExtractOffset(string sql)
-    {
-        var m = Regex.Match(sql, @"\boffset\s+(\d+)", RegexOptions.IgnoreCase);
-        return m.Success ? int.Parse(m.Groups[1].Value) : 0;
-    }
-
     // Push paging into the Cosmos query (OFFSET ... LIMIT) so only the requested page is returned instead of every
     // matching item. Cosmos requires OFFSET and LIMIT together; ORDER BY is optional and appended separately.
-    private static string BuildOffsetLimitClause(string sql)
+    private static string OffsetLimitClause(SelectShape shape)
     {
-        var limit = ExtractLimit(sql);
-        var offset = ExtractOffset(sql);
-        if (limit.HasValue)
+        var offset = ClampToInt(shape.Offset);
+        if (shape.Limit is { } limit)
         {
-            return $" OFFSET {offset} LIMIT {limit.Value}";
+            return $" OFFSET {offset} LIMIT {ClampToInt(limit)}";
         }
 
         // Bare OFFSET with no LIMIT (e.g. .Skip(n) without .Take(...)): Cosmos rejects OFFSET on its own, so
@@ -1161,25 +573,18 @@ internal sealed partial class CosmosDbCommand : DbCommand
     }
 
     // Query<T>() — all documents in the partition, optionally filtered by Type.
-    private async Task<DbDataReader> QueryDocumentsAsync(string sql, CancellationToken cancellationToken)
+    private async Task<DbDataReader> QueryDocumentsAsync(SelectShape shape, CancellationToken cancellationToken)
     {
-        var docTable = ExtractTableAfter(sql, "from");
+        var docTable = shape.RequiredFromTable;
 
         // Type filter: YesSql usually binds @Type, but some callers (e.g. Orchard's QueriesDocument
         // migration) embed a [Type] = '<literal>' directly in the WHERE. Honour both, otherwise the
         // filter is silently dropped and the query returns the wrong document(s).
         object? typeFilter = TryParam("Type", out var typeVal) ? typeVal : null;
-        if (typeFilter is null)
-        {
-            var lit = Regex.Match(sql, @"\[Type\]\s*=\s*'([^']*)'", RegexOptions.IgnoreCase);
-            if (lit.Success)
-            {
-                typeFilter = lit.Groups[1].Value;
-            }
-        }
+        typeFilter ??= SqlTree.TypeLiteral(shape.Where);
 
-        var random = HasRandomOrder(sql);
-        var queryDef = new QueryDefinition("SELECT * FROM c WHERE " + Scoped(docTable) + (typeFilter is not null ? " AND c.Type = @Type" : string.Empty) + OrderAndPagingClause(sql, random))
+        var random = shape.HasRandomOrder;
+        var queryDef = new QueryDefinition("SELECT * FROM c WHERE " + Scoped(docTable) + (typeFilter is not null ? " AND c.Type = @Type" : string.Empty) + OrderAndPagingClause(shape))
             .WithParameter("@pk", PkValue(docTable));
         if (typeFilter is not null)
         {
@@ -1200,26 +605,13 @@ internal sealed partial class CosmosDbCommand : DbCommand
         }
 
         // Cosmos applied ORDER BY and OFFSET/LIMIT, so items is already the page, unless the order is random.
-        IEnumerable<JObject> page = random ? PageOfRows(OrderRows(items, ParseOrderTerms(sql)), sql) : items;
+        IEnumerable<JObject> page = random ? PageOfRows(OrderRows(items, shape.Order), shape) : items;
 
         // Honour the SELECT projection. Dapper reads result columns positionally, so a single-column
         // projection (e.g. "SELECT [Content]") must return exactly that column — returning the full
         // document row would make Dapper read [Id] (a number) where [Content] (a string) was asked for.
-        var columns = ExtractDocumentSelectColumns(sql) ?? DocumentColumns;
+        var columns = shape.Projection?.ToArray() ?? DocumentColumns;
         return new CosmosDbDataReader(columns, page.Select(item => ProjectRow(item, columns)).ToList());
-    }
-
-    // The document columns a SELECT projects, or null for "*" / "alias.*" (→ all DocumentColumns).
-    private static string[]? ExtractDocumentSelectColumns(string sql)
-    {
-        var m = Regex.Match(sql, @"select\s+(.*?)\s+from\b", RegexOptions.IgnoreCase | RegexOptions.Singleline);
-        if (!m.Success || m.Groups[1].Value.Contains('*'))
-        {
-            return null;
-        }
-
-        var cols = Regex.Matches(m.Groups[1].Value, @"\[(\w+)\]").Select(x => x.Groups[1].Value).ToArray();
-        return cols.Length > 0 ? cols : null;
     }
 
     // Project a document item onto the requested columns (numeric Id/Version as long, others as string).
@@ -1238,12 +630,18 @@ internal sealed partial class CosmosDbCommand : DbCommand
 
     // Run a "SELECT DateTimePart(\"part\", [col]) FROM [table]" projection as a Cosmos VALUE query over the
     // partition, returning the computed integer(s) under a single column named after the part.
-    private async Task<DbDataReader> ExecuteDatePartAsync(string sql, string table, string part, string column, CancellationToken cancellationToken)
+    private async Task<DbDataReader> ExecuteDatePartAsync(SelectShape shape, CancellationToken cancellationToken)
     {
-        var where = ExtractWhere(sql);
-        var cosmosWhere = string.IsNullOrWhiteSpace(where) ? string.Empty : " AND " + await TranslateWhereAsync(where!, cancellationToken);
+        var (part, column) = shape.DatePart!.Value;
+        if (part.Length == 0 || !part.All(char.IsAsciiLetter))
+        {
+            throw new SqlSyntaxException($"DateTimePart does not support the part \"{part}\"", CommandText);
+        }
 
-        var queryDef = new QueryDefinition($"SELECT VALUE DateTimePart(\"{part}\", c.{column}) FROM c WHERE " + Scoped(table) + cosmosWhere)
+        var table = shape.RequiredFromTable;
+        var cosmosWhere = shape.Where is null ? string.Empty : " AND " + await WriteWhereAsync(shape.Where, cancellationToken);
+
+        var queryDef = new QueryDefinition($"SELECT VALUE DateTimePart(\"{part}\", {CosmosExpressionWriter.Property(column)}) FROM c WHERE " + Scoped(table) + cosmosWhere)
             .WithParameter("@pk", PkValue(table));
         queryDef = BindParameters(queryDef);
 
@@ -1264,13 +662,13 @@ internal sealed partial class CosmosDbCommand : DbCommand
     }
 
     // Query<TIndex>() — return the index rows themselves (dynamic columns from the index fields).
-    private async Task<DbDataReader> QueryIndexRowsAsync(string sql, string indexTable, CancellationToken cancellationToken)
+    private async Task<DbDataReader> QueryIndexRowsAsync(SelectShape shape, CancellationToken cancellationToken)
     {
-        var where = ExtractWhere(sql);
-        var cosmosWhere = string.IsNullOrWhiteSpace(where) ? string.Empty : " AND " + await TranslateWhereAsync(where!, cancellationToken);
+        var indexTable = shape.RequiredFromTable;
+        var cosmosWhere = shape.Where is null ? string.Empty : " AND " + await WriteWhereAsync(shape.Where, cancellationToken);
 
-        var random = HasRandomOrder(sql);
-        var queryDef = new QueryDefinition("SELECT * FROM c WHERE " + Scoped(indexTable) + cosmosWhere + OrderAndPagingClause(sql, random))
+        var random = shape.HasRandomOrder;
+        var queryDef = new QueryDefinition("SELECT * FROM c WHERE " + Scoped(indexTable) + cosmosWhere + OrderAndPagingClause(shape))
             .WithParameter("@pk", PkValue(indexTable));
         queryDef = BindParameters(queryDef);
 
@@ -1288,7 +686,7 @@ internal sealed partial class CosmosDbCommand : DbCommand
         }
 
         // Cosmos applied ORDER BY and OFFSET/LIMIT, so all is already the page, unless the order is random.
-        var items = random ? PageOfRows(OrderRows(all, ParseOrderTerms(sql)), sql).ToList() : all;
+        var items = random ? PageOfRows(OrderRows(all, shape.Order), shape).ToList() : all;
         var columns = new List<string>();
         foreach (var item in items)
         {
@@ -1311,21 +709,12 @@ internal sealed partial class CosmosDbCommand : DbCommand
         return new CosmosDbDataReader(cols, rows);
     }
 
-    private static List<(string Table, string Alias)> IndexJoins(string sql)
-        => Regex.Matches(sql, @"join\s+\[([^\]]+)\]\s+as\s+(\w+)\s+on\s+\w+\.\[DocumentId\]\s*=\s*\[[^\]]+\]\.\[Id\]", RegexOptions.IgnoreCase)
-            .Select(m => (m.Groups[1].Value, m.Groups[2].Value)).ToList();
-
-    private static IEnumerable<string> IndexJoinTables(string sql) => IndexJoins(sql).Select(j => j.Table);
-
     // Multi-index join across distinct index tables: query each index's DocumentId set (filtered by its
     // own aliases' predicates) and intersect them.
-    private async Task<List<long>> GatherMultiIndexDocumentIdsAsync(string sql, CancellationToken cancellationToken)
+    private async Task<List<long>> GatherMultiIndexDocumentIdsAsync(SelectShape shape, CancellationToken cancellationToken)
     {
-        var joins = IndexJoins(sql);
-        var where = ExtractWhere(sql);
-        var terms = string.IsNullOrWhiteSpace(where)
-            ? SqlTree.Conjuncts(null)
-            : SqlTree.Conjuncts(SqlTree.WithoutDocumentTypePredicate(SqlParser.ParseExpression(where!)));
+        var joins = shape.IndexJoins;
+        var terms = SqlTree.Conjuncts(SqlTree.WithoutDocumentTypePredicate(shape.Where));
 
         List<long>? result = null;
         foreach (var group in joins.GroupBy(j => j.Table))
@@ -1357,16 +746,16 @@ internal sealed partial class CosmosDbCommand : DbCommand
 
         // Order across the joined indexes (Cosmos can't ORDER BY case-insensitively). The order column(s)
         // live in one of the joined index tables; gather their values per DocumentId, then sort client-side.
-        var orderTerms = ParseOrderTerms(sql);
+        var orderTerms = shape.Order;
         if (orderTerms.Count > 0 && documentIds.Count > 0)
         {
             var orderCols = orderTerms.Select(t => t.Column).Distinct()
-                .Where(col => col != RandomOrderColumn && !col.Equals("DocumentId", StringComparison.OrdinalIgnoreCase)).ToList();
+                .Where(col => col != SelectShape.RandomColumn && !col.Equals("DocumentId", StringComparison.OrdinalIgnoreCase)).ToList();
             var randomKeys = documentIds.ToDictionary(id => id, _ => Random.Shared.NextDouble());
             var orderValues = new Dictionary<long, JObject>();
             foreach (var group in joins.GroupBy(j => j.Table))
             {
-                var projection = "c.DocumentId" + string.Concat(orderCols.Select(col => $", c[\"{col}\"]"));
+                var projection = "c.DocumentId" + string.Concat(orderCols.Select(col => ", " + CosmosExpressionWriter.Property(col)));
                 var orderQuery = new QueryDefinition("SELECT " + projection + " FROM c WHERE " + Scoped(group.Key) + " AND ARRAY_CONTAINS(@__ids, c.DocumentId)")
                     .WithParameter("@pk", PkValue(group.Key))
                     .WithParameter("@__ids", documentIds);
@@ -1402,7 +791,7 @@ internal sealed partial class CosmosDbCommand : DbCommand
                     orderValues.TryGetValue(y.Id, out var yv);
                     foreach (var (column, desc) in orderTerms)
                     {
-                        var c = column == RandomOrderColumn
+                        var c = column == SelectShape.RandomColumn
                             ? randomKeys[x.Id].CompareTo(randomKeys[y.Id])
                             : column.Equals("DocumentId", StringComparison.OrdinalIgnoreCase)
                                 ? x.Id.CompareTo(y.Id)
@@ -1427,59 +816,44 @@ internal sealed partial class CosmosDbCommand : DbCommand
         return documentIds;
     }
 
-    private async Task<DbDataReader> ExecuteMultiIndexJoinQueryAsync(string sql, CancellationToken cancellationToken)
-    {
-        var documentTable = ExtractTableAfter(sql, "from");
-        var documentIds = await GatherMultiIndexDocumentIdsAsync(sql, cancellationToken);
-
-        var rows = await ReadDocumentRowsAsync(documentTable, PageOf(documentIds, sql), cancellationToken);
-        return new CosmosDbDataReader(DocumentColumns, rows);
-    }
-
     // Reduce-index query: doc ← bridge → index. Resolve in three steps — matching index Ids, then the
     // bridge rows linking them to documents, then the document ids.
-    private async Task<List<long>> GatherReduceDocumentIdsAsync(string sql, CancellationToken cancellationToken)
+    private async Task<List<long>> GatherReduceDocumentIdsAsync(SelectShape shape, CancellationToken cancellationToken)
     {
-        // index↔bridge join: "JOIN [Index] AS idx ON idx.[Id] = <bridgeAlias>.[<FK>]". Capture the bridge
-        // alias so we pick the RIGHT bridge — a query may also join plain map indexes (.With<Map>()) whose
-        // "[DocumentId] = [Document].[Id]" join looks identical to the reduce bridge's.
-        var index = Regex.Match(sql, @"join\s+\[([^\]]+)\]\s+as\s+(\w+)\s+on\s+\w+\.\[Id\]\s*=\s*(\w+)\.\[(\w+)\]", RegexOptions.IgnoreCase);
-        if (!index.Success)
+        // index↔bridge join: "JOIN [Index] AS idx ON idx.[Id] = <bridgeAlias>.[<FK>]". The bridge alias picks the RIGHT
+        // bridge — a query may also join plain map indexes (.With<Map>()) whose "[DocumentId] = [Document].[Id]" join
+        // looks identical to the reduce bridge's.
+        var reduce = shape.Reduce;
+        if (reduce?.BridgeTable is null)
         {
             throw new NotSupportedException($"Unsupported reduce query: {CommandText}");
         }
 
-        var indexTable = index.Groups[1].Value;
-        var bridgeAlias = index.Groups[3].Value;
-        var bridgeForeignKey = index.Groups[4].Value;
+        var indexTable = reduce.IndexTable;
+        var bridgeAlias = reduce.BridgeAlias;
+        var bridgeForeignKey = reduce.BridgeColumn;
+        var bridgeTable = reduce.BridgeTable;
 
-        var bridge = Regex.Match(sql, @"join\s+\[([^\]]+)\]\s+as\s+" + Regex.Escape(bridgeAlias) + @"\s+on\s+" + Regex.Escape(bridgeAlias) + @"\.\[DocumentId\]\s*=\s*(?:\w+|\[[^\]]+\])\.\[Id\]", RegexOptions.IgnoreCase);
-        if (!bridge.Success)
-        {
-            throw new NotSupportedException($"Unsupported reduce query: {CommandText}");
-        }
-
-        var bridgeTable = bridge.Groups[1].Value;
-
-        var where = ExtractWhere(sql);
         var indexWhere = string.Empty;
-        if (!string.IsNullOrWhiteSpace(where))
+        var predicate = SqlTree.WithoutDocumentTypePredicate(shape.Where);
+        if (predicate is not null)
         {
-            var predicate = SqlTree.WithoutDocumentTypePredicate(SqlParser.ParseExpression(where!));
-            if (predicate is not null)
-            {
-                indexWhere = " AND " + await WriteWhereAsync(predicate, cancellationToken);
-            }
+            indexWhere = " AND " + await WriteWhereAsync(predicate, cancellationToken);
         }
 
         // 1. matching index rows, with the columns the query orders by. The order columns belong to the reduce
         // index, so documents are ordered by the index row they belong to.
-        var orderTerms = ParseOrderTerms(sql);
+        var orderTerms = shape.Order;
+        if (orderTerms.Any(term => term.Column.Equals("DocumentId", StringComparison.OrdinalIgnoreCase)))
+        {
+            throw new NotSupportedException($"Ordering the documents of a reduce index query by document id is not supported: {CommandText}");
+        }
+
         var orderColumns = orderTerms.Select(t => t.Column)
-            .Where(col => col != RandomOrderColumn && !col.Equals("Id", StringComparison.OrdinalIgnoreCase)
+            .Where(col => col != SelectShape.RandomColumn && !col.Equals("Id", StringComparison.OrdinalIgnoreCase)
                 && !col.Equals("DocumentId", StringComparison.OrdinalIgnoreCase))
             .Distinct().ToList();
-        var indexProjection = "c.Id" + string.Concat(orderColumns.Select(col => $", c[\"{col}\"]"));
+        var indexProjection = "c.Id" + string.Concat(orderColumns.Select(col => ", " + CosmosExpressionWriter.Property(col)));
         var indexQuery = new QueryDefinition("SELECT " + indexProjection + " FROM c WHERE " + Scoped(indexTable) + indexWhere).WithParameter("@pk", PkValue(indexTable));
         indexQuery = BindParameters(indexQuery);
 
@@ -1539,7 +913,7 @@ internal sealed partial class CosmosDbCommand : DbCommand
 
         // A reduce query may also join plain map indexes (.With<Map>().With<Reduce>()). Intersect: keep only
         // documents that also have a row in each such map index (the bridge itself is excluded by alias).
-        foreach (var (mapTable, mapAlias) in IndexJoins(sql))
+        foreach (var (mapTable, mapAlias, _) in shape.IndexJoins)
         {
             if (documentIds.Count == 0 || mapAlias.Equals(bridgeAlias, StringComparison.OrdinalIgnoreCase))
             {
@@ -1564,15 +938,6 @@ internal sealed partial class CosmosDbCommand : DbCommand
         }
 
         return documentIds;
-    }
-
-    private async Task<DbDataReader> ExecuteReduceJoinQueryAsync(string sql, CancellationToken cancellationToken)
-    {
-        var documentTable = Regex.Match(sql, @"from\s+\[([^\]]+)\]", RegexOptions.IgnoreCase).Groups[1].Value;
-        var documentIds = await GatherReduceDocumentIdsAsync(sql, cancellationToken);
-
-        var rows = await ReadDocumentRowsAsync(documentTable, PageOf(documentIds, sql), cancellationToken);
-        return new CosmosDbDataReader(DocumentColumns, rows);
     }
 
     // Monotonic, never-reused id allocator for index rows (auto-increment has no Cosmos equivalent, and
@@ -1671,29 +1036,6 @@ internal sealed partial class CosmosDbCommand : DbCommand
         return token.ToObject<object>();
     }
 
-    // Resolve a value token that is either a SQL string literal ('… with '' escapes') or a bound @parameter,
-    // to its string value (null for a NULL literal or a null parameter). Used by the REPLACE-update path.
-    private string? ResolveSqlValue(string token)
-    {
-        token = token.Trim();
-        if (token.Length == 0 || token.Equals("null", StringComparison.OrdinalIgnoreCase))
-        {
-            return null;
-        }
-
-        if (token[0] == '@')
-        {
-            return TryParam(token.TrimStart('@'), out var value) ? value?.ToString() : null;
-        }
-
-        if (token.Length >= 2 && token[0] == '\'' && token[^1] == '\'')
-        {
-            return token[1..^1].Replace("''", "'");
-        }
-
-        return token;
-    }
-
     private object? Param(string name)
         => TryParam(name, out var value) ? value : throw new InvalidOperationException($"Parameter '{name}' not found for: {CommandText}");
 
@@ -1710,22 +1052,5 @@ internal sealed partial class CosmosDbCommand : DbCommand
 
         value = null;
         return false;
-    }
-
-    private static bool StartsWith(string sql, string keyword)
-        => sql.StartsWith(keyword, StringComparison.OrdinalIgnoreCase);
-
-    // First bracketed token in the statement (table appears before columns for insert/update/delete).
-    private static string ExtractTable(string sql)
-    {
-        var m = Regex.Match(sql, @"\[([^\]]+)\]");
-        return m.Success ? m.Groups[1].Value : throw new InvalidOperationException($"No table in: {sql}");
-    }
-
-    // First bracketed token following a keyword (e.g. the table after 'from').
-    private static string ExtractTableAfter(string sql, string keyword)
-    {
-        var m = Regex.Match(sql, keyword + @"\s+\[([^\]]+)\]", RegexOptions.IgnoreCase);
-        return m.Success ? m.Groups[1].Value : ExtractTable(sql);
     }
 }

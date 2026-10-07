@@ -71,10 +71,29 @@ public sealed class CosmosDbOptions
         _ = ParsePartitionKeyProperty(PartitionKeyPath);
     }
 
+    // "/" followed by a name of ASCII letters, digits and underscores that does not start with a digit.
+    private static bool IsSingleSegmentPath(string path)
+    {
+        if (path.Length < 2 || path[0] != '/' || char.IsAsciiDigit(path[1]))
+        {
+            return false;
+        }
+
+        foreach (var c in path.AsSpan(1))
+        {
+            if (!char.IsAsciiLetterOrDigit(c) && c != '_')
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
     private static string ParsePartitionKeyProperty(string? path)
     {
         // A single path segment made of identifier characters keeps the property name safe to embed in queries.
-        if (path is null || !System.Text.RegularExpressions.Regex.IsMatch(path, @"^/[A-Za-z_][A-Za-z0-9_]*$"))
+        if (path is null || !IsSingleSegmentPath(path))
         {
             throw new ArgumentException(
                 $"PartitionKeyPath '{path}' is not supported. Use a single-level path such as '/pk' or '/tenantId'.",

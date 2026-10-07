@@ -28,6 +28,8 @@
     <None Include="Sql\statements.sql" CopyToOutputDirectory="PreserveNewest" />
     <!-- Each WHERE clause in the corpus with the predicate the regex translator produced for it. -->
     <None Include="Sql\where-translations.tsv" CopyToOutputDirectory="PreserveNewest" />
+    <!-- Each statement in the corpus with what the regex implementation extracted from it: its tables, joins, predicate, ordering and paging. -->
+    <None Include="Sql\statement-shapes.tsv" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 
 </Project>
