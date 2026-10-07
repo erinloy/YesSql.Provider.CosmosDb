@@ -23,4 +23,9 @@
     <ProjectReference Include="..\..\src\YesSql.Provider.CosmosDb\YesSql.Provider.CosmosDb.csproj" />
   </ItemGroup>
 
+  <ItemGroup>
+    <!-- The statements YesSql, its test suites and Orchard Core send to the provider, with parameter values removed. -->
+    <None Include="Sql\statements.sql" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
 </Project>
