@@ -2,7 +2,7 @@
 
 All notable changes are listed here. The project is in preview, so minor versions may change behavior.
 
-## Unreleased
+## 0.1.5
 
 ### Fixed
 - Concurrent saves could fail with `Could not allocate a sequence id`. Each index row id was taken with a read and a conditional write on one counter document per table, and writers that shared a counter collided and retried 16 times. At the emulator's latency that was rare, but on a real account (about 60 ms per round trip) 16 concurrent sessions exhausted the retries. Ids are now reserved 32 at a time and handed out from memory, so most inserts never touch the counter. Ids remain unique across processes and across versions that share a database, but a restart leaves a gap of up to 31 unused ids. A save also makes about 25% fewer requests: 6 instead of 8 for a document with a map and a reduce index, measured on a real account.
