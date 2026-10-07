@@ -843,12 +843,11 @@ internal sealed partial class CosmosDbCommand : DbCommand
 
         // 1. matching index rows, with the columns the query orders by. The order columns belong to the reduce
         // index, so documents are ordered by the index row they belong to.
-        var orderTerms = shape.Order;
-        if (orderTerms.Any(term => term.Column.Equals("DocumentId", StringComparison.OrdinalIgnoreCase)))
-        {
-            throw new NotSupportedException($"Ordering the documents of a reduce index query by document id is not supported: {CommandText}");
-        }
-
+        // A term for the id of the document (YesSql adds one so that paging is stable) is not a column of the index. It
+        // orders the documents that the index rows before it leave tied, so the terms after it never apply.
+        var allTerms = shape.Order;
+        var documentIdAt = allTerms.ToList().FindIndex(term => term.Column.Equals("DocumentId", StringComparison.OrdinalIgnoreCase));
+        var orderTerms = documentIdAt < 0 ? allTerms : allTerms.Take(documentIdAt).ToList();
         var orderColumns = orderTerms.Select(t => t.Column)
             .Where(col => col != SelectShape.RandomColumn && !col.Equals("Id", StringComparison.OrdinalIgnoreCase)
                 && !col.Equals("DocumentId", StringComparison.OrdinalIgnoreCase))
@@ -900,16 +899,34 @@ internal sealed partial class CosmosDbCommand : DbCommand
             }
         }
 
-        // Documents follow their index row's position, and a document in several index rows takes the first.
-        var documentIds = new List<long>();
-        var seenDocumentIds = new HashSet<long>();
-        foreach (var (documentId, _) in bridgeRows.OrderBy(row => row.Position))
+        // Documents follow their index row's position, and a document in several index rows takes the first. Documents
+        // at the same position (all of them, when the only order is the document id) are ordered by their id.
+        var firstPosition = new Dictionary<long, int>();
+        foreach (var (documentId, position) in bridgeRows)
         {
-            if (seenDocumentIds.Add(documentId))
+            if (!firstPosition.TryGetValue(documentId, out var known) || position < known)
             {
-                documentIds.Add(documentId);
+                firstPosition[documentId] = position;
             }
         }
+
+        // Ties are broken by document id, ascending unless the query asked for it descending, so that the same query
+        // always returns the same order and pages never repeat or skip a document. With no index column before the
+        // document id, the index rows give no order, so the position is not used.
+        var idDescending = documentIdAt >= 0 && allTerms[documentIdAt].Descending;
+        var byIndexOrder = documentIdAt < 0 || orderTerms.Count > 0;
+        IEnumerable<KeyValuePair<long, int>> placed;
+        if (byIndexOrder)
+        {
+            var byPosition = firstPosition.OrderBy(pair => pair.Value);
+            placed = idDescending ? byPosition.ThenByDescending(pair => pair.Key) : byPosition.ThenBy(pair => pair.Key);
+        }
+        else
+        {
+            placed = idDescending ? firstPosition.OrderByDescending(pair => pair.Key) : firstPosition.OrderBy(pair => pair.Key);
+        }
+
+        var documentIds = placed.Select(pair => pair.Key).ToList();
 
         // A reduce query may also join plain map indexes (.With<Map>().With<Reduce>()). Intersect: keep only
         // documents that also have a row in each such map index (the bridge itself is excluded by alias).
