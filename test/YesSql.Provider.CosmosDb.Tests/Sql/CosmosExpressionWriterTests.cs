@@ -56,6 +56,10 @@ public class CosmosExpressionWriterTests
             Write("[a] IN (@p0, 2, 's') AND [b] NOT IN (1.5) AND [c] = NULL").Text);
 
     [Fact]
+    public void Booleans_are_written_directly()
+        => Assert.Equal("c[\"a\"] = true AND c[\"b\"] = false", Write("[a] = TRUE AND [b] = false").Text);
+
+    [Fact]
     public void A_date_column_compared_with_a_date_parameter_is_compared_by_instant_in_either_order()
     {
         Assert.Equal("DateTimeToTimestamp(c[\"d\"]) >= DateTimeToTimestamp(@when) AND c[\"n\"] = @other",

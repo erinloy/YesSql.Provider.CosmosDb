@@ -379,13 +379,19 @@ internal sealed partial class SqlParser
         }
     }
 
-    // NULL, a function call, or alias.[Column].
+    // NULL, TRUE, FALSE, a function call, or alias.[Column].
     private SqlExpr ParseWordPrimary(SqlToken token)
     {
         if (token.IsWord("null"))
         {
             _index++;
             return new LiteralExpr(null);
+        }
+
+        if (token.IsWord("true") || token.IsWord("false"))
+        {
+            _index++;
+            return new LiteralExpr(token.IsWord("true"));
         }
 
         var next = _index + 1 < _tokens.Count ? _tokens[_index + 1] : (SqlToken?)null;

@@ -65,6 +65,108 @@ internal static class SqlTree
         }
     }
 
+    /// <summary>
+    /// The name of the parameter in the <c>[Document].[Type] = @p</c> term that <see cref="WithoutDocumentTypePredicate"/>
+    /// removes, or null when there is none. It is found the same way, by shape and only under <c>AND</c>.
+    /// </summary>
+    public static string? DocumentTypeParameter(SqlExpr? predicate)
+    {
+        switch (predicate)
+        {
+            case BinaryExpr { Operator: "=", Left: ColumnRef { QualifierIsTable: true, Name: var name }, Right: ParamRef parameter }
+                when name.Equals("Type", StringComparison.OrdinalIgnoreCase):
+                return parameter.Name;
+
+            case LogicalExpr { IsAnd: true } and:
+                return and.Terms.Select(DocumentTypeParameter).FirstOrDefault(found => found is not null);
+
+            case ParenExpr paren:
+                return DocumentTypeParameter(paren.Inner);
+
+            default:
+                return null;
+        }
+    }
+
+    /// <summary>The first <c>[Type] = 'literal'</c> comparison anywhere in the predicate, whatever its qualifier, or null.</summary>
+    public static string? TypeLiteral(SqlExpr? predicate)
+    {
+        string? found = null;
+        if (predicate is not null)
+        {
+            Visit(predicate, node =>
+            {
+                if (found is null
+                    && node is BinaryExpr { Operator: "=", Left: ColumnRef column, Right: LiteralExpr { Value: string text } }
+                    && column.Name.Equals("Type", StringComparison.OrdinalIgnoreCase))
+                {
+                    found = text;
+                }
+            });
+        }
+
+        return found;
+    }
+
+    /// <summary>True when the predicate selects by key: <c>[Id] = x</c> or <c>[Id] IN (...)</c> anywhere in it.</summary>
+    public static bool SelectsById(SqlExpr? predicate)
+    {
+        var found = false;
+        if (predicate is not null)
+        {
+            Visit(predicate, node =>
+            {
+                found |= node switch
+                {
+                    BinaryExpr { Operator: "=", Left: ColumnRef column } => IsId(column),
+                    InListExpr { Negated: false, Operand: ColumnRef column } => IsId(column),
+                    InSubqueryExpr { Negated: false, Operand: ColumnRef column } => IsId(column),
+                    _ => false,
+                };
+            });
+        }
+
+        return found;
+
+        static bool IsId(ColumnRef column) => column.Name.Equals("Id", StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>The version in a <c>[Version] = n</c> comparison of an update's predicate, or null when it has none.</summary>
+    public static long? VersionCheck(SqlExpr? predicate)
+    {
+        long? found = null;
+        if (predicate is not null)
+        {
+            Visit(predicate, node =>
+            {
+                if (found is null
+                    && node is BinaryExpr { Operator: "=", Left: ColumnRef column, Right: LiteralExpr { Value: long version } }
+                    && column.Name.Equals("Version", StringComparison.OrdinalIgnoreCase))
+                {
+                    found = version;
+                }
+            });
+        }
+
+        return found;
+    }
+
+    /// <summary>True when the predicate has a <c>[Version] IS NULL</c> test, which lets a version check pass for a row with no version.</summary>
+    public static bool AllowsNullVersion(SqlExpr? predicate)
+    {
+        var found = false;
+        if (predicate is not null)
+        {
+            Visit(predicate, node =>
+            {
+                found |= node is IsNullExpr { Negated: false, Operand: ColumnRef column }
+                    && column.Name.Equals("Version", StringComparison.OrdinalIgnoreCase);
+            });
+        }
+
+        return found;
+    }
+
     /// <summary>The distinct qualifiers of every column in the expression, including inside <c>IN (SELECT ...)</c>.</summary>
     public static IReadOnlySet<string> Qualifiers(SqlExpr expression)
     {

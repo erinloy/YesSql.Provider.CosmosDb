@@ -40,7 +40,10 @@ internal sealed class CosmosExpressionWriter
     }
 
     /// <summary>The Cosmos text for a column reference.</summary>
-    public static string Column(ColumnRef column) => "c[\"" + EscapeName(column.Name) + "\"]";
+    public static string Column(ColumnRef column) => Property(column.Name);
+
+    /// <summary>The Cosmos text for a property of the item, <c>c["Name"]</c>.</summary>
+    public static string Property(string name) => "c[\"" + EscapeName(name) + "\"]";
 
     private static string EscapeName(string name)
     {
@@ -70,6 +73,10 @@ internal sealed class CosmosExpressionWriter
 
             case LiteralExpr { Value: null }:
                 sb.Append("null");
+                break;
+
+            case LiteralExpr { Value: bool flag }:
+                sb.Append(flag ? "true" : "false");
                 break;
 
             case LiteralExpr { Value: string text }:

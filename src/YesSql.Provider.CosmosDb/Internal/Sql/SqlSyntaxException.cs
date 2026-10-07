@@ -17,6 +17,14 @@ internal sealed class SqlSyntaxException : DbException
         Position = position;
     }
 
+    /// <summary>For a rejection that is found after parsing, when no single position applies. The message shows the start of the statement.</summary>
+    public SqlSyntaxException(string message, string statement)
+        : base($"{message}: {Excerpt(statement, 0)}")
+    {
+        Statement = statement;
+        Position = 0;
+    }
+
     /// <summary>For a rejection that is found after parsing, when no single position applies.</summary>
     public SqlSyntaxException(string message)
         : base(message)

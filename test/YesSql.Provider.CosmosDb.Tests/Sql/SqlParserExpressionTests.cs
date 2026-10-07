@@ -103,6 +103,8 @@ public class SqlParserExpressionTests
         Assert.Equal(1.5m, Assert.IsType<LiteralExpr>(Assert.IsType<BinaryExpr>(Parse("[a] = 1.5")).Right).Value);
         Assert.Equal("it's", Assert.IsType<LiteralExpr>(Assert.IsType<BinaryExpr>(Parse("[a] = 'it''s'")).Right).Value);
         Assert.Null(Assert.IsType<LiteralExpr>(Assert.IsType<BinaryExpr>(Parse("[a] = NULL")).Right).Value);
+        Assert.Equal(true, Assert.IsType<LiteralExpr>(Assert.IsType<BinaryExpr>(Parse("[a] = TRUE")).Right).Value);
+        Assert.Equal(false, Assert.IsType<LiteralExpr>(Assert.IsType<BinaryExpr>(Parse("[a] = false")).Right).Value);
     }
 
     [Fact]
