@@ -2,6 +2,11 @@
 
 All notable changes are listed here. The project is in preview, so minor versions may change behavior.
 
+## 0.1.4 (not yet released)
+
+### Fixed
+- `ISession.CancelAsync()` did not undo writes that had already been sent to Cosmos. YesSql releases the transaction by disposing it, and the provider's transaction only rolled back when `Rollback` was called, so a unit of work that was flushed (by a query inside the session, for example) and then cancelled left its documents and index rows behind. YesSql does the same when one of its own reads or queries fails, and Orchard Core calls `CancelAsync` to discard a request's changes. Disposing an uncommitted transaction now rolls it back, as ADO.NET expects. Data written by earlier versions is unaffected, but documents or index rows left behind by an earlier cancelled unit of work are not cleaned up.
+
 ## 0.1.3
 
 ### Added
