@@ -1,5 +1,6 @@
 using System.Data;
 using Newtonsoft.Json.Linq;
+using YesSql.Provider.CosmosDb.Internal.Sql;
 
 namespace YesSql.Provider.CosmosDb.Tests;
 
@@ -33,7 +34,7 @@ public class StatementHandlingTests
     {
         var store = await NewStoreAsync();
 
-        await Assert.ThrowsAsync<NotSupportedException>(() => ExecuteAsync(store, "renamecolumn [Table] [OnlyOneColumn]"));
+        await Assert.ThrowsAsync<SqlSyntaxException>(() => ExecuteAsync(store, "renamecolumn [Table] [OnlyOneColumn]"));
     }
 
     [Fact]
