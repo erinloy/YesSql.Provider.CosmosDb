@@ -2,6 +2,11 @@
 
 All notable changes are listed here. The project is in preview, so minor versions may change behavior.
 
+## Unreleased
+
+### Fixed
+- A query ordered by a date column on an index (`OrderBy(x => x.CreatedUtc)`) could return rows out of order. The provider sorts these in the client, and compared the dates as the culture's text, which drops the fractions of a second and sorts `9:59 AM` after `10:00 AM`, so items created within the same second tied and kept index order. Dates are now compared as moments in time. Found by running content operations through a real Orchard Core site.
+
 ## 0.1.5
 
 ### Fixed
