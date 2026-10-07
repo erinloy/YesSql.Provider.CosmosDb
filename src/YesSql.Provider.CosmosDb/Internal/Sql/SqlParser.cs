@@ -10,7 +10,7 @@ namespace YesSql.Provider.CosmosDb.Internal.Sql;
 /// <c>+ - ||</c>, <c>* / %</c>, unary minus, primary. Anything else is rejected with a
 /// <see cref="SqlSyntaxException"/> that names the position.
 /// </summary>
-internal sealed class SqlExpressionParser
+internal sealed partial class SqlParser
 {
     /// <summary>Nesting and operator-chain depth beyond which a statement is refused instead of risking the stack.</summary>
     internal const int MaxDepth = 200;
@@ -20,7 +20,7 @@ internal sealed class SqlExpressionParser
     private int _index;
     private int _depth;
 
-    public SqlExpressionParser(string sql, List<SqlToken> tokens, int startIndex = 0)
+    public SqlParser(string sql, List<SqlToken> tokens, int startIndex = 0)
     {
         _sql = sql;
         _tokens = tokens;
@@ -31,11 +31,11 @@ internal sealed class SqlExpressionParser
     public int Index => _index;
 
     /// <summary>Parses <paramref name="sql"/> as exactly one expression, optionally followed by a semicolon.</summary>
-    public static SqlExpr Parse(string sql)
+    public static SqlExpr ParseExpression(string sql)
     {
         var tokens = SqlLexer.Tokenize(sql);
-        var parser = new SqlExpressionParser(sql, tokens);
-        var expression = parser.ParseExpression();
+        var parser = new SqlParser(sql, tokens);
+        var expression = parser.ReadExpression();
         parser.SkipSemicolons();
         if (!parser.AtEnd)
         {
@@ -55,7 +55,8 @@ internal sealed class SqlExpressionParser
         }
     }
 
-    public SqlExpr ParseExpression() => ParseOr();
+    /// <summary>Reads one expression at the current position.</summary>
+    public SqlExpr ReadExpression() => ParseOr();
 
     private SqlToken Peek => _tokens[_index];
 
@@ -345,6 +346,10 @@ internal sealed class SqlExpressionParser
                 _index++;
                 return new LiteralExpr(token.Value);
 
+            case SqlTokenKind.Quoted:
+                _index++;
+                return new QuotedNameExpr(token.Value);
+
             case SqlTokenKind.Parameter:
                 _index++;
                 return new ParamRef(token.Value);
@@ -391,17 +396,18 @@ internal sealed class SqlExpressionParser
             try
             {
                 var args = new List<SqlExpr>();
+                var distinct = AcceptWord("distinct");
                 if (!PeekSymbol(")"))
                 {
                     do
                     {
-                        args.Add(ParseOr());
+                        args.Add(PeekSymbol("*") && !distinct ? ReadStar() : ParseOr());
                     }
                     while (AcceptSymbol(","));
                 }
 
                 ExpectSymbol(")");
-                return new FunctionExpr(token.Text, args);
+                return new FunctionExpr(token.Text, args, distinct);
             }
             finally
             {

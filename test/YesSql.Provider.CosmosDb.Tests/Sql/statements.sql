@@ -11,45 +11,45 @@ delete from [tpPersonByName] where [DocumentId] = @p;
 delete from [tpPersonIdentity] where [DocumentId] = @p;
 delete from [tpUserByRoleNameIndex] where [Id] = @p;
 delete from [tpUserByRoleNameIndex_Document] where [UserByRoleNameIndexId] = @p;
-insert into [ArticlesByDay] ([Day], [Count]) values (@p0, @p1, @p2) [Id];
-insert into [ArticlesByDay_Document] ([ArticlesByDayId], [DocumentId]) values (@p0, @p1, @p2);
-insert into [Document] ([Id], [Type], [Content], [Version]) values (@p0, @p1, @p2);
-insert into [OpenId_Document] ([Id], [Type], [Content], [Version]) values (@p0, @p1, @p2);
-insert into [OpenId_OpenIdScopeIndex] ([Name], [ScopeId], [DocumentId]) values (@p0, @p1, @p2) [Id];
-insert into [PersonByName] ([Name], [DocumentId]) values (@p0, @p1, @p2) [Id];
-insert into [PersonByName] ([Name], [Group], [DocumentId]) values (@p0, @p1, @p2) [Id];
-insert into [PersonByName] ([SomeName], [DocumentId]) values (@p0, @p1, @p2) [Id];
-insert into [PersonByNickname] ([Nickname], [DocumentId]) values (@p0, @p1, @p2) [Id];
-insert into [PersonIndex] ([Name], [Age], [DocumentId]) values (@p0, @p1, @p2) [Id];
-insert into [RecordIndexingTask] ([CreatedUtc], [RecordId], [Category], [Type]) values (@p0, @p1, @p2);
-insert into [tpArticleByPublishedDate] ([Title], [PublishedDateTime], [DocumentId]) values (@p0, @p1, @p2) [Id];
-insert into [tpArticlesByDay] ([Count], [DayOfYear]) values (@p0, @p1, @p2) [Id];
-insert into [tpArticlesByDay_Document] ([ArticlesByDayId], [DocumentId]) values (@p0, @p1, @p2);
-insert into [tpAttachmentByDay] ([Date], [Count]) values (@p0, @p1, @p2) [Id];
-insert into [tpAttachmentByDay_Document] ([AttachmentByDayId], [DocumentId]) values (@p0, @p1, @p2);
-insert into [tpBinary] ([Content1], [Content2], [Content3], [Content4], [DocumentId]) values (@p0, @p1, @p2) [Id];
-insert into [tpCarIndex] ([Name], [Category], [DocumentId]) values (@p0, @p1, @p2) [Id];
-insert into [tpCol1_Document] ([Id], [Type], [Content], [Version]) values (@p0, @p1, @p2);
-insert into [tpCol1_PersonByBothNamesCol] ([Firstname], [Lastname], [DocumentId]) values (@p0, @p1, @p2) [Id];
-insert into [tpCol1_PersonByName] ([SomeName], [DocumentId]) values (@p0, @p1, @p2) [Id];
-insert into [tpCol1_PersonByNameCol] ([Name], [DocumentId]) values (@p0, @p1, @p2) [Id];
-insert into [tpCol1_PersonsByNameCol] ([Name], [Count]) values (@p0, @p1, @p2) [Id];
-insert into [tpCol1_PersonsByNameCol_Col1_Document] ([PersonsByNameColId], [DocumentId]) values (@p0, @p1, @p2);
-insert into [tpDocument] ([Id], [Type], [Content], [Version]) values (@p0, @p1, @p2);
-insert into [tpEmailByAttachment] ([Date], [AttachmentName], [DocumentId]) values (@p0, @p1, @p2) [Id];
-insert into [tpPersonByAge] ([Name], [Age], [Adult], [DocumentId]) values (@p0, @p1, @p2) [Id];
-insert into [tpPersonByName] ([SomeName], [DocumentId]) values (@p0, @p1, @p2) [Id];
-insert into [tpPersonByNullableAge] ([Age], [DocumentId]) values (@p0, @p1, @p2) [Id];
-insert into [tpPersonIdentity] ([Identity], [DocumentId]) values (@p0, @p1, @p2) [Id];
-insert into [tpPublishedArticle] ([DocumentId]) values (@p) [Id];
-insert into [tpShapeIndex] ([Name], [DocumentId]) values (@p0, @p1, @p2) [Id];
+insert into [ArticlesByDay] ([Day], [Count]) values (@p, @p) RETURNING [Id];
+insert into [ArticlesByDay_Document] ([ArticlesByDayId], [DocumentId]) values (@p, @p);
+insert into [Document] ([Id], [Type], [Content], [Version]) values (@p, @p, @p, @p);
+insert into [OpenId_Document] ([Id], [Type], [Content], [Version]) values (@p, @p, @p, @p);
+insert into [OpenId_OpenIdScopeIndex] ([Name], [ScopeId], [DocumentId]) values (@p, @p, @p) RETURNING [Id];
+insert into [PersonByName] ([Name], [DocumentId]) values (@p, @p) RETURNING [Id];
+insert into [PersonByName] ([Name], [Group], [DocumentId]) values (@p, @p, @p) RETURNING [Id];
+insert into [PersonByName] ([SomeName], [DocumentId]) values (@p, @p) RETURNING [Id];
+insert into [PersonByNickname] ([Nickname], [DocumentId]) values (@p, @p) RETURNING [Id];
+insert into [PersonIndex] ([Name], [Age], [DocumentId]) values (@p, @p, @p) RETURNING [Id];
+insert into [RecordIndexingTask] ([CreatedUtc], [RecordId], [Category], [Type]) values (@p, @p, @p, @p);
+insert into [tpArticleByPublishedDate] ([Title], [PublishedDateTime], [DocumentId]) values (@p, @p, @p) RETURNING [Id];
+insert into [tpArticlesByDay] ([Count], [DayOfYear]) values (@p, @p) RETURNING [Id];
+insert into [tpArticlesByDay_Document] ([ArticlesByDayId], [DocumentId]) values (@p, @p);
+insert into [tpAttachmentByDay] ([Date], [Count]) values (@p, @p) RETURNING [Id];
+insert into [tpAttachmentByDay_Document] ([AttachmentByDayId], [DocumentId]) values (@p, @p);
+insert into [tpBinary] ([Content1], [Content2], [Content3], [Content4], [DocumentId]) values (@p, @p, @p, @p, @p) RETURNING [Id];
+insert into [tpCarIndex] ([Name], [Category], [DocumentId]) values (@p, @p, @p) RETURNING [Id];
+insert into [tpCol1_Document] ([Id], [Type], [Content], [Version]) values (@p, @p, @p, @p);
+insert into [tpCol1_PersonByBothNamesCol] ([Firstname], [Lastname], [DocumentId]) values (@p, @p, @p) RETURNING [Id];
+insert into [tpCol1_PersonByName] ([SomeName], [DocumentId]) values (@p, @p) RETURNING [Id];
+insert into [tpCol1_PersonByNameCol] ([Name], [DocumentId]) values (@p, @p) RETURNING [Id];
+insert into [tpCol1_PersonsByNameCol] ([Name], [Count]) values (@p, @p) RETURNING [Id];
+insert into [tpCol1_PersonsByNameCol_Col1_Document] ([PersonsByNameColId], [DocumentId]) values (@p, @p);
+insert into [tpDocument] ([Id], [Type], [Content], [Version]) values (@p, @p, @p, @p);
+insert into [tpEmailByAttachment] ([Date], [AttachmentName], [DocumentId]) values (@p, @p, @p) RETURNING [Id];
+insert into [tpPersonByAge] ([Name], [Age], [Adult], [DocumentId]) values (@p, @p, @p, @p) RETURNING [Id];
+insert into [tpPersonByName] ([SomeName], [DocumentId]) values (@p, @p) RETURNING [Id];
+insert into [tpPersonByNullableAge] ([Age], [DocumentId]) values (@p, @p) RETURNING [Id];
+insert into [tpPersonIdentity] ([Identity], [DocumentId]) values (@p, @p) RETURNING [Id];
+insert into [tpPublishedArticle] ([DocumentId]) values (@p) RETURNING [Id];
+insert into [tpShapeIndex] ([Name], [DocumentId]) values (@p, @p) RETURNING [Id];
 INSERT INTO [tpTable1] ([Column1]) VALUES('str')
-insert into [tpTypesIndex] ([ValueBool], [ValueShort], [ValueInt], [ValueLong], [ValueFloat], [ValueDouble], [ValueDecimal], [ValueDateTime], [ValueDateTimeOffset], [ValueGuid], [ValueTimeSpan], [NullableBool], [NullableShort], [NullableInt], [NullableLong], [NullableFloat], [NullableDouble], [NullableDecimal], [NullableDateTime], [NullableDateTimeOffset], [NullableGuid], [NullableTimeSpan], [DocumentId]) values (@p0, @p1, @p2) [Id];
-insert into [tpUserByRoleNameIndex] ([RoleName], [Count]) values (@p0, @p1, @p2) [Id];
-insert into [tpUserByRoleNameIndex_Document] ([UserByRoleNameIndexId], [DocumentId]) values (@p0, @p1, @p2);
-insert into [UserByRoleNameIndex] ([RoleName], [Count]) values (@p0, @p1, @p2) [Id];
-insert into [UserByRoleNameIndex_Document] ([UserByRoleNameIndexId], [DocumentId]) values (@p0, @p1, @p2);
-insert into [UserIndex] ([UserId], [NormalizedUserName], [NormalizedEmail], [IsEnabled], [IsLockoutEnabled], [LockoutEndUtc], [AccessFailedCount], [DocumentId]) values (@p0, @p1, @p2) [Id];
+insert into [tpTypesIndex] ([ValueBool], [ValueShort], [ValueInt], [ValueLong], [ValueFloat], [ValueDouble], [ValueDecimal], [ValueDateTime], [ValueDateTimeOffset], [ValueGuid], [ValueTimeSpan], [NullableBool], [NullableShort], [NullableInt], [NullableLong], [NullableFloat], [NullableDouble], [NullableDecimal], [NullableDateTime], [NullableDateTimeOffset], [NullableGuid], [NullableTimeSpan], [DocumentId]) values (@p, @p, @p, @p, @p, @p, @p, @p, @p, @p, @p, @p, @p, @p, @p, @p, @p, @p, @p, @p, @p, @p, @p) RETURNING [Id];
+insert into [tpUserByRoleNameIndex] ([RoleName], [Count]) values (@p, @p) RETURNING [Id];
+insert into [tpUserByRoleNameIndex_Document] ([UserByRoleNameIndexId], [DocumentId]) values (@p, @p);
+insert into [UserByRoleNameIndex] ([RoleName], [Count]) values (@p, @p) RETURNING [Id];
+insert into [UserByRoleNameIndex_Document] ([UserByRoleNameIndexId], [DocumentId]) values (@p, @p);
+insert into [UserIndex] ([UserId], [NormalizedUserName], [NormalizedEmail], [IsEnabled], [IsLockoutEnabled], [LockoutEndUtc], [AccessFailedCount], [DocumentId]) values (@p, @p, @p, @p, @p, @p, @p, @p) RETURNING [Id];
 renamecolumn [Table] [OnlyOneColumn]
 renamecolumn [tpTable1] [Column1] [Column2]
 select * from [ArticlesByDay] where [Day] = @p
@@ -204,6 +204,11 @@ SELECT count(*) FROM [tpPersonIdentity] AS PersonIdentity_a1 WHERE (PersonIdenti
 SELECT count(*) FROM [tpShapeIndex] AS ShapeIndex_a1
 SELECT count(*) FROM [tpUserByRoleNameIndex] AS UserByRoleNameIndex_a1
 SELECT count(*) FROM [UserIndex] AS UserIndex_a1 WHERE (UserIndex_a1.[UserId] = @p)
+SELECT count(1) FROM [tpArticleByPublishedDate] WHERE [PublishedDateTime] < GetCurrentDateTime()
+SELECT count(1) FROM [tpArticleByPublishedDate] WHERE [PublishedDateTime] > GetCurrentDateTime()
+SELECT count(1) FROM [tpDocument] AS d INNER JOIN [tpArticleByPublishedDate] AS a ON a.[DocumentId] = d.[Id]
+SELECT count(1) FROM [tpDocument] AS d LEFT JOIN [tpArticleByPublishedDate] AS a ON a.[DocumentId] = d.[Id]
+SELECT count(1) FROM [tpDocument] AS d RIGHT JOIN [tpArticleByPublishedDate] AS a ON a.[DocumentId] = d.[Id]
 SELECT count(distinct [Document].[Id]) FROM [Document] INNER JOIN [PersonByName] AS PersonByName_a1 ON PersonByName_a1.[DocumentId] = [Document].[Id] WHERE (PersonByName_a1.[Name] = @p)
 SELECT count(distinct [Document].[Id]) FROM [Document] INNER JOIN [PersonByName] AS PersonByName_a1 ON PersonByName_a1.[DocumentId] = [Document].[Id] WHERE (PersonByName_a1.[Name] like @p)
 SELECT count(distinct [Document].[Id]) FROM [Document] INNER JOIN [PersonByName] AS PersonByName_a1 ON PersonByName_a1.[DocumentId] = [Document].[Id] WHERE (PersonByName_a1.[SomeName] = @p)
@@ -272,11 +277,6 @@ SELECT count(distinct [tpDocument].[Id]) FROM [tpDocument] INNER JOIN [tpPublish
 SELECT count(distinct [tpDocument].[Id]) FROM [tpDocument] INNER JOIN [tpShapeIndex] AS ShapeIndex_a1 ON ShapeIndex_a1.[DocumentId] = [tpDocument].[Id]
 SELECT count(distinct [tpDocument].[Id]) FROM [tpDocument] INNER JOIN [tpShapeIndex] AS ShapeIndex_a1 ON ShapeIndex_a1.[DocumentId] = [tpDocument].[Id] WHERE [tpDocument].[Type] = @p
 SELECT count(distinct [tpDocument].[Id]) FROM [tpDocument] INNER JOIN [tpUserByRoleNameIndex_Document] AS UserByRoleNameIndex_Document_a1 ON UserByRoleNameIndex_Document_a1.[DocumentId] = [tpDocument].[Id] INNER JOIN [tpUserByRoleNameIndex] AS UserByRoleNameIndex_a1 ON UserByRoleNameIndex_a1.[Id] = UserByRoleNameIndex_Document_a1.[UserByRoleNameIndexId] WHERE (UserByRoleNameIndex_a1.[RoleName] = @p)
-SELECT count(1) FROM [tpArticleByPublishedDate] WHERE [PublishedDateTime] < GetCurrentDateTime()
-SELECT count(1) FROM [tpArticleByPublishedDate] WHERE [PublishedDateTime] > GetCurrentDateTime()
-SELECT count(1) FROM [tpDocument] AS d INNER JOIN [tpArticleByPublishedDate] AS a ON a.[DocumentId] = d.[Id]
-SELECT count(1) FROM [tpDocument] AS d LEFT JOIN [tpArticleByPublishedDate] AS a ON a.[DocumentId] = d.[Id]
-SELECT count(1) FROM [tpDocument] AS d RIGHT JOIN [tpArticleByPublishedDate] AS a ON a.[DocumentId] = d.[Id]
 SELECT DateTimePart("day", [PublishedDateTime]) FROM [tpArticleByPublishedDate]
 SELECT DateTimePart("hour", [PublishedDateTime]) FROM [tpArticleByPublishedDate]
 SELECT DateTimePart("minute", [PublishedDateTime]) FROM [tpArticleByPublishedDate]

@@ -14,7 +14,7 @@ public class CosmosExpressionWriterTests
             subquery => { subqueries.Add(subquery); return "@__sq" + (subqueries.Count - 1); },
             text => { literals.Add(text); return "@__lit" + (literals.Count - 1); },
             new HashSet<string>(dateParameters));
-        return (writer.Write(SqlExpressionParser.Parse(sql)), literals, subqueries);
+        return (writer.Write(SqlParser.ParseExpression(sql)), literals, subqueries);
     }
 
     [Fact]
@@ -134,7 +134,7 @@ public class CosmosExpressionWriterTests
             {
                 var literals = new List<string>();
                 var writer = new CosmosExpressionWriter(_ => throw new InvalidOperationException(), text => { literals.Add(text); return "@__lit" + (literals.Count - 1); });
-                newText = writer.Write(SqlExpressionParser.Parse(where));
+                newText = writer.Write(SqlParser.ParseExpression(where));
                 for (var i = 0; i < literals.Count; i++)
                 {
                     newText = newText.Replace("@__lit" + i, "'" + literals[i].Replace("'", "''") + "'");
