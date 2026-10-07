@@ -48,10 +48,14 @@ builder.Services
                     {
                         ConnectionMode = ConnectionMode.Gateway,
                         LimitToEndpoint = true,
-                        HttpClientFactory = () => new HttpClient(new HttpClientHandler
-                        {
-                            ServerCertificateCustomValidationCallback = HttpClientHandler.DangerousAcceptAnyServerCertificateValidator,
-                        }),
+                        // The emulator can present a self-signed certificate. Skip certificate validation for a
+                        // loopback endpoint only; a real Cosmos DB account must always be validated.
+                        HttpClientFactory = IsLoopback(cosmos["Endpoint"])
+                            ? () => new HttpClient(new HttpClientHandler
+                            {
+                                ServerCertificateCustomValidationCallback = HttpClientHandler.DangerousAcceptAnyServerCertificateValidator,
+                            })
+                            : null,
                     },
                 })
                 .UseDefaultIdGenerator();
@@ -73,3 +77,5 @@ var app = builder.Build();
 app.UseOrchardCore();
 
 app.Run();
+
+static bool IsLoopback(string endpoint) => Uri.TryCreate(endpoint, UriKind.Absolute, out var uri) && uri.IsLoopback;

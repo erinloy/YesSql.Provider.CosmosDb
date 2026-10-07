@@ -20,11 +20,16 @@ internal static class Emulator
     {
         ConnectionMode = ConnectionMode.Gateway,
         LimitToEndpoint = true,
-        HttpClientFactory = () => new HttpClient(new HttpClientHandler
-        {
-            ServerCertificateCustomValidationCallback = HttpClientHandler.DangerousAcceptAnyServerCertificateValidator,
-        }),
+        // Skip certificate validation for a loopback emulator only; a real account must be validated.
+        HttpClientFactory = IsLoopback(Endpoint)
+            ? () => new HttpClient(new HttpClientHandler
+            {
+                ServerCertificateCustomValidationCallback = HttpClientHandler.DangerousAcceptAnyServerCertificateValidator,
+            })
+            : null,
     };
+
+    private static bool IsLoopback(string endpoint) => Uri.TryCreate(endpoint, UriKind.Absolute, out var uri) && uri.IsLoopback;
 
     public static CosmosDbOptions Options(
         string databaseId,

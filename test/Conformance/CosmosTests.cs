@@ -34,10 +34,13 @@ namespace YesSql.Tests
         {
             ConnectionMode = ConnectionMode.Gateway,
             LimitToEndpoint = true,
-            HttpClientFactory = () => new HttpClient(new HttpClientHandler
-            {
-                ServerCertificateCustomValidationCallback = HttpClientHandler.DangerousAcceptAnyServerCertificateValidator,
-            }),
+            // Skip certificate validation for a loopback emulator only; a real account must be validated.
+            HttpClientFactory = Uri.TryCreate(Endpoint, UriKind.Absolute, out var uri) && uri.IsLoopback
+                ? () => new HttpClient(new HttpClientHandler
+                {
+                    ServerCertificateCustomValidationCallback = HttpClientHandler.DangerousAcceptAnyServerCertificateValidator,
+                })
+                : null,
         };
 
         private static readonly PartitionStrategy Strategy =
