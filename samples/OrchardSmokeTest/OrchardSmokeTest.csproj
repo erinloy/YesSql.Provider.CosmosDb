@@ -10,6 +10,8 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <!-- Orchard Core brings in a vulnerable AngleSharp (NU1902); take the patched version. -->
+    <PackageReference Include="AngleSharp" Version="1.5.0" />
     <PackageReference Include="OrchardCore.Application.Cms.Core.Targets" Version="$(OrchardCoreVersion)" />
   </ItemGroup>
 

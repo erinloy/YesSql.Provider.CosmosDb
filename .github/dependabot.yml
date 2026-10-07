@@ -14,6 +14,9 @@ updates:
       # YesSql 6 is a separate compatibility target and Orchard Core 3.x pins YesSql 5.4.7.
       - dependency-name: "YesSql*"
         update-types: ["version-update:semver-major"]
+      # The package declares this as its minimum SDK version, and applications pin their own. Raising it forces every
+      # consumer to upgrade, so it is changed by hand in a release that says so.
+      - dependency-name: "Microsoft.Azure.Cosmos"
   - package-ecosystem: github-actions
     directory: /
     schedule:
