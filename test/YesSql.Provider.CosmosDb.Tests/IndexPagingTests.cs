@@ -112,6 +112,39 @@ public class IndexPagingTests
         Assert.Null(await session.Query<Article, ArticleByTag>(x => x.Tag == "missing").FirstOrDefaultAsync());
     }
 
+    [Theory]
+    [InlineData(PartitionStrategy.PerTable)]
+    [InlineData(PartitionStrategy.PerStore)]
+    public async Task A_page_larger_than_one_document_query_comes_back_whole_and_in_order(PartitionStrategy strategy)
+    {
+        var store = await StoreFactory.CreateAndInitializeAsync(
+            new Configuration().UseCosmosDb(Emulator.Options(Emulator.NewDatabaseId("yessql_paging"), strategy: strategy)));
+        store.RegisterIndexes<ArticleIndexProvider>();
+
+        const int count = 230; // more than two queries' worth of documents
+        var ids = new List<int>();
+        await using (var session = store.CreateSession())
+        {
+            for (var i = 0; i < count; i++)
+            {
+                var article = new Article { Title = "a" + i, Tags = new[] { "bulk", "also" } };
+                await session.SaveAsync(article);
+                ids.Add(article.Id);
+            }
+
+            await session.SaveChangesAsync();
+        }
+
+        await using var read = store.CreateSession();
+        var page = (await read.Query<Article, ArticleByTag>(x => x.Tag == "bulk" || x.Tag == "also").Take(count + 20).ListAsync()).Select(a => a.Id).ToList();
+        Assert.Equal(ids.OrderBy(id => id), page);
+
+        // documents loaded by id come back in the order they were asked for, and an id with no document is skipped
+        var asked = ids.AsEnumerable().Reverse().Take(150).Append(int.MaxValue).ToArray();
+        var loaded = (await read.GetAsync<Article>(asked)).Select(a => a.Id).ToList();
+        Assert.Equal(asked.Take(150), loaded);
+    }
+
     [Fact]
     public async Task A_query_that_filters_on_the_documents_type_is_still_counted_and_paged_correctly()
     {

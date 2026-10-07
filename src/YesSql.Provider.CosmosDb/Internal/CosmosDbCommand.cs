@@ -284,8 +284,9 @@ internal sealed partial class CosmosDbCommand : DbCommand
 
     // ---- helpers ----
 
-    // Number of point reads in flight at once when loading a page of documents.
-    private const int PointReadConcurrency = 8;
+    // Ids read by one query when loading documents, and queries in flight at once.
+    private const int DocumentsPerQuery = 100;
+    private const int QueryConcurrency = 4;
 
     // The ids on the requested page of an id list, after applying the statement's OFFSET and LIMIT.
     private static List<long> PageOf(List<long> ids, SelectShape shape)
@@ -302,32 +303,63 @@ internal sealed partial class CosmosDbCommand : DbCommand
     // Paging counts beyond what a list can hold are the same as no bound.
     private static int ClampToInt(long value) => (int)Math.Min(value, int.MaxValue);
 
-    // Reads documents by id as result rows, in the order of ids; ids with no document are skipped. The reads run
-    // concurrently up to a limit, since a page would otherwise cost one sequential round trip per document.
+    // Reads documents by id as result rows, in the order of ids; ids with no document are skipped. One id is a point
+    // read. Several are read with one query per DocumentsPerQuery ids, which costs one round trip where point reads
+    // cost one each (and at about 60 ms to a real account, 20 point reads take longer than one query even when eight
+    // run at once).
     private async Task<List<object?[]>> ReadDocumentRowsAsync(string table, IReadOnlyList<long> ids, CancellationToken cancellationToken)
     {
-        var items = new JObject?[ids.Count];
-        using var gate = new SemaphoreSlim(PointReadConcurrency);
-
-        await Task.WhenAll(ids.Select(async (id, index) =>
+        if (ids.Count == 0)
         {
-            await gate.WaitAsync(cancellationToken);
+            return new List<object?[]>();
+        }
+
+        var byId = new Dictionary<long, JObject>();
+        if (ids.Count == 1)
+        {
             try
             {
-                var response = await CosmosContainer.ReadItemAsync<JObject>($"{table}:{id}", PartitionKeyFor(table), cancellationToken: cancellationToken);
-                items[index] = response.Resource;
+                var response = await CosmosContainer.ReadItemAsync<JObject>($"{table}:{ids[0]}", PartitionKeyFor(table), cancellationToken: cancellationToken);
+                byId[ids[0]] = response.Resource;
             }
             catch (CosmosException ex) when (ex.StatusCode == HttpStatusCode.NotFound)
             {
                 // no document for this id
             }
-            finally
+        }
+        else
+        {
+            var chunks = ids.Distinct().Chunk(DocumentsPerQuery).ToList();
+            using var gate = new SemaphoreSlim(QueryConcurrency);
+            await Task.WhenAll(chunks.Select(async chunk =>
             {
-                gate.Release();
-            }
-        }));
+                await gate.WaitAsync(cancellationToken);
+                try
+                {
+                    var query = new QueryDefinition("SELECT * FROM c WHERE " + Scoped(table) + " AND ARRAY_CONTAINS(@__docIds, c.Id)")
+                        .WithParameter("@pk", PkValue(table))
+                        .WithParameter("@__docIds", chunk);
+                    using var iterator = CosmosContainer.GetItemQueryIterator<JObject>(query,
+                        requestOptions: new QueryRequestOptions { PartitionKey = PartitionKeyFor(table) });
+                    while (iterator.HasMoreResults)
+                    {
+                        foreach (var item in await iterator.ReadNextAsync(cancellationToken))
+                        {
+                            lock (byId)
+                            {
+                                byId[item["Id"]!.ToObject<long>()] = item;
+                            }
+                        }
+                    }
+                }
+                finally
+                {
+                    gate.Release();
+                }
+            }));
+        }
 
-        return items.Where(item => item is not null).Select(item => ToRow(item!)).ToList();
+        return ids.Where(byId.ContainsKey).Select(id => ToRow(byId[id])).ToList();
     }
 
     // Parse an index-joined query and run the index lookup, returning distinct DocumentIds (ordered if
