@@ -2,9 +2,9 @@
 
 Orchard Core stores its data through YesSql, so it can use this provider. Orchard does not yet have Cosmos DB as a built-in database option, so the provider has to be wired in by replacing the tenant's `IStore` registration.
 
-[`samples/OrchardSmokeTest`](../samples/OrchardSmokeTest) is a minimal Orchard Core host (net10.0) that does this. It builds against Orchard Core 3.0.1 (YesSql 5.4.7) by default, and against the 4.0 preview (YesSql 6.0.0) with `-p:OrchardCoreVersion=4.0.0-preview-19175`. Against the Cosmos emulator it runs the `Headless` setup recipe, creates the tenant, and serves the site and the admin login page. No SQLite file is created; every document and index row goes to Cosmos.
+[`samples/OrchardSmokeTest`](../samples/OrchardSmokeTest) is a minimal Orchard Core host (net10.0) that does this. It builds against Orchard Core 3.0.1 (YesSql 5.4.7) by default, and against the 4.0 preview (YesSql 6.0.0) with `-p:OrchardCoreVersion=4.0.0-preview-19175`. Against the Cosmos emulator it runs the `Headless` setup recipe, creates the tenant, serves the site and the admin login page, and runs content checks through Orchard's content manager. No SQLite file is created; every document and index row goes to Cosmos.
 
-The sample uses the default `PerTable` partition strategy. Orchard has not been tested here with `PerStore`.
+The sample uses the `PerTable` partition strategy by default and runs with `PerStore` when `Cosmos:PartitionStrategy` says so. Both are covered in CI.
 
 ## How Orchard selects a database
 
@@ -86,10 +86,11 @@ With `SMOKE_CONTENT=1` it also runs the content checks in [`samples/OrchardSmoke
 
 The `Cosmos` section of `appsettings.json` holds the endpoint, key and database name. On first start AutoSetup creates the `Default` tenant and its data in the `orchard_smoke` database.
 
-## Not covered yet
+## What the checks do not cover
 
-- Creating, editing, publishing and deleting content items, and listing and filtering them, have not been exercised through the Orchard UI on this provider.
-- Request rollback through `CancelAsync` is covered by the provider's rollback tests and YesSql's conformance suite, but not through an Orchard request that fails.
+- Content is created, edited and removed through Orchard's content manager inside a shell scope, not through the admin UI, and the search and indexing modules are not enabled in the sample.
+- A cancelled request calls `ISession.CancelAsync()` and a failing request throws inside the scope; neither is a failing HTTP request.
+- Orchard Core versions other than 3.0.1 and the 4.0 preview named above.
 
 ## Making it a built-in option
 
