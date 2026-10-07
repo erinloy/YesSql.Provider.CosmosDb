@@ -98,5 +98,8 @@ jobs:
 
       - uses: ./.github/actions/start-emulator
 
-      - name: Set up and serve the sample
-        run: scripts/smoke-sample.sh ${{ matrix.orchard-core }}
+      - name: Set up and serve the sample, and run the content checks (PerTable)
+        run: SMOKE_CONTENT=1 scripts/smoke-sample.sh ${{ matrix.orchard-core }}
+
+      - name: Set up and serve the sample, and run the content checks (PerStore)
+        run: SMOKE_CONTENT=1 SMOKE_PARTITION=PerStore scripts/smoke-sample.sh ${{ matrix.orchard-core }}
