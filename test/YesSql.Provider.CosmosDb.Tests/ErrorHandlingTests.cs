@@ -2,6 +2,7 @@ using System.Data.Common;
 using System.Net;
 using Microsoft.Azure.Cosmos;
 using YesSql.Indexes;
+using YesSql.Provider.CosmosDb.Internal.Sql;
 
 namespace YesSql.Provider.CosmosDb.Tests;
 
@@ -36,6 +37,23 @@ public class ErrorHandlingTests
     }
 
     [Fact]
+    public async Task A_query_the_provider_cannot_parse_throws_a_DbException_and_releases_the_transaction()
+    {
+        var store = await NewStoreAsync();
+        await using var session = store.CreateSession();
+        await session.SaveAsync(new Person { Name = "Alice" });
+        await session.FlushAsync();
+
+        // An unquoted column is not in the SQL the provider accepts, so it is refused before any Cosmos call.
+        var exception = await Assert.ThrowsAnyAsync<DbException>(
+            () => session.Query<Person>().With<PersonByName>().Where("ThisColumnDoesNotExist = 1").ListAsync());
+
+        Assert.IsType<SqlSyntaxException>(exception);
+        Assert.Contains("ThisColumnDoesNotExist", exception.Message);
+        Assert.Null(session.CurrentTransaction);
+    }
+
+    [Fact]
     public async Task A_query_Cosmos_rejects_throws_a_DbException_that_keeps_the_Cosmos_error()
     {
         var store = await NewStoreAsync();
@@ -43,8 +61,9 @@ public class ErrorHandlingTests
         await session.SaveAsync(new Person { Name = "Alice" });
         await session.FlushAsync();
 
+        // The provider parses this, so it is Cosmos that rejects the unknown function.
         var exception = await Assert.ThrowsAnyAsync<DbException>(
-            () => session.Query<Person>().With<PersonByName>().Where("ThisColumnDoesNotExist = 1").ListAsync());
+            () => session.Query<Person>().With<PersonByName>().Where("NoSuchFunction(1) = 1").ListAsync());
 
         var cosmos = Assert.IsType<CosmosDbException>(exception);
         Assert.Equal(HttpStatusCode.BadRequest, cosmos.StatusCode);
