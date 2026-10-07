@@ -25,7 +25,7 @@ Everything lives in one container. Each item carries the Cosmos system `id`, a p
 
 `pk` is the table name with `PerTable` and `CosmosDbOptions.PartitionScope` with `PerStore`. `pk` is the default name of the partition key property; `CosmosDbOptions.PartitionKeyPath` can name another single-level path. See [PARTITIONING.md](PARTITIONING.md).
 
-`Id` is a numeric field separate from the system `id` string. Cosmos has no auto-increment, so ids for index rows come from the counter item for that table. The counter lives in its own `__seq` partition, so it never appears in queries over a table, and it is advanced with an ETag-conditional replace. Ids are not reused after deletes.
+`Id` is a numeric field separate from the system `id` string. Cosmos has no auto-increment, so ids for index rows come from the counter item for that table. The counter lives in its own `__seq` partition, so it never appears in queries over a table. It holds the highest id reserved. A process reserves ids 32 at a time with an ETag-conditional replace and hands them out from memory (`SequenceBlocks`), so most inserts make no request for their id and concurrent inserts rarely contend on the counter. Ids stay unique across processes and are not reused after deletes. A restart leaves a gap of up to 31 unused ids. Before blocks, every insert took the counter's ETag and sixteen concurrent writers on a real account (about 60 ms per round trip) exhausted the retries.
 
 Cosmos indexes every property by default, so YesSql's index tables need no DDL. `CosmosDbCommandInterpreter` turns schema commands into no-ops, with one exception: `RenameColumn` rewrites the field on every item of that table.
 
@@ -63,10 +63,10 @@ The parser is in `Internal/Sql`: a lexer (`SqlLexer`, one pass, `[bracketed]` na
 
 **Reads (`ExecuteReader`)**
 
-- Documents by id (`WHERE [Id] = / IN`): point reads.
+- Documents by id (`WHERE [Id] = / IN`): a point read for one id, and one `ARRAY_CONTAINS` query per 100 ids for several, returned in the order asked with missing ids skipped.
 - Documents by type, or a document query without an index: a query over the table's items, optionally filtered on `Type`, with the requested columns projected.
 - Index rows (`SELECT ... FROM [index]`): a query over the index's items. Column names come from the properties of the returned items.
-- Index joins (`... JOIN [index] AS a ON a.[DocumentId] = [Document].[Id]`), including joins on several different indexes and the map-plus-reduce form: a query against each index partition collects the matching `DocumentId` values, which are intersected when there are several indexes. Ordering and paging are applied to that id list in the client, then only the documents on the requested page are point-read, up to eight reads at a time.
+- Index joins (`... JOIN [index] AS a ON a.[DocumentId] = [Document].[Id]`), including joins on several different indexes and the map-plus-reduce form: a query against each index partition collects the matching `DocumentId` values, which are intersected when there are several indexes. Ordering and paging are applied to that id list in the client, then only the documents on the requested page are loaded, with one query per 100 ids. When the query is over a single index, is ordered by document id or not at all, and does not filter on the document type, Cosmos does the work instead: `SELECT VALUE COUNT(1) FROM (SELECT DISTINCT ...)` for a count and `SELECT DISTINCT ... ORDER BY DocumentId OFFSET n LIMIT m` for a page, so the cost no longer grows with the number of matching index rows.
 - Reduce index queries (document, bridge and index tables): resolved through the index, then the bridge rows, then the documents.
 - `SELECT DateTimePart(...)` projections: run as a Cosmos `VALUE` query.
 
@@ -77,7 +77,8 @@ The parser is in `Internal/Sql`: a lexer (`SqlLexer`, one pass, `[bracketed]` na
 - Comparisons against `DateTime` and `DateTimeOffset` parameters use `DateTimeToTimestamp`, so values compare by instant regardless of offset text.
 - `IN (SELECT ...)` subqueries are run first and replaced with an `ARRAY_CONTAINS` test over the resulting values, which are passed as a query parameter. Cosmos has no correlated subqueries across partitions.
 - Document and index-row queries map YesSql's `ORDER BY` (including the `MAX(a.[Col]) AS order_N` form) to a Cosmos `ORDER BY` and push `OFFSET`/`LIMIT` into the query. A lone `OFFSET` is paired with a maximum `LIMIT`, because Cosmos requires both.
-- Index joins sort in the client. Cosmos `ORDER BY` is case-sensitive and cannot order by `LOWER(...)`, and the reference providers order case-insensitively.
+- Dates are stored as UTC instants (`...Z`). A `DateTimeOffset` is written as UTC and a `Local` `DateTime` is converted, because Cosmos DB compares `DateTimeToTimestamp(c.x)` wrongly in a `WHERE` clause for a stored offset east of +01:00, which the emulator does not reproduce.
+- Index joins ordered by an index column sort in the client. Cosmos `ORDER BY` is case-sensitive and cannot order by `LOWER(...)`, and the reference providers order case-insensitively.
 - `byte[]` column values are stored as `{ "$b64": "<base64>" }` so they round-trip as `byte[]`.
 
 ## Transactions
