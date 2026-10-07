@@ -4,7 +4,9 @@ The provider is checked against YesSql's own test suite (`CoreTests`, v5.4.7), t
 
 ## Results
 
-All 249 tests in `CoreTests` pass on both partition strategies against the Cosmos DB emulator.
+All 249 tests in `CoreTests` pass on both partition strategies against the Cosmos DB emulator, and against a real serverless account (West US, gateway mode). The YesSql 6.0.0 suite passes on the emulator on both strategies.
+
+The real-account run found a difference between the emulator and the service: Cosmos DB compares `DateTimeToTimestamp(c.x)` wrongly in a `WHERE` clause when the stored text has a UTC offset east of +01:00. YesSql's `AllDataTypesShouldBeQueryable` tests store a `+01:02` offset and failed on the real account until the provider began storing moments in time as UTC. The emulator never showed it, so CI would not catch a similar difference.
 
 The suite covers document CRUD, map and reduce indexes and their update and delete lifecycle, queries over one or several indexes (including map plus reduce), the raw `INNER`, `LEFT` and `RIGHT JOIN` count API, comparison and `IN` predicates, date and decimal functions, ordering, paging, counts, `byte[]` index columns, `RenameColumn`, optimistic concurrency and rollback.
 
@@ -31,6 +33,8 @@ The project in `test/Conformance` source-links YesSql's test sources and compile
    # PerStore run
    COSMOS_PARTITION=PerStore dotnet test test/Conformance/YesSql.Provider.CosmosDb.Conformance.csproj
    ```
+
+To run the suite against a real account, set `COSMOS_TEST_ENDPOINT` and `COSMOS_TEST_KEY`. Without them the suite uses the emulator and its published key. The key is never sent to a named endpoint unless you set it, certificate validation is skipped only for a loopback endpoint, and the run creates one database named `yessql_conf_*` that it does not delete. A full run costs a fraction of a dollar on a serverless account and takes about 18 minutes per strategy from West US. The provider tests in `test/YesSql.Provider.CosmosDb.Tests` read the same two variables.
 
 To use an existing YesSql checkout, pass `-p:YesSqlTestsDir=<path to test/YesSql.Tests>`. The signing key is read from `src/YesSqlKey.snk` two directories above that path.
 
