@@ -959,8 +959,18 @@ internal sealed partial class CosmosDbCommand : DbCommand
 
     // Monotonic, never-reused id allocator for index rows (auto-increment has no Cosmos equivalent, and
     // MAX+1 reuses ids after deletes — which breaks YesSql's append-only index expectations). A counter
-    // doc per table lives in an isolated "__seq" partition so it never appears in index/count queries.
-    private async Task<long> NextSequenceAsync(string table, CancellationToken cancellationToken)
+    // doc per table lives in an isolated "__seq" partition so it never appears in index/count queries. The counter
+    // holds the last id reserved, and ids are reserved in blocks (see SequenceBlocks), so an insert normally costs no
+    // round trip for its id and concurrent inserts do not contend on the counter.
+    private Task<long> NextSequenceAsync(string table, CancellationToken cancellationToken)
+    {
+        var options = _connection.Options;
+        var key = $"{options.AccountEndpoint}|{options.DatabaseId}|{options.ContainerId}|{table}";
+        return SequenceBlocks.NextAsync(key, (size, token) => ReserveSequenceBlockAsync(table, size, token), cancellationToken);
+    }
+
+    // Reserves `size` ids from the table's counter with a conditional write and returns the first one.
+    private async Task<long> ReserveSequenceBlockAsync(string table, int size, CancellationToken cancellationToken)
     {
         var seqPk = new PartitionKey("__seq");
 
@@ -969,25 +979,25 @@ internal sealed partial class CosmosDbCommand : DbCommand
             if (attempt > 0)
             {
                 // Concurrent allocators for the same table collide on the counter's ETag; spread the retries.
-                await Task.Delay(Random.Shared.Next(2, 10 * (attempt + 1)), cancellationToken);
+                await Task.Delay(Random.Shared.Next(2, 20 * (attempt + 1)), cancellationToken);
             }
 
             try
             {
                 var current = await CosmosContainer.ReadItemAsync<JObject>(table, seqPk, cancellationToken: cancellationToken);
-                var next = (current.Resource["next"]?.ToObject<long>() ?? 0) + 1;
-                current.Resource["next"] = next;
+                var last = current.Resource["next"]?.ToObject<long>() ?? 0;
+                current.Resource["next"] = last + size;
                 await CosmosContainer.ReplaceItemAsync(current.Resource, table, seqPk,
                     new ItemRequestOptions { IfMatchEtag = current.ETag }, cancellationToken);
-                return next;
+                return last + 1;
             }
             catch (CosmosException ex) when (ex.StatusCode == HttpStatusCode.NotFound)
             {
-                var seed = (await MaxIdAsync(table, cancellationToken) ?? 0) + 1;
+                var max = await MaxIdAsync(table, cancellationToken) ?? 0;
                 try
                 {
-                    await CosmosContainer.CreateItemAsync(new JObject { ["id"] = table, [PartitionKeyProperty] = "__seq", ["next"] = seed }, seqPk, cancellationToken: cancellationToken);
-                    return seed;
+                    await CosmosContainer.CreateItemAsync(new JObject { ["id"] = table, [PartitionKeyProperty] = "__seq", ["next"] = max + size }, seqPk, cancellationToken: cancellationToken);
+                    return max + 1;
                 }
                 catch (CosmosException dup) when (dup.StatusCode == HttpStatusCode.Conflict)
                 {
@@ -1000,7 +1010,7 @@ internal sealed partial class CosmosDbCommand : DbCommand
             }
         }
 
-        throw new InvalidOperationException($"Could not allocate a sequence id for '{table}'.");
+        throw new InvalidOperationException($"Could not reserve a block of ids for '{table}'.");
     }
 
     private async Task<long?> MaxIdAsync(string table, CancellationToken cancellationToken)
