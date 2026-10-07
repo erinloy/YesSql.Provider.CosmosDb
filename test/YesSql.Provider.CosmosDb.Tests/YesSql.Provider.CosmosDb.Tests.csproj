@@ -26,6 +26,8 @@
   <ItemGroup>
     <!-- The statements YesSql, its test suites and Orchard Core send to the provider, with parameter values removed. -->
     <None Include="Sql\statements.sql" CopyToOutputDirectory="PreserveNewest" />
+    <!-- Each WHERE clause in the corpus with the predicate the regex translator produced for it. -->
+    <None Include="Sql\where-translations.tsv" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 
 </Project>

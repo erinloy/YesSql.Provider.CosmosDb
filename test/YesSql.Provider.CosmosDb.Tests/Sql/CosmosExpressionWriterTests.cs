@@ -1,5 +1,4 @@
 using System.Text.RegularExpressions;
-using YesSql.Provider.CosmosDb.Internal;
 using YesSql.Provider.CosmosDb.Internal.Sql;
 
 namespace YesSql.Provider.CosmosDb.Tests.Sql;
@@ -99,51 +98,37 @@ public class CosmosExpressionWriterTests
 
     private static string Normalize(string text) => Regex.Replace(text, @"\s+", string.Empty).ToLowerInvariant();
 
-    private static string[] Corpus() =>
-        File.ReadAllLines(Path.Combine(AppContext.BaseDirectory, "Sql", "statements.sql")).Where(l => l.Length > 0).ToArray();
-
     [Fact]
-    public void The_new_translation_equals_the_old_one_on_every_where_clause_in_the_corpus()
+    public void The_translation_equals_what_the_regex_translator_produced_for_every_where_clause_in_the_corpus()
     {
-        var legacy = new CosmosDbCommand(null!);
-        var compared = 0;
-        var rejectedOnPurpose = 0;
-        var notComparable = new List<string>();
+        // where-translations.tsv holds each WHERE clause found in the statement corpus and the Cosmos predicate the
+        // regex-based translator produced for it before it was replaced. Subqueries are covered by their own test.
+        var golden = File.ReadAllLines(Path.Combine(AppContext.BaseDirectory, "Sql", "where-translations.tsv")).Where(l => l.Length > 0).ToArray();
+        Assert.True(golden.Length > 80, "the golden file is missing or truncated");
+
         var differences = new List<string>();
-
-        foreach (var sql in Corpus())
+        var rejectedOnPurpose = 0;
+        foreach (var line in golden)
         {
-            var where = CosmosDbCommand.ExtractWhere(sql);
-            if (string.IsNullOrWhiteSpace(where))
-            {
-                continue;
-            }
+            var parts = line.Split('	');
+            var where = parts[0];
+            var expected = parts[1];
 
-            // The old translator resolves a subquery by running it against Cosmos, so those are covered by the
-            // writer test above instead.
-            if (Regex.IsMatch(where, @"\bin\s*\(\s*select\b", RegexOptions.IgnoreCase))
-            {
-                notComparable.Add("subquery: " + where);
-                continue;
-            }
-
-            var oldText = legacy.TranslateWhere(where);
-
-            string newText;
+            string actual;
             try
             {
                 var literals = new List<string>();
                 var writer = new CosmosExpressionWriter(_ => throw new InvalidOperationException(), text => { literals.Add(text); return "@__lit" + (literals.Count - 1); });
-                newText = writer.Write(SqlParser.ParseExpression(where));
+                actual = writer.Write(SqlParser.ParseExpression(where));
                 for (var i = 0; i < literals.Count; i++)
                 {
-                    newText = newText.Replace("@__lit" + i, "'" + literals[i].Replace("'", "''") + "'");
+                    actual = actual.Replace("@__lit" + i, "'" + literals[i].Replace("'", "''") + "'");
                 }
             }
             catch (SqlSyntaxException ex)
             {
                 // YesSql's tests send a bare, unquoted column on purpose, to check that a rejected query raises a
-                // DbException. The old translator left it for Cosmos to reject; the parser rejects it up front.
+                // DbException. The regex translator left it for Cosmos to reject; the parser rejects it up front.
                 if (where.Contains("ThisColumnDoesNotExist", StringComparison.Ordinal))
                 {
                     rejectedOnPurpose++;
@@ -154,15 +139,14 @@ public class CosmosExpressionWriterTests
                 continue;
             }
 
-            compared++;
-            if (Normalize(oldText) != Normalize(newText))
+            // The old translator kept "NOT LIKE" and "IS NULL" as written; the writer spells them in upper case.
+            if (Normalize(expected) != Normalize(actual))
             {
-                differences.Add($"DIFFERENT {where}\n  old: {oldText}\n  new: {newText}");
+                differences.Add($"DIFFERENT {where}\n  old: {expected}\n  new: {actual}");
             }
         }
 
-        Assert.True(compared > 60, $"only {compared} where clauses were compared");
         Assert.True(rejectedOnPurpose >= 3, "the unquoted-column statements should be rejected by the parser");
-        Assert.True(differences.Count == 0, $"{differences.Count} of {compared + differences.Count} differ:\n" + string.Join("\n", differences.Take(15)));
+        Assert.True(differences.Count == 0, $"{differences.Count} of {golden.Length} differ:\n" + string.Join("\n", differences.Take(15)));
     }
 }

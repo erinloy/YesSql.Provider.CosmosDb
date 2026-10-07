@@ -426,12 +426,14 @@ internal sealed partial class SqlParser
     private ColumnRef ParseColumn()
     {
         string? qualifier = null;
+        var qualifierIsTable = false;
         var token = AtEnd ? throw Error("Expected a column but the statement ended") : Peek;
 
         if (token.Kind is SqlTokenKind.Word or SqlTokenKind.Bracketed
             && _index + 1 < _tokens.Count && _tokens[_index + 1].IsSymbol("."))
         {
-            qualifier = token.Kind == SqlTokenKind.Bracketed ? token.Value : token.Text;
+            qualifierIsTable = token.Kind == SqlTokenKind.Bracketed;
+            qualifier = qualifierIsTable ? token.Value : token.Text;
             _index += 2;
             token = AtEnd ? throw Error("Expected a column name after '.'") : Peek;
         }
@@ -442,7 +444,7 @@ internal sealed partial class SqlParser
         }
 
         _index++;
-        return new ColumnRef(qualifier, token.Value);
+        return new ColumnRef(qualifier, token.Value, qualifierIsTable);
     }
 
     private object ParseNumber(SqlToken token)
