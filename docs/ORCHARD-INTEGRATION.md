@@ -8,7 +8,7 @@ The sample uses the `PerTable` partition strategy by default and runs with `PerS
 
 ## How Orchard selects a database
 
-`AddDataAccess()` in `OrchardCore.Data.YesSql` registers a singleton `IStore` per shell. It reads the shell's `DatabaseProvider` setting and calls the matching YesSql extension (`UseSqlServer`, `UseSqLite`, `UseMySql`, `UsePostgreSql`), then registers the shell's `IIndexProvider`s with the store. The set of providers is fixed in three places: the `DatabaseProviderValue` constants, the `switch` in `AddDataAccess`, and the `switch` in `DbConnectionValidator` used during setup. None of them is extensible from outside Orchard.
+`AddDataAccess()` in `OrchardCore.Data.YesSql` registers a singleton `IStore` per shell. It reads the shell's `DatabaseProvider` setting and calls the matching YesSql extension (`UseSqlServer`, `UseSqLite`, `UseMySql`, `UsePostgreSql`), then registers the shell's `IIndexProvider`s with the store. The set of providers is fixed in three places: the `DatabaseProviderValue` constants, the `switch` in `AddDataAccess`, and the `switch` in `DbConnectionValidator` used during setup. None of them is extensible from outside Orchard, which is why the provider replaces the `IStore` registration, as described below, and is not registered as a database option. The code is in [Orchard Core](https://github.com/OrchardCMS/OrchardCore), `src/OrchardCore/OrchardCore.Data.YesSql`.
 
 Orchard also ties YesSql to the request. A scoped `ISession` is committed through `IDocumentStore.CommitAsync()` when the request scope is disposed, and `IDocumentStore.CancelAsync()` is called when the request throws. With `PerStore` the provider reverts an unsaved unit of work with transactional batches, which is atomic for a request that changed up to 100 items. With `PerTable` the rollback is best effort. Neither isolates the request from other sessions while it runs. See [PARTITIONING.md](PARTITIONING.md) for the limits.
 
@@ -91,9 +91,3 @@ The `Cosmos` section of `appsettings.json` holds the endpoint, key and database 
 - Content is created, edited and removed through Orchard's content manager inside a shell scope, not through the admin UI, and the search and indexing modules are not enabled in the sample.
 - A cancelled request calls `ISession.CancelAsync()` and a failing request throws inside the scope; neither is a failing HTTP request.
 - Orchard Core versions other than 3.0.1 and the 4.0 preview named above.
-
-## Making it a built-in option
-
-The cleaner long-term route is an upstream change to Orchard Core: add a `CosmosDb` value to `DatabaseProviderValue`, a case in both `switch` statements, and a data provider entry for the setup screen. That would make Orchard depend on this package, so it would need agreement from the Orchard maintainers.
-
-Reference: [Orchard Core source](https://github.com/OrchardCMS/OrchardCore), `src/OrchardCore/OrchardCore.Data.YesSql`.
