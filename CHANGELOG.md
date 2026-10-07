@@ -2,7 +2,7 @@
 
 All notable changes are listed here. The project is in preview, so minor versions may change behavior.
 
-## 0.1.3 (not yet released)
+## 0.1.3
 
 ### Added
 - Works with YesSql 6.0.0. The package is still built against YesSql 5.4.7, and YesSql 6's own test suite (`CoreTests`) passes against that build, on both partition strategies. CI now runs it.
