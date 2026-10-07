@@ -99,7 +99,7 @@ public class SqlLexerTests
         var ex = Assert.Throws<SqlSyntaxException>(() => SqlLexer.Tokenize(sql));
         Assert.Contains(expected, ex.Message, StringComparison.OrdinalIgnoreCase);
         Assert.InRange(ex.Position, 0, sql.Length);
-        Assert.IsAssignableFrom<NotSupportedException>(ex);
+        Assert.IsAssignableFrom<System.Data.Common.DbException>(ex);
     }
 
     [Fact]
