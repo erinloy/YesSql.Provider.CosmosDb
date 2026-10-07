@@ -88,6 +88,20 @@ public class SelectShapeTests
     }
 
     [Fact]
+    public void A_reduce_index_query_paged_by_document_id_orders_by_the_document_id()
+    {
+        var shape = Shape(
+            "SELECT [Document].* FROM [Document] INNER JOIN (SELECT [Document].[Id], MAX([Document].[Id]) AS order_1 FROM [Document] " +
+            "INNER JOIN [ArticlesByDay_Document] AS b_a1 ON b_a1.[DocumentId] = [Document].[Id] " +
+            "INNER JOIN [ArticlesByDay] AS i_a1 ON i_a1.[Id] = b_a1.[ArticlesByDayId] " +
+            "WHERE (i_a1.[DayOfYear] = @p) GROUP BY [Document].[Id] ORDER BY order_1 LIMIT 20) AS IndexQuery ON IndexQuery.[Id] = [Document].[Id] ORDER BY order_1");
+
+        Assert.Equal(ReaderRoute.ReduceJoin, shape.Reader);
+        Assert.Equal(new[] { new OrderColumn("DocumentId", false) }, shape.Order);
+        Assert.Equal(20, shape.Limit);
+    }
+
+    [Fact]
     public void Joins_to_two_different_index_tables_are_a_multi_index_query_and_the_same_table_twice_is_not()
     {
         const string join = " INNER JOIN [{0}] AS {1} ON {1}.[DocumentId] = [Document].[Id]";
