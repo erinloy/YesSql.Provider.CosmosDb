@@ -3,9 +3,9 @@ using YesSql.Provider.CosmosDb.Internal.Sql;
 
 namespace YesSql.Provider.CosmosDb.Tests.Sql;
 
-public class SqlExpressionParserTests
+public class SqlParserExpressionTests
 {
-    private static SqlExpr Parse(string sql) => SqlExpressionParser.Parse(sql);
+    private static SqlExpr Parse(string sql) => SqlParser.ParseExpression(sql);
 
     [Fact]
     public void And_binds_tighter_than_or_and_chains_are_flat()

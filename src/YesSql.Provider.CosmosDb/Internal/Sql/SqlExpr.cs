@@ -35,5 +35,14 @@ internal sealed record SubSelect(ColumnRef Column, string Table, string Alias, S
 
 internal sealed record ParenExpr(SqlExpr Inner) : SqlExpr;
 
-/// <summary>A function call such as <c>MAX(x)</c>; <see cref="Name"/> is as written.</summary>
-internal sealed record FunctionExpr(string Name, IReadOnlyList<SqlExpr> Arguments) : SqlExpr;
+/// <summary>A function call such as <c>MAX(x)</c> or <c>count(DISTINCT x)</c>; <see cref="Name"/> is as written.</summary>
+internal sealed record FunctionExpr(string Name, IReadOnlyList<SqlExpr> Arguments, bool Distinct = false) : SqlExpr;
+
+/// <summary><c>*</c> or <c>alias.*</c>, as a select item or the argument of <c>count(*)</c>.</summary>
+internal sealed record StarExpr(string? Qualifier) : SqlExpr;
+
+/// <summary>A <c>"double quoted"</c> name, as in the part of <c>DateTimePart("year", [Date])</c>.</summary>
+internal sealed record QuotedNameExpr(string Name) : SqlExpr;
+
+/// <summary>A bare word naming a select item alias, as in <c>ORDER BY order_1</c>.</summary>
+internal sealed record AliasRefExpr(string Name) : SqlExpr;

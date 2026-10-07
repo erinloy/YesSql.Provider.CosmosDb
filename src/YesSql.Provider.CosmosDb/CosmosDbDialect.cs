@@ -86,7 +86,7 @@ public sealed class CosmosDbDialect : BaseDialect
     /// <inheritdoc />
     public override string LegacyIdentityColumnString => "";
     /// <inheritdoc />
-    public override string IdentitySelectString => "";
+    public override string IdentitySelectString => "RETURNING";
     /// <inheritdoc />
     public override string IdentityLastId => "";
 
