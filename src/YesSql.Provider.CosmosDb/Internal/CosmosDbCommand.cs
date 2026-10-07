@@ -1199,7 +1199,7 @@ internal sealed class CosmosDbCommand : DbCommand
         return new JValue(raw);
     }
 
-    private static string? ExtractWhere(string sql)
+    internal static string? ExtractWhere(string sql)
     {
         var m = Regex.Match(sql, @"\bwhere\b(.*?)(?:\bgroup\s+by\b|\border\s+by\b|\blimit\b|\boffset\b|\)\s*as\b|;|$)",
             RegexOptions.IgnoreCase | RegexOptions.Singleline);
@@ -1236,7 +1236,7 @@ internal sealed class CosmosDbCommand : DbCommand
 
     // Rewrite SQL column refs (alias.[Col], [table].[Col], or bare [Col]) → Cosmos c["Col"] (single
     // pass so an already-rewritten c["Col"] is not reprocessed), then map SQL null tests to Cosmos.
-    private string TranslateWhere(string where)
+    internal string TranslateWhere(string where)
     {
         where = Regex.Replace(where, @"(?:(?:\w+|\[[^\]]+\])\.)?\[([^\]]+)\]", "c[\"$1\"]");
         where = Regex.Replace(where, @"(c\[""[^""]+""\])\s+is\s+not\s+null", "(IS_DEFINED($1) AND NOT IS_NULL($1))", RegexOptions.IgnoreCase);

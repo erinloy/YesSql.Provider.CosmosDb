@@ -1,18 +1,28 @@
 using System;
+using System.Data.Common;
 
 namespace YesSql.Provider.CosmosDb.Internal.Sql;
 
 /// <summary>
-/// Thrown when a statement is not in the SQL subset the provider understands. It derives from
-/// <see cref="NotSupportedException"/> because that is what the provider throws for statements it cannot translate.
+/// Thrown when the provider rejects a statement because it is not in the SQL subset it understands. It is a
+/// <see cref="DbException"/>, like the error a relational database raises for invalid SQL, because YesSql 6 expects a
+/// rejected query to surface as one.
 /// </summary>
-internal sealed class SqlSyntaxException : NotSupportedException
+internal sealed class SqlSyntaxException : DbException
 {
     public SqlSyntaxException(string message, string statement, int position)
         : base($"{message} at position {position} in: {Excerpt(statement, position)}")
     {
         Statement = statement;
         Position = position;
+    }
+
+    /// <summary>For a rejection that is found after parsing, when no single position applies.</summary>
+    public SqlSyntaxException(string message)
+        : base(message)
+    {
+        Statement = string.Empty;
+        Position = 0;
     }
 
     public string Statement { get; }
