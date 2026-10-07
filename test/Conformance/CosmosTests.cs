@@ -14,13 +14,23 @@ using YesSql.Provider.CosmosDb;
 namespace YesSql.Tests
 {
     /// <summary>
-    /// Runs YesSql's full CoreTests conformance suite against the Cosmos DB provider (emulator).
+    /// Runs YesSql's full CoreTests conformance suite against the Cosmos DB provider. It targets the emulator at
+    /// http://localhost:8081/ unless COSMOS_TEST_ENDPOINT and COSMOS_TEST_KEY name an account, which is how the suite
+    /// is run against a real one. The run creates one database, named yessql_conf_*, and does not delete it.
     /// </summary>
     public class CosmosTests : CoreTests
     {
-        private const string Endpoint = "http://localhost:8081/";
-        // Microsoft's published, well-known Cosmos DB emulator key (not a secret).
-        private const string Key = "C2y6yDjf5/R+ob0N8A7Cgv30VRDJIWEHLM+4QDU5DE2nQ9nDuVTqobD4b8mGGyPMbIZnqyMsEcaGQy67XIw/Jw==";
+        private static readonly string Endpoint =
+            Environment.GetEnvironmentVariable("COSMOS_TEST_ENDPOINT") ?? "http://localhost:8081/";
+
+        // Without an explicit account the key is Microsoft's published, well-known emulator key (not a secret). An
+        // account named by COSMOS_TEST_ENDPOINT needs its own key in COSMOS_TEST_KEY; the emulator key is never sent to it.
+        private static readonly string Key = Environment.GetEnvironmentVariable("COSMOS_TEST_ENDPOINT") is null
+            ? "C2y6yDjf5/R+ob0N8A7Cgv30VRDJIWEHLM+4QDU5DE2nQ9nDuVTqobD4b8mGGyPMbIZnqyMsEcaGQy67XIw/Jw=="
+            : Environment.GetEnvironmentVariable("COSMOS_TEST_KEY")
+                ?? throw new InvalidOperationException("COSMOS_TEST_ENDPOINT is set, so COSMOS_TEST_KEY is required.");
+
+        private static bool IsEmulator => Uri.TryCreate(Endpoint, UriKind.Absolute, out var uri) && uri.IsLoopback;
         private const string ContainerId = "yessql";
 
         // One database for the whole run (CoreTests caches _configuration statically).
@@ -35,7 +45,7 @@ namespace YesSql.Tests
             ConnectionMode = ConnectionMode.Gateway,
             LimitToEndpoint = true,
             // Skip certificate validation for a loopback emulator only; a real account must be validated.
-            HttpClientFactory = Uri.TryCreate(Endpoint, UriKind.Absolute, out var uri) && uri.IsLoopback
+            HttpClientFactory = IsEmulator
                 ? () => new HttpClient(new HttpClientHandler
                 {
                     ServerCertificateCustomValidationCallback = HttpClientHandler.DangerousAcceptAnyServerCertificateValidator,
@@ -58,7 +68,7 @@ namespace YesSql.Tests
         {
             lock (WarmupLock)
             {
-                if (_warmed)
+                if (_warmed || !IsEmulator)
                 {
                     return;
                 }
