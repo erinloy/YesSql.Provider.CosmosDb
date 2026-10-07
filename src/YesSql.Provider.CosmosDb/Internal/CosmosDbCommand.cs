@@ -225,6 +225,12 @@ internal sealed partial class CosmosDbCommand : DbCommand
             // An index join ("JOIN [index] AS a ON a.[DocumentId] = …") — whether flat (FirstOrDefault) or wrapped in
             // a "(SELECT … GROUP BY …)" dedup subquery (ListAsync) — is an index query.
             case ReaderRoute.IndexJoin:
+                // A page of a query over one index is selected in Cosmos when it can be; the ids are then already paged.
+                if (await TryPageDocumentIdsAsync(shape, cancellationToken) is { } pagedIds)
+                {
+                    return new CosmosDbDataReader(DocumentColumns, await ReadDocumentRowsAsync(shape.RequiredFromTable, pagedIds, cancellationToken));
+                }
+
                 return await DocumentsOfAsync(shape, await GatherDocumentIdsAsync(shape, cancellationToken), cancellationToken);
 
             // A join onto a "(SELECT … )" subquery with no index inside is the document-by-type form of
@@ -516,6 +522,11 @@ internal sealed partial class CosmosDbCommand : DbCommand
     // by the scalar path (CountAsync) and the reader path (raw Inner/Left/Right join count API).
     private async Task<long> CountJoinAsync(SelectShape shape, CancellationToken cancellationToken)
     {
+        if (await TryCountDocumentsAsync(shape, cancellationToken) is { } counted)
+        {
+            return counted;
+        }
+
         List<long> ids;
         if (shape.HasReduceJoin)
         {
