@@ -86,7 +86,7 @@ Cosmos DB can only commit atomically within a single logical partition. A YesSql
 
 ## Limitations
 
-- The provider is not a SQL engine. YesSql talks to it through ADO.NET and SQL text, and it recognizes the statement shapes that YesSql and Orchard Core generate. Other statements generally fail with `NotSupportedException`.
+- The provider is not a SQL engine. YesSql talks to it through ADO.NET and SQL text, and it recognizes the statement shapes that YesSql and Orchard Core generate. A statement outside the SQL it understands is rejected with a `DbException` that names the position of the problem, and one it parses but cannot run throws `NotSupportedException`.
 - There is no isolation between sessions. Writes are applied as they happen, so another session can read changes from a unit of work that has not committed. On rollback the provider restores the previous version of each item, which can overwrite a concurrent writer's changes to the same item.
 - With `PerTable`, a failed unit of work is rolled back item by item, and a crash during rollback can leave partial writes.
 - Queries that join an index to its documents first collect the matching document ids from the index partition, apply any ordering and paging in the client, and then read the page's documents. Request unit cost grows with the number of matching index rows.
@@ -146,7 +146,7 @@ See [docs/CONFORMANCE.md](docs/CONFORMANCE.md) for how the conformance project w
 
 ## Contributing
 
-Issues and pull requests are welcome. Run both test projects against the emulator before submitting a change that touches `CosmosDbCommand`, since that is where SQL is translated.
+Issues and pull requests are welcome. Run both test projects against the emulator before submitting a change that touches `CosmosDbCommand`, since that is where SQL is translated and run.
 
 ## License
 

@@ -43,7 +43,9 @@ YesSql session
 
 ### Statement handling
 
-`CosmosDbCommand` dispatches on the statement text.
+Each statement is parsed once when it runs, and `CosmosDbCommand` dispatches on the parse tree.
+
+The parser is in `Internal/Sql`: a lexer (`SqlLexer`, one pass, `[bracketed]` names, `'strings'` and `@parameters`), a recursive-descent parser (`SqlParser`) that builds a statement tree (`SelectStatement`, `InsertStatement`, `UpdateStatement`, `DeleteStatement`, `RenameColumnStatement`) and expression trees, and `SelectShape`, which reads a parsed `SELECT` to find the document table, the index joins (map, several maps, reduce with its bridge table), the predicate, the ordering and the paging, wherever YesSql put them, including inside the derived table of an index query. The grammar is the subset YesSql and Orchard Core emit: joins, `WHERE` with `AND`, `OR`, `NOT`, comparisons, `LIKE`, `IN` lists, `IN (SELECT ...)`, `IS [NOT] NULL` and `||`, `GROUP BY`, `ORDER BY`, `OFFSET`, `LIMIT`, `count`, `MAX`, `REPLACE` and `DateTimePart`. Nesting is limited to 200 levels. A statement outside the grammar throws `SqlSyntaxException`, a `DbException`, and an `ORDER BY` term the provider cannot apply is refused rather than dropped. Parsing a statement takes a few microseconds.
 
 **Writes (`ExecuteNonQuery`)**
 
@@ -96,7 +98,10 @@ Writes are applied when the statement runs, so that a later read in the same ses
 | `CosmosDbCommandInterpreter.cs` | Schema commands (no-ops except `RenameColumn`) |
 | `Internal/CosmosDbConnectionFactory.cs` | `IConnectionFactory` carrying the options |
 | `Internal/CosmosDbConnection.cs` | `DbConnection`; shared client and one-time provisioning |
-| `Internal/CosmosDbCommand.cs` | SQL-to-Cosmos translation |
+| `Internal/CosmosDbCommand.cs` | Statement dispatch and the read paths |
+| `Internal/CosmosDbCommand.Writes.cs` | `INSERT`, `UPDATE`, `DELETE` and `renamecolumn` |
+| `Internal/CosmosDbCommand.Where.cs` | `WHERE` clauses to Cosmos predicates |
+| `Internal/Sql/` | Lexer, parser, statement and expression trees, `SelectShape`, and the writer that turns an expression into Cosmos text |
 | `Internal/CosmosDbTransaction.cs` | Undo log and rollback |
 | `Internal/CosmosDbDataReader.cs` | In-memory forward-only reader |
 | `Internal/CosmosDbParameter*.cs` | Parameter types |
