@@ -52,6 +52,28 @@ internal sealed class CosmosDbTransaction : DbTransaction
         return Task.CompletedTask;
     }
 
+    // ADO.NET rolls an uncommitted transaction back when it is disposed. YesSql relies on that: ISession.CancelAsync
+    // and its handling of a failed read or query release the transaction by disposing it, without calling Rollback.
+    protected override void Dispose(bool disposing)
+    {
+        if (disposing && !_committed)
+        {
+            Rollback();
+        }
+
+        base.Dispose(disposing);
+    }
+
+    public override async ValueTask DisposeAsync()
+    {
+        if (!_committed)
+        {
+            await RollbackAsync(CancellationToken.None).ConfigureAwait(false);
+        }
+
+        await base.DisposeAsync().ConfigureAwait(false);
+    }
+
     public override async Task RollbackAsync(CancellationToken cancellationToken)
     {
         try
