@@ -31,7 +31,7 @@ The cost is the per-partition ceiling of 20 GB and 10,000 RU/s for the whole sto
 
 ## Rollback
 
-Writes are applied immediately, so YesSql's autoflush (a query inside a session that sees the session's own unsaved changes) keeps working. Each write records its inverse in an undo log held by the transaction. `Commit` discards the log. Disposing a transaction that was not committed, which is what `ISession.CancelAsync` and YesSql's own failure handling do, rolls it back. `Rollback` restores each item touched by the unit of work to the state recorded first, so it issues one operation per item however many times the item was written.
+Writes are applied immediately, so YesSql's autoflush (a query inside a session that sees the session's own unsaved changes) keeps working. A write is started without waiting for Cosmos to answer; the next query, `Commit` or `Rollback` waits for the writes in flight, and a write that failed is thrown there (see [ARCHITECTURE.md](ARCHITECTURE.md#transactions)). Each write records its inverse in an undo log held by the transaction. `Commit` discards the log. Disposing a transaction that was not committed, which is what `ISession.CancelAsync` and YesSql's own failure handling do, rolls it back. `Rollback` restores each item touched by the unit of work to the state recorded first, so it issues one operation per item however many times the item was written.
 
 With `PerStore`, the inverse operations are sent as transactional batches in the single partition. A batch is all-or-nothing. Batches are limited to 100 operations, so a unit of work that touched more than 100 items is rolled back in several batches, and atomicity holds per batch rather than for the whole set. If the service rejects a batch, for example because an item to delete is already gone, the provider applies that batch's operations one at a time, which is not atomic. A rollback is therefore atomic when it fits in one batch and the batch is accepted.
 
@@ -41,7 +41,8 @@ With `PerTable`, the inverse operations are applied one at a time across partiti
 
 - Because writes are applied when issued, other sessions can read a unit of work's changes before it commits.
 - The undo log restores a snapshot taken before the write. If another session changed the same item in between, rollback overwrites that change.
-- Commit does not do any work; the data is already written. A crash before commit leaves the writes in place and the undo log lost.
+- Commit only waits for the writes still in flight; the data is already written. A crash before commit leaves the writes in place and the undo log lost.
+- A write that Cosmos rejects is reported by a later statement or by the commit, not by the statement that issued it.
 
 Optimistic concurrency is separate from rollback. A checked `UPDATE` compares the stored `Version` and uses the item's ETag, so concurrent writers to the same document get a `ConcurrencyException` instead of silently overwriting each other.
 

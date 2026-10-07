@@ -75,6 +75,44 @@ internal sealed partial class CosmosDbCommand : DbCommand
             ? $"c[\"{PartitionKeyProperty}\"] = {pkParam} AND c.__table = \"{table}\""
             : $"c[\"{PartitionKeyProperty}\"] = {pkParam}";
 
+    // Waits for the writes the open unit of work has in flight, so a query sees them.
+    private Task CompleteWritesAsync() => _connection.ActiveTransaction?.CompleteWritesAsync() ?? Task.CompletedTask;
+
+    // Waits for the write in flight to one item, so a point read of it sees that write.
+    private Task CompleteWriteAsync(string itemId) => _connection.ActiveTransaction?.CompleteWriteAsync(itemId) ?? Task.CompletedTask;
+
+    // Writes an item whose outcome is not needed to answer the statement. Inside a unit of work the request is started
+    // and not awaited, see CosmosDbTransaction.UpsertAsync.
+    private async Task WriteItemAsync(JObject item, string table, CancellationToken cancellationToken)
+    {
+        if (Undo is { } transaction)
+        {
+            await transaction.UpsertAsync(CosmosContainer, item, PartitionKeyFor(table), cancellationToken);
+            return;
+        }
+
+        await CosmosContainer.UpsertItemAsync(item, PartitionKeyFor(table), cancellationToken: cancellationToken);
+    }
+
+    // Deletes an item, started and not awaited inside a unit of work like WriteItemAsync. An item already gone is fine.
+    private async Task DeleteItemAsync(string itemId, string table, CancellationToken cancellationToken)
+    {
+        if (Undo is { } transaction)
+        {
+            await transaction.DeleteAsync(CosmosContainer, itemId, PartitionKeyFor(table), cancellationToken);
+            return;
+        }
+
+        try
+        {
+            await CosmosContainer.DeleteItemAsync<JObject>(itemId, PartitionKeyFor(table), cancellationToken: cancellationToken);
+        }
+        catch (CosmosException ex) when (ex.StatusCode == HttpStatusCode.NotFound)
+        {
+            // already gone
+        }
+    }
+
     // Stamp the partition key + table discriminator onto an item being written.
     private JObject WithPartition(JObject item, string table)
     {
@@ -135,6 +173,7 @@ internal sealed partial class CosmosDbCommand : DbCommand
         switch (SqlParser.ParseStatement(CommandText))
         {
             case SelectStatement select:
+                await CompleteWritesAsync();
                 var shape = SelectShape.Of(select, CommandText);
                 switch (shape.Scalar)
                 {
@@ -173,8 +212,8 @@ internal sealed partial class CosmosDbCommand : DbCommand
                 }
 
                 WithPartition(item, insert.Table);
-                await CosmosContainer.UpsertItemAsync(item, PartitionKeyFor(insert.Table), cancellationToken: cancellationToken);
                 Undo?.Record(item["id"]!.ToString(), PkValue(insert.Table), null);
+                await WriteItemAsync(item, insert.Table, cancellationToken);
                 return newId;
         }
 
@@ -201,6 +240,8 @@ internal sealed partial class CosmosDbCommand : DbCommand
         {
             throw new NotSupportedException($"Unsupported query statement: {CommandText}");
         }
+
+        await CompleteWritesAsync();
 
         var shape = SelectShape.Of(select, CommandText);
         switch (shape.Reader)
@@ -1025,11 +1066,13 @@ internal sealed partial class CosmosDbCommand : DbCommand
     {
         var options = _connection.Options;
         var key = $"{options.AccountEndpoint}|{options.DatabaseId}|{options.ContainerId}|{table}";
-        return SequenceBlocks.NextAsync(key, (size, token) => ReserveSequenceBlockAsync(table, size, token), cancellationToken);
+        return SequenceBlocks.NextAsync(key, (size, lowest, token) => ReserveSequenceBlockAsync(table, size, lowest, token), cancellationToken);
     }
 
-    // Reserves `size` ids from the table's counter with a conditional write and returns the first one.
-    private async Task<long> ReserveSequenceBlockAsync(string table, int size, CancellationToken cancellationToken)
+    // Reserves `size` ids from the table's counter with a conditional write and returns the first one. The first id is
+    // at least `lowest`: this process has issued the ids below it, and they may still be on their way to Cosmos, so the
+    // counter, or the largest stored id when there is no counter, can be behind them.
+    private async Task<long> ReserveSequenceBlockAsync(string table, int size, long lowest, CancellationToken cancellationToken)
     {
         var seqPk = new PartitionKey("__seq");
 
@@ -1044,7 +1087,7 @@ internal sealed partial class CosmosDbCommand : DbCommand
             try
             {
                 var current = await CosmosContainer.ReadItemAsync<JObject>(table, seqPk, cancellationToken: cancellationToken);
-                var last = current.Resource["next"]?.ToObject<long>() ?? 0;
+                var last = Math.Max(current.Resource["next"]?.ToObject<long>() ?? 0, lowest - 1);
                 current.Resource["next"] = last + size;
                 await CosmosContainer.ReplaceItemAsync(current.Resource, table, seqPk,
                     new ItemRequestOptions { IfMatchEtag = current.ETag }, cancellationToken);
@@ -1052,7 +1095,7 @@ internal sealed partial class CosmosDbCommand : DbCommand
             }
             catch (CosmosException ex) when (ex.StatusCode == HttpStatusCode.NotFound)
             {
-                var max = await MaxIdAsync(table, cancellationToken) ?? 0;
+                var max = Math.Max(await MaxIdAsync(table, cancellationToken) ?? 0, lowest - 1);
                 try
                 {
                     await CosmosContainer.CreateItemAsync(new JObject { ["id"] = table, [PartitionKeyProperty] = "__seq", ["next"] = max + size }, seqPk, cancellationToken: cancellationToken);

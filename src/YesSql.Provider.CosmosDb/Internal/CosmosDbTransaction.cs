@@ -1,9 +1,11 @@
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Data;
 using System.Data.Common;
 using System.Linq;
 using System.Net;
+using System.Runtime.ExceptionServices;
 using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.Azure.Cosmos;
@@ -18,11 +20,22 @@ namespace YesSql.Provider.CosmosDb.Internal;
 /// one logical partition, so the inverse ops are sent as Cosmos transactional batches (atomic per batch of up
 /// to 100 operations; a rejected batch is retried item by item); in <see cref="PartitionStrategy.PerTable"/>
 /// they span partitions, so rollback is best-effort per item.
+/// <para>
+/// Writes are started without waiting for the response (see <see cref="UpsertAsync"/>), so the round trips of one
+/// save overlap. Every other command, commit and rollback first waits for the writes in flight
+/// (<see cref="CompleteWritesAsync"/>), and a failed write is thrown there, never dropped.
+/// </para>
 /// </summary>
 internal sealed class CosmosDbTransaction : DbTransaction
 {
     private readonly CosmosDbConnection _connection;
+    // Writes that are started and not yet answered. A single unit of work holds this many Cosmos requests at once.
+    private const int MaxWritesInFlight = 8;
+
     private readonly List<UndoOp> _undo = new();
+    private readonly SemaphoreSlim _slots = new(MaxWritesInFlight);
+    private readonly ConcurrentDictionary<string, Task> _inFlight = new();
+    private Exception? _failure;
     private bool _committed;
 
     public CosmosDbTransaction(CosmosDbConnection connection, IsolationLevel isolationLevel)
@@ -41,15 +54,109 @@ internal sealed class CosmosDbTransaction : DbTransaction
     internal void Record(string id, string partitionKey, JObject? prior)
         => _undo.Add(new UndoOp(id, partitionKey, prior));
 
+    /// <summary>
+    /// Writes an item. The request is started and this returns once it is under way, so the next write of the same
+    /// save can start before this one is answered. A failure is kept and thrown by the next command that waits for the
+    /// writes in flight, or by commit. The caller records the undo before it calls this.
+    /// </summary>
+    internal Task UpsertAsync(Container container, JObject item, PartitionKey partitionKey, CancellationToken cancellationToken)
+        => StartAsync(item["id"]!.ToString(),
+            () => container.UpsertItemAsync(item, partitionKey, cancellationToken: cancellationToken), cancellationToken);
+
+    /// <summary>Deletes an item, started and not awaited like <see cref="UpsertAsync"/>. An item that is already gone is not a failure.</summary>
+    internal Task DeleteAsync(Container container, string itemId, PartitionKey partitionKey, CancellationToken cancellationToken)
+        => StartAsync(itemId, async () =>
+        {
+            try
+            {
+                await container.DeleteItemAsync<JObject>(itemId, partitionKey, cancellationToken: cancellationToken).ConfigureAwait(false);
+            }
+            catch (CosmosException ex) when (ex.StatusCode == HttpStatusCode.NotFound)
+            {
+                // already gone
+            }
+        }, cancellationToken);
+
+    private async Task StartAsync(string itemId, Func<Task> write, CancellationToken cancellationToken)
+    {
+        ThrowIfFailed();
+
+        // Two writes of one item must reach Cosmos in the order they were issued.
+        if (_inFlight.TryGetValue(itemId, out var earlier))
+        {
+            await earlier.ConfigureAwait(false);
+            ThrowIfFailed();
+        }
+
+        await _slots.WaitAsync(cancellationToken).ConfigureAwait(false);
+        var finished = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        _inFlight[itemId] = finished.Task;
+        _ = RunAsync();
+
+        async Task RunAsync()
+        {
+            try
+            {
+                await write().ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                Interlocked.CompareExchange(ref _failure, ex is CosmosException cosmos ? new CosmosDbException(cosmos) : ex, null);
+            }
+            finally
+            {
+                _inFlight.TryRemove(new KeyValuePair<string, Task>(itemId, finished.Task));
+                _slots.Release();
+                finished.SetResult();
+            }
+        }
+    }
+
+    /// <summary>Waits for the write in flight to one item, if there is one, and throws the first write that failed.</summary>
+    internal async Task CompleteWriteAsync(string itemId)
+    {
+        if (_inFlight.TryGetValue(itemId, out var write))
+        {
+            await write.ConfigureAwait(false);
+        }
+
+        ThrowIfFailed();
+    }
+
+    /// <summary>Waits for the writes in flight, and throws the first one that failed.</summary>
+    internal async Task CompleteWritesAsync()
+    {
+        await WaitForWritesAsync().ConfigureAwait(false);
+        ThrowIfFailed();
+    }
+
+    private async Task WaitForWritesAsync()
+    {
+        while (!_inFlight.IsEmpty)
+        {
+            await Task.WhenAll(_inFlight.Values).ConfigureAwait(false);
+        }
+    }
+
+    private void ThrowIfFailed()
+    {
+        if (_failure is { } failure)
+        {
+            ExceptionDispatchInfo.Capture(failure).Throw();
+        }
+    }
+
     public override void Commit() => CommitAsync(CancellationToken.None).GetAwaiter().GetResult();
     public override void Rollback() => RollbackAsync(CancellationToken.None).GetAwaiter().GetResult();
 
-    public override Task CommitAsync(CancellationToken cancellationToken)
+    public override async Task CommitAsync(CancellationToken cancellationToken)
     {
-        // Writes were already applied; commit just discards the undo log.
+        // Writes are applied as they are issued; commit waits for the last of them, and then discards the undo log.
+        // A write that failed means the unit of work is not committed.
+        await CompleteWritesAsync().ConfigureAwait(false);
         _committed = true;
         _undo.Clear();
-        return Task.CompletedTask;
+        _connection.EndTransaction(this);
     }
 
     // ADO.NET rolls an uncommitted transaction back when it is disposed. YesSql relies on that: ISession.CancelAsync
@@ -59,6 +166,11 @@ internal sealed class CosmosDbTransaction : DbTransaction
         if (disposing && !_committed)
         {
             Rollback();
+        }
+
+        if (disposing)
+        {
+            _connection.EndTransaction(this);
         }
 
         base.Dispose(disposing);
@@ -71,6 +183,7 @@ internal sealed class CosmosDbTransaction : DbTransaction
             await RollbackAsync(CancellationToken.None).ConfigureAwait(false);
         }
 
+        _connection.EndTransaction(this);
         await base.DisposeAsync().ConfigureAwait(false);
     }
 
@@ -78,6 +191,9 @@ internal sealed class CosmosDbTransaction : DbTransaction
     {
         try
         {
+            // The writes in flight have to land before they can be undone. A failed one is not rethrown here: the
+            // unit of work is being undone, and its failure is thrown to the caller by the command or commit that saw it.
+            await WaitForWritesAsync().ConfigureAwait(false);
             await RollbackCoreAsync(cancellationToken);
         }
         catch (CosmosException ex)

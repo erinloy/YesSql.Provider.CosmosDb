@@ -23,12 +23,14 @@ internal sealed partial class CosmosDbCommand
         switch (SqlParser.ParseStatement(CommandText))
         {
             case RenameColumnStatement rename:
+                await CompleteWritesAsync();
                 return await RenameColumnAsync(rename, cancellationToken);
             case InsertStatement insert:
                 return await InsertAsync(insert, cancellationToken);
             case UpdateStatement update:
                 return await UpdateAsync(update, cancellationToken);
             case DeleteStatement delete:
+                await CompleteWritesAsync();
                 return await DeleteAsync(delete, cancellationToken);
             default:
                 throw new NotSupportedException($"Unsupported non-query statement: {CommandText}");
@@ -79,8 +81,8 @@ internal sealed partial class CosmosDbCommand
             bridge["id"] = $"{insert.Table}:{indexForeignKey}:{bridgeDocumentId}";
             WithPartition(bridge, insert.Table);
 
-            await CosmosContainer.UpsertItemAsync(bridge, PartitionKeyFor(insert.Table), cancellationToken: cancellationToken);
             Undo?.Record(bridge["id"]!.ToString(), PkValue(insert.Table), null);
+            await WriteItemAsync(bridge, insert.Table, cancellationToken);
             return 1;
         }
 
@@ -104,8 +106,8 @@ internal sealed partial class CosmosDbCommand
         }
 
         WithPartition(item, insert.Table);
-        await CosmosContainer.UpsertItemAsync(item, PartitionKeyFor(insert.Table), cancellationToken: cancellationToken);
         Undo?.Record($"{insert.Table}:{id}", PkValue(insert.Table), null);
+        await WriteItemAsync(item, insert.Table, cancellationToken);
         return 1;
     }
 
@@ -117,6 +119,7 @@ internal sealed partial class CosmosDbCommand
         if (update.Assignments.Any(assignment => assignment.Value is FunctionExpr function
             && function.Name.Equals("REPLACE", StringComparison.OrdinalIgnoreCase)))
         {
+            await CompleteWritesAsync();
             return await ReplaceContentAsync(update, cancellationToken);
         }
 
@@ -127,6 +130,9 @@ internal sealed partial class CosmosDbCommand
         var id = TryParam("Id", out var idParameter) && idParameter is not null
             ? Convert.ToInt64(idParameter)
             : throw new InvalidOperationException($"Parameter 'Id' not found for: {CommandText}");
+
+        // Only a write to this same item has to land before it is read.
+        await CompleteWriteAsync($"{table}:{id}");
 
         JObject? item = null;
         string? etag = null;
@@ -177,7 +183,11 @@ internal sealed partial class CosmosDbCommand
         }
         else
         {
-            await CosmosContainer.UpsertItemAsync(item, PartitionKeyFor(table), cancellationToken: cancellationToken);
+            // The write is not checked, so it counts as one row whatever its outcome. A failure is thrown by the next
+            // command that waits for the writes in flight, or by commit.
+            Undo?.Record($"{table}:{id}", PkValue(table), prior);
+            await WriteItemAsync(item, table, cancellationToken);
+            return 1;
         }
 
         Undo?.Record($"{table}:{id}", PkValue(table), prior);
@@ -258,14 +268,7 @@ internal sealed partial class CosmosDbCommand
         {
             var id = item["id"]!.ToString();
             Undo?.Record(id, PkValue(table), item); // restore the deleted item on rollback
-            try
-            {
-                await CosmosContainer.DeleteItemAsync<JObject>(id, PartitionKeyFor(table), cancellationToken: cancellationToken);
-            }
-            catch (CosmosException ex) when (ex.StatusCode == HttpStatusCode.NotFound)
-            {
-                // already gone
-            }
+            await DeleteItemAsync(id, table, cancellationToken);
         }
 
         return items.Count;

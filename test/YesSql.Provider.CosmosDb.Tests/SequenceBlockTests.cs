@@ -30,7 +30,7 @@ public class SequenceBlockTests
         long counter = 0;
         var key = "unit-" + Guid.NewGuid();
 
-        Task<long> Reserve(int size, CancellationToken token)
+        Task<long> Reserve(int size, long lowest, CancellationToken token)
         {
             reservations++;
             var first = counter + 1;
@@ -49,12 +49,61 @@ public class SequenceBlockTests
     }
 
     [Fact]
+    public async Task A_counter_that_is_behind_the_issued_ids_never_repeats_one()
+    {
+        // The counter is rebuilt from the largest stored id, which does not yet include the ids issued last.
+        var key = "unit-" + Guid.NewGuid();
+        var requested = new List<long>();
+        long counter = 0;
+
+        Task<long> Reserve(int size, long lowest, CancellationToken token)
+        {
+            requested.Add(lowest);
+            var first = Math.Max(counter, lowest - 1) + 1;
+            counter = first + size - 1;
+            return Task.FromResult(first);
+        }
+
+        var ids = new List<long>();
+        for (var i = 0; i < SequenceBlocks.BlockSize + 5; i++)
+        {
+            ids.Add(await SequenceBlocks.NextAsync(key, Reserve, CancellationToken.None));
+        }
+
+        counter = 0; // the stored counter is lost
+        for (var i = 0; i < SequenceBlocks.BlockSize * 2; i++)
+        {
+            ids.Add(await SequenceBlocks.NextAsync(key, Reserve, CancellationToken.None));
+        }
+
+        Assert.Equal(ids.Count, ids.Distinct().Count());
+        Assert.Equal(ids.OrderBy(id => id), ids);
+        Assert.All(requested.Skip(1), lowest => Assert.True(lowest > 1));
+    }
+
+    [Fact]
+    public async Task A_reservation_below_the_lowest_id_is_an_error()
+    {
+        var key = "unit-" + Guid.NewGuid();
+        var first = await SequenceBlocks.NextAsync(key, (size, lowest, token) => Task.FromResult(1L), CancellationToken.None);
+        Assert.Equal(1, first);
+
+        for (var i = 1; i < SequenceBlocks.BlockSize; i++)
+        {
+            await SequenceBlocks.NextAsync(key, (size, lowest, token) => Task.FromResult(1L), CancellationToken.None);
+        }
+
+        await Assert.ThrowsAsync<InvalidOperationException>(
+            () => SequenceBlocks.NextAsync(key, (size, lowest, token) => Task.FromResult(1L), CancellationToken.None));
+    }
+
+    [Fact]
     public async Task Concurrent_callers_get_distinct_ids()
     {
         long counter = 0;
         var key = "unit-" + Guid.NewGuid();
 
-        async Task<long> Reserve(int size, CancellationToken token)
+        async Task<long> Reserve(int size, long lowest, CancellationToken token)
         {
             await Task.Delay(5, token);
             return Interlocked.Add(ref counter, size) - size + 1;

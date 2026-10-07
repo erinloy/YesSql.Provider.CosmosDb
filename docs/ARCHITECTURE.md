@@ -85,6 +85,15 @@ The parser is in `Internal/Sql`: a lexer (`SqlLexer`, one pass, `[bracketed]` na
 
 Writes are applied when the statement runs, so that a later read in the same session (YesSql's autoflush) sees them. Each write records its inverse in the transaction's undo log: delete for a created item, restore of the prior snapshot for a changed or deleted one. `Commit` discards the log. `Rollback` replays it in reverse. See [PARTITIONING.md](PARTITIONING.md) for what that guarantees under each strategy.
 
+A write is started when the statement runs and the statement returns without waiting for Cosmos to answer (`CosmosDbTransaction.UpsertAsync` and `DeleteAsync`), so the writes of one save, the document and its index rows, are on the wire together. At most 8 are in flight. What has to wait:
+
+- A query (any `SELECT`, `DELETE`, `UPDATE ... REPLACE` or `renamecolumn`) waits for every write in flight, so it sees them.
+- An `UPDATE` of one item, which reads that item by id, waits only for an earlier write to the same item. A second write to an item also waits for the first, so two writes of one item reach Cosmos in the order they were issued.
+- A checked `UPDATE` (one with a `[Version]` condition) is awaited, because its result, one row or none, is the answer YesSql needs.
+- `Commit` and `Rollback` wait for everything in flight. Rollback has to, because it can only undo a write that has landed.
+
+A write that fails is not lost. The failure is kept, and the next statement that waits for the writes in flight, or `Commit`, throws it (a `CosmosDbException` for a Cosmos error). YesSql then cancels the unit of work, which rolls back every write, including the ones that succeeded. The statement that issued the failed write has already returned, so the exception surfaces on a later statement or on `SaveChangesAsync`.
+
 ## Connections
 
 `CosmosDbConnection` shares one `CosmosClient` per account endpoint and key for the life of the process, as the Cosmos SDK recommends. It creates the database and container once per process and endpoint, not on every connection open.
