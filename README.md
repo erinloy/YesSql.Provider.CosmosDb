@@ -95,7 +95,7 @@ Cosmos DB can only commit atomically within a single logical partition. A YesSql
 
 ## Running against the emulator
 
-Development uses the Linux emulator image (`vnext-preview`). It serves plain HTTP on port 8081, so use `http://localhost:8081/`. Use gateway mode and accept its self-signed certificate:
+Development uses the Linux emulator image (`vnext-preview`). It serves plain HTTP on port 8081, so use `http://localhost:8081/`. Use gateway mode. Emulators that serve HTTPS present a self-signed certificate, which has to be accepted explicitly:
 
 ```bash
 docker run -d --name cosmos-emu -p 8081:8081 -p 10250-10255:10250-10255 \
@@ -107,12 +107,17 @@ ClientOptions = new CosmosClientOptions
 {
     ConnectionMode = ConnectionMode.Gateway,
     LimitToEndpoint = true,
-    HttpClientFactory = () => new HttpClient(new HttpClientHandler
-    {
-        ServerCertificateCustomValidationCallback = HttpClientHandler.DangerousAcceptAnyServerCertificateValidator,
-    }),
+    // Emulator only. Skip certificate validation for a loopback endpoint and never for a real account.
+    HttpClientFactory = Uri.TryCreate(endpoint, UriKind.Absolute, out var uri) && uri.IsLoopback
+        ? () => new HttpClient(new HttpClientHandler
+        {
+            ServerCertificateCustomValidationCallback = HttpClientHandler.DangerousAcceptAnyServerCertificateValidator,
+        })
+        : null,
 }
 ```
+
+Do not use `DangerousAcceptAnyServerCertificateValidator` with a real Cosmos DB account. It turns off certificate validation for the connection that carries the account key.
 
 The account key in this repository's tests and sample is the emulator's published default key. It is not a secret.
 
