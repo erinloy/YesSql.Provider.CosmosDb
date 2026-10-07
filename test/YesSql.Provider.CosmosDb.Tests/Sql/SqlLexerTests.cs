@@ -3,6 +3,7 @@ using YesSql.Provider.CosmosDb.Internal.Sql;
 
 namespace YesSql.Provider.CosmosDb.Tests.Sql;
 
+[Collection("Timing")]
 public class SqlLexerTests
 {
     private static string[] Corpus() =>
