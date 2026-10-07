@@ -5,6 +5,12 @@
 # usage: scripts/smoke-sample.sh [orchard-core-version] [port]
 #   scripts/smoke-sample.sh 3.0.1                    # YesSql 5.4.7
 #   scripts/smoke-sample.sh 4.0.0-preview-19175      # YesSql 6.0.0
+#
+# Environment:
+#   SMOKE_PARTITION=PerStore   use the PerStore partition strategy (default PerTable)
+#   SMOKE_CONTENT=1            also run the content checks (samples/OrchardSmokeTest/ContentChecks.cs): create, publish,
+#                              edit, unpublish and remove content items, ordered and paged queries, concurrent creates
+#                              and a cancelled request, all through Orchard's content manager
 set -euo pipefail
 
 version="${1:-3.0.1}"
@@ -21,7 +27,7 @@ log="$sample/App_Data/smoke.log"
 
 dotnet build "$sample" -c Release -p:OrchardCoreVersion="$version" --nologo -v q
 
-ASPNETCORE_ENVIRONMENT=Development \
+SmokeTest__ContentChecks="$([ "${SMOKE_CONTENT:-0}" = "1" ] && echo true || echo false)" Cosmos__PartitionStrategy="${SMOKE_PARTITION:-PerTable}" ASPNETCORE_ENVIRONMENT=Development \
 ASPNETCORE_URLS="http://localhost:$port" \
 ASPNETCORE_CONTENTROOT="$contentroot" \
 Cosmos__Database="$database" \
@@ -50,6 +56,21 @@ for path in / /Login /admin; do
   grep -q "Cosmos Smoke Test" "$page" || fail "GET $path did not return the Cosmos Smoke Test site"
   echo "GET $path -> $code"
 done
+
+if [ "${SMOKE_CONTENT:-0}" = "1" ]; then
+  result="$sample/App_Data/content.json"
+  code="$(curl -s -o "$result" -w '%{http_code}' -m 600 "http://localhost:$port/_smoke/content" || true)"
+  # One line per check: ok/FAIL, name, detail.
+  python3 - "$result" <<'PY' || true
+import json, sys
+with open(sys.argv[1], encoding="utf-8") as f:
+    checks = json.load(f)
+for c in checks:
+    print(("ok   " if c["ok"] else "FAIL ") + c["name"] + ("" if c["ok"] else "  -> " + c["detail"]))
+print(f"{sum(c['ok'] for c in checks)} of {len(checks)} content checks passed")
+PY
+  [ "$code" = "200" ] || fail "the content checks returned $code"
+fi
 
 if grep -q -E '^(fail|crit):' "$log"; then
   fail "the application logged errors"

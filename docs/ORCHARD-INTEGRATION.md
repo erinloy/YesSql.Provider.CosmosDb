@@ -82,6 +82,8 @@ dotnet run --project samples/OrchardSmokeTest -p:OrchardCoreVersion=4.0.0-previe
 
 `samples/nuget.config` adds Orchard Core's preview feed for the samples only. `scripts/smoke-sample.sh <version>` builds the sample, starts it against a running emulator with a fresh database, and checks that `/`, `/Login` and `/admin` return the site. CI runs it for both versions.
 
+With `SMOKE_CONTENT=1` it also runs the content checks in [`samples/OrchardSmokeTest/ContentChecks.cs`](../samples/OrchardSmokeTest/ContentChecks.cs), through Orchard's content manager: create and publish items, edit one as a draft and publish the draft, unpublish and remove items, ordered and paged queries (by title and by creation date), twenty concurrent creates, and a cancelled and a failing request, which must leave no documents or index rows behind. `SMOKE_PARTITION=PerStore` runs the same site with the PerStore strategy. CI runs both strategies for both versions.
+
 The `Cosmos` section of `appsettings.json` holds the endpoint, key and database name. On first start AutoSetup creates the `Default` tenant and its data in the `orchard_smoke` database.
 
 ## Not covered yet

@@ -11,7 +11,7 @@ YesSql ships providers for SQL Server, PostgreSQL, MySQL and SQLite. This packag
 Preview (0.1.x). Interfaces and behavior may still change.
 
 - YesSql's own test suite (`CoreTests`) passes in full against the Cosmos DB emulator on both partition strategies: 249 of 249 tests for YesSql 5.4.7, and the 6.0.0 suite (the tests that do not need a database server). The 5.4.7 suite also passes 249 of 249 against a real serverless account on both strategies. See [docs/CONFORMANCE.md](docs/CONFORMANCE.md).
-- A minimal Orchard Core 3.0.1 site runs its setup recipe and serves requests with this provider as its only data store. See [docs/ORCHARD-INTEGRATION.md](docs/ORCHARD-INTEGRATION.md).
+- A minimal Orchard Core 3.0.1 site runs its setup recipe, serves requests and passes content checks (create, publish, draft, unpublish, remove, ordered and paged queries, concurrent creates, cancelled and failed requests) with this provider as its only data store. See [docs/ORCHARD-INTEGRATION.md](docs/ORCHARD-INTEGRATION.md).
 - Read [Limitations](#limitations) before using this with real data.
 
 ## Installation

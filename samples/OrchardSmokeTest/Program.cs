@@ -44,6 +44,9 @@ builder.Services
                     AccountEndpoint = cosmos["Endpoint"],
                     AccountKey = cosmos["Key"],
                     DatabaseId = cosmos["Database"],
+                    // PerTable is the default. PerStore keeps a tenant's data in one partition, named after the tenant.
+                    PartitionStrategy = Enum.Parse<PartitionStrategy>(cosmos["PartitionStrategy"] ?? nameof(PartitionStrategy.PerTable)),
+                    PartitionScope = shellSettings.Name,
                     ClientOptions = new CosmosClientOptions
                     {
                         ConnectionMode = ConnectionMode.Gateway,
@@ -73,6 +76,24 @@ builder.Services
     });
 
 var app = builder.Build();
+
+// With SmokeTest:ContentChecks set, GET /_smoke/content runs the content operations of ContentChecks against the tenant
+// and answers with the result of every check. It is not mapped otherwise.
+if (app.Configuration.GetValue<bool>("SmokeTest:ContentChecks"))
+{
+    app.Use(async (context, next) =>
+    {
+        if (!context.Request.Path.Equals("/_smoke/content", StringComparison.Ordinal))
+        {
+            await next();
+            return;
+        }
+
+        var checks = await ContentChecks.RunAsync(context.RequestServices.GetRequiredService<IShellHost>());
+        context.Response.StatusCode = checks.All(check => check.Ok) ? StatusCodes.Status200OK : StatusCodes.Status500InternalServerError;
+        await context.Response.WriteAsJsonAsync(checks);
+    });
+}
 
 app.UseOrchardCore();
 

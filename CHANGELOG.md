@@ -7,6 +7,9 @@ All notable changes are listed here. The project is in preview, so minor version
 ### Fixed
 - A query ordered by a date column on an index (`OrderBy(x => x.CreatedUtc)`) could return rows out of order. The provider sorts these in the client, and compared the dates as the culture's text, which drops the fractions of a second and sorts `9:59 AM` after `10:00 AM`, so items created within the same second tied and kept index order. Dates are now compared as moments in time. Found by running content operations through a real Orchard Core site.
 
+### Added
+- Orchard Core content checks (`SMOKE_CONTENT=1 scripts/smoke-sample.sh`): content items are created, published, edited as drafts, unpublished and removed through Orchard's content manager, queried in order and by page, created concurrently, and cancelled or failed requests are checked to leave nothing behind. CI runs them on Orchard Core 3.0.1 and the 4.0 preview with both partition strategies.
+
 ## 0.1.5
 
 ### Fixed
