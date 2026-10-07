@@ -78,7 +78,7 @@ The parser is in `Internal/Sql`: a lexer (`SqlLexer`, one pass, `[bracketed]` na
 - `IN (SELECT ...)` subqueries are run first and replaced with an `ARRAY_CONTAINS` test over the resulting values, which are passed as a query parameter. Cosmos has no correlated subqueries across partitions.
 - Document and index-row queries map YesSql's `ORDER BY` (including the `MAX(a.[Col]) AS order_N` form) to a Cosmos `ORDER BY` and push `OFFSET`/`LIMIT` into the query. A lone `OFFSET` is paired with a maximum `LIMIT`, because Cosmos requires both.
 - Dates are stored as UTC instants (`...Z`). A `DateTimeOffset` is written as UTC and a `Local` `DateTime` is converted, because Cosmos DB compares `DateTimeToTimestamp(c.x)` wrongly in a `WHERE` clause for a stored offset east of +01:00, which the emulator does not reproduce.
-- Index joins ordered by an index column sort in the client. Cosmos `ORDER BY` is case-sensitive and cannot order by `LOWER(...)`, and the reference providers order case-insensitively.
+- Index joins ordered by an index column sort in the client, after reading every matching index row (only the document id and the order columns). Cosmos `ORDER BY` is case-sensitive and cannot order by `LOWER(...)`, and the reference providers order case-insensitively. Dates are stored as text, which Cosmos compares as text, and a time with fractions of a second sorts before the same second without them. Only a numeric column could be ordered in Cosmos, and the provider cannot tell a numeric column from a text one before it reads the rows, so none is.
 - `byte[]` column values are stored as `{ "$b64": "<base64>" }` so they round-trip as `byte[]`.
 
 ## Transactions
