@@ -6,7 +6,7 @@ All notable changes are listed here. The project is in preview, so minor version
 
 ### Changed
 - Statements are now parsed, not matched with regular expressions. Each statement is read once into a tree, and the provider runs it from the tree. Reading a statement takes about 3 microseconds, against about 1 millisecond for the regular expressions, and a statement is no longer at the mercy of a pattern that matches it wrongly.
-- A statement the parser cannot read throws a `DbException` that says where. An `ORDER BY` term the provider cannot apply (a function, an unknown alias, a document column other than `Id` on an index query) throws instead of being dropped, and so does a reduce index query ordered by document id.
+- A statement the parser cannot read throws a `DbException` that says where. A malformed `renamecolumn` now does too, where it used to throw `NotSupportedException`. An `ORDER BY` term the provider cannot apply (a function, an unknown alias, a document column other than `Id` on an index query) throws instead of being dropped, and so does a reduce index query ordered by document id.
 - An `UPDATE` with no `@Id`, a `REPLACE` whose parameter is missing or that sits next to another assignment, and an `INSERT` value that is neither a parameter nor a literal now throw instead of writing a partial or wrong row.
 - Queries ordered by `OrderBy(x => x.Id)` on an index join are now ordered. The regexes dropped that term, so the rows came back in index order.
 - `TRUE` and `FALSE` are accepted as literals.
