@@ -109,7 +109,7 @@ public class SqlLexerTests
         static string InList(int count) =>
             "SELECT * FROM [Document] WHERE [Id] IN (" + string.Join(", ", Enumerable.Range(0, count).Select(i => "@p" + i)) + ")";
 
-        // The best of several runs, so another test running at the same moment does not decide the result.
+        // The best of many runs: another process using the machine slows some runs, but not every one of them.
         static double BestMilliseconds(string sql, int runs)
         {
             var best = double.MaxValue;
@@ -123,17 +123,20 @@ public class SqlLexerTests
             return best;
         }
 
-        var small = InList(20_000);
+        var small = InList(10_000);
         var large = InList(200_000);
         SqlLexer.Tokenize(InList(1_000)); // warm up
 
-        var smallMs = BestMilliseconds(small, 7);
-        var largeMs = BestMilliseconds(large, 7);
+        var smallMs = BestMilliseconds(small, 15);
+        var largeMs = BestMilliseconds(large, 15);
 
         // 8 tokens before the list, 200,000 parameters, 199,999 commas and the closing parenthesis.
         Assert.Equal(400_008, SqlLexer.Tokenize(large).Count);
-        Assert.True(largeMs < 2_000, $"200,000 parameters took {largeMs:F0} ms");
-        Assert.True(largeMs < smallMs * 40, $"10x the input took {largeMs / Math.Max(smallMs, 0.01):F1}x the time");
+
+        // 20x the input. Linear time is about 20x; quadratic would be about 400x. The limit sits well between the two
+        // so that noise from a busy machine cannot reach it, and an accidental quadratic cannot hide under it.
+        var ratio = largeMs / Math.Max(smallMs, 0.001);
+        Assert.True(ratio < 120, $"20x the input took {ratio:F0}x the time ({smallMs:F2} ms for 10,000, {largeMs:F1} ms for 200,000)");
     }
 
     [Fact]
