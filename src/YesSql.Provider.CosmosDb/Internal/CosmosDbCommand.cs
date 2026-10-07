@@ -475,8 +475,8 @@ internal sealed partial class CosmosDbCommand : DbCommand
         return documentIds;
     }
 
-    // Order comparison matching the reference dialects: nulls first, numbers numerically, everything else
-    // as a case-insensitive string (ISO date strings sort chronologically under ordinal comparison).
+    // Order comparison matching the reference dialects: nulls first, numbers numerically, dates as moments in time,
+    // everything else as a case-insensitive string.
     private static int CompareTokens(JToken? a, JToken? b)
     {
         var aNull = a is null || a.Type == JTokenType.Null;
@@ -493,7 +493,23 @@ internal sealed partial class CosmosDbCommand : DbCommand
             return a.ToObject<double>().CompareTo(b.ToObject<double>());
         }
 
+        // Cosmos returns a date column's text, and the JSON reader turns it into a date. Its ToString() is the culture's
+        // text without the fractions of a second, which ties moments within one second and sorts 9:59 AM after 10:00 AM.
+        if (a.Type == JTokenType.Date && b.Type == JTokenType.Date)
+        {
+            return MomentOf(a).CompareTo(MomentOf(b));
+        }
+
         return string.Compare(a.ToString(), b.ToString(), StringComparison.OrdinalIgnoreCase);
+    }
+
+    // The instant a date token stands for. Dates are stored as UTC ("...Z"); a value written with an offset by an earlier
+    // version is read as a local time, which is converted. A date with no kind is compared as written.
+    private static DateTime MomentOf(JToken token)
+    {
+        var value = ((JValue)token).Value;
+        var moment = value is DateTimeOffset offset ? offset.UtcDateTime : (DateTime)value!;
+        return moment.Kind == DateTimeKind.Local ? moment.ToUniversalTime() : moment;
     }
 
     // Stable client-side ordering of rows by the parsed order terms (shared by the index/join gatherers).
