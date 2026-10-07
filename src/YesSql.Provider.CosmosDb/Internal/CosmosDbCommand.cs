@@ -91,7 +91,7 @@ internal sealed partial class CosmosDbCommand : DbCommand
     {
         foreach (DbParameter p in _parameters)
         {
-            query = query.WithParameter("@" + p.ParameterName.TrimStart('@'), p.Value is DBNull ? null : p.Value);
+            query = query.WithParameter("@" + p.ParameterName.TrimStart('@'), p.Value is DBNull ? null : AsUtc(p.Value));
         }
 
         foreach (var (name, value) in _derivedParameters)
@@ -1017,7 +1017,18 @@ internal sealed partial class CosmosDbCommand : DbCommand
         // JSON has no binary type; wrap byte[] self-descriptively so reads can recover it as byte[]
         // (a bare base64 string would come back as a string and fail the byte[] cast).
         byte[] bytes => new JObject { ["$b64"] = Convert.ToBase64String(bytes) },
-        _ => JToken.FromObject(value),
+        _ => JToken.FromObject(AsUtc(value)!),
+    };
+
+    // A moment in time is stored and queried as a UTC instant ("...Z"), never with an offset. Cosmos DB compares
+    // DateTimeToTimestamp(c.x) wrongly in a WHERE clause for a stored offset east of +01:00 ("...+05:30" is
+    // never equal to its own instant), so a value written with such an offset could not be found by a query.
+    // A DateTime of unspecified kind is left as it is, because it carries no offset.
+    private static object? AsUtc(object? value) => value switch
+    {
+        DateTimeOffset moment => moment.UtcDateTime,
+        DateTime { Kind: DateTimeKind.Local } local => local.ToUniversalTime(),
+        _ => value,
     };
 
     // Reverse of ToToken for reading column values: recover wrapped byte[]; otherwise the raw CLR value.
