@@ -9,7 +9,7 @@
 
   <PropertyGroup Label="Package">
     <PackageId>YesSql.Provider.CosmosDb</PackageId>
-    <Version>0.1.6</Version>
+    <Version>0.1.7</Version>
     <Description>Azure Cosmos DB (NoSQL API) storage provider for YesSql, for running Orchard Core and other YesSql-based applications on Cosmos DB.</Description>
     <Authors>Ziltch</Authors>
     <Company>Ziltch</Company>
