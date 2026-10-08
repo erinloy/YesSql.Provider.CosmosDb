@@ -2,7 +2,7 @@
 
 All notable changes are listed here. The project is in preview, so minor versions may change behavior.
 
-## Unreleased
+## 0.1.7
 
 ### Added
 - The Orchard Core sample and its documentation use `UseBlockIdGenerator()`, as Orchard does for every database that more than one process can reach (checked against Orchard Core's `OrchardCoreBuilderExtensions`: SQL Server, MySQL and PostgreSQL use it, SQLite uses the default). The sample's content checks now run through it on both Orchard Core versions and both partition strategies.
