@@ -4,6 +4,7 @@ NOTICE: AI GENERATED SLOP. KNOWN TO WORK, BUT BARELY REVIEWED. TAKE APPROPRIATE 
 
 [![CI](https://github.com/erinloy/YesSql.Provider.CosmosDb/actions/workflows/ci.yml/badge.svg?branch=master)](https://github.com/erinloy/YesSql.Provider.CosmosDb/actions/workflows/ci.yml)
 [![Release](https://github.com/erinloy/YesSql.Provider.CosmosDb/actions/workflows/release.yml/badge.svg)](https://github.com/erinloy/YesSql.Provider.CosmosDb/actions/workflows/release.yml)
+[![CodeQL](https://github.com/erinloy/YesSql.Provider.CosmosDb/actions/workflows/dynamic/github-code-scanning/codeql/badge.svg?branch=master)](https://github.com/erinloy/YesSql.Provider.CosmosDb/security/code-scanning)
 [![NuGet](https://img.shields.io/nuget/v/YesSql.Provider.CosmosDb.svg)](https://www.nuget.org/packages/YesSql.Provider.CosmosDb)
 [![NuGet downloads](https://img.shields.io/nuget/dt/YesSql.Provider.CosmosDb.svg)](https://www.nuget.org/packages/YesSql.Provider.CosmosDb)
 [![License: MIT](https://img.shields.io/github/license/erinloy/YesSql.Provider.CosmosDb.svg)](https://github.com/erinloy/YesSql.Provider.CosmosDb/blob/master/LICENSE)
