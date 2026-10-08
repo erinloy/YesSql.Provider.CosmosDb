@@ -49,13 +49,7 @@ internal sealed partial class CosmosDbCommand
             .WithParameter("@pk", PkValue(table));
         queryDef = BindParameters(queryDef);
 
-        var ids = new List<long>();
-        using var iterator = CosmosContainer.GetItemQueryIterator<long>(queryDef,
-            requestOptions: new QueryRequestOptions { PartitionKey = PartitionKeyFor(table) });
-        while (iterator.HasMoreResults)
-        {
-            ids.AddRange(await iterator.ReadNextAsync(cancellationToken));
-        }
+        var ids = await ReadAllAsync<long>(queryDef, table, cancellationToken);
 
         return ids;
     }
@@ -68,23 +62,7 @@ internal sealed partial class CosmosDbCommand
             return null;
         }
 
-        var table = shape.LinkJoin!.Table;
-        var queryDef = new QueryDefinition(
-                $"SELECT VALUE COUNT(1) FROM (SELECT DISTINCT VALUE {CosmosExpressionWriter.Property("DocumentId")} FROM c WHERE "
-                + await IndexRowsFilterAsync(shape, cancellationToken) + ")")
-            .WithParameter("@pk", PkValue(table));
-        queryDef = BindParameters(queryDef);
-
-        using var iterator = CosmosContainer.GetItemQueryIterator<long>(queryDef,
-            requestOptions: new QueryRequestOptions { PartitionKey = PartitionKeyFor(table) });
-        while (iterator.HasMoreResults)
-        {
-            foreach (var count in await iterator.ReadNextAsync(cancellationToken))
-            {
-                return count;
-            }
-        }
-
-        return 0L;
+        return await CountDistinctDocumentIdsAsync(shape.LinkJoin!.Table, await IndexRowsFilterAsync(shape, cancellationToken), cancellationToken);
     }
+
 }

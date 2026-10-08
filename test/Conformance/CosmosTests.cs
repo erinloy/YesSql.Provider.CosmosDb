@@ -53,6 +53,11 @@ namespace YesSql.Tests
                 : null,
         };
 
+        // COSMOS_ID_GENERATOR=Block runs the suite with the block id generator, which leases ids from the store, as YesSql's
+        // own provider suites do. Without it the suite uses the default generator, which seeds a counter from MAX(Id).
+        private static readonly bool UseBlockIds =
+            string.Equals(Environment.GetEnvironmentVariable("COSMOS_ID_GENERATOR"), "Block", StringComparison.OrdinalIgnoreCase);
+
         private static readonly PartitionStrategy Strategy =
             string.Equals(Environment.GetEnvironmentVariable("COSMOS_PARTITION"), "PerStore", StringComparison.OrdinalIgnoreCase)
                 ? PartitionStrategy.PerStore
@@ -98,7 +103,7 @@ namespace YesSql.Tests
         protected override IConfiguration CreateConfiguration()
         {
             EnsureEmulatorWarm();
-            return new Configuration()
+            var configuration = new Configuration()
                 .UseCosmosDb(new CosmosDbOptions
                 {
                     AccountEndpoint = Endpoint,
@@ -109,11 +114,11 @@ namespace YesSql.Tests
                     PartitionStrategy = Strategy,
                     PartitionScope = "conf",
                 })
-                .SetTablePrefix(TablePrefix)
+                .SetTablePrefix(TablePrefix);
 #if YESSQL6
-                .WithThreadSafetyChecks()
+            configuration = configuration.WithThreadSafetyChecks();
 #endif
-                .UseDefaultIdGenerator()
+            return (UseBlockIds ? configuration.UseBlockIdGenerator() : configuration.UseDefaultIdGenerator())
                 .SetIdentityColumnSize(IdentityColumnSize.Int64);
         }
 
@@ -121,7 +126,9 @@ namespace YesSql.Tests
         protected override Task CleanDatabaseAsync(IConfiguration configuration, bool throwOnError)
             => Task.CompletedTask;
 
-        // Per-test isolation: delete every item in the container instead of raw DELETE FROM <table>.
+        // Per-test isolation: delete every item in the container instead of raw DELETE FROM <table>. The rows of the block id
+        // generator's Identifiers table stay, as they do in YesSql's own provider suites: CoreTests shares one configuration, so
+        // one generator that has already leased its collections for the whole run.
         protected override async Task ClearTablesAsync(IConfiguration configuration)
         {
             using var client = new CosmosClient(Endpoint, Key, ClientOptions());
@@ -129,11 +136,16 @@ namespace YesSql.Tests
 
             try
             {
-                using var iterator = container.GetItemQueryIterator<JObject>("SELECT c.id, c.pk FROM c");
+                using var iterator = container.GetItemQueryIterator<JObject>("SELECT c.id, c.pk, c.__table FROM c");
                 while (iterator.HasMoreResults)
                 {
                     foreach (var item in await iterator.ReadNextAsync())
                     {
+                        if (item["__table"]?.ToString().EndsWith("Identifiers", StringComparison.OrdinalIgnoreCase) == true)
+                        {
+                            continue;
+                        }
+
                         var id = item["id"]!.ToString();
                         var pk = item["pk"]?.ToString() ?? id;
                         await container.DeleteItemAsync<JObject>(id, new PartitionKey(pk));

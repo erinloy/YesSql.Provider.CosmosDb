@@ -163,19 +163,114 @@ public class SelectShapeTests
         Assert.Equal("t", SqlTree.DocumentTypeParameter(SqlParser.ParseExpression("([Document].[Type] = @t)")));
     }
 
-    [Fact]
-    public void Version_checks_are_read_from_the_predicate()
+    [Theory]
+    [InlineData("[Id] = @p", null, false)]
+    [InlineData("[Id] = @p AND [Version] = 3", 3L, false)]
+    [InlineData("[Id] = @p AND ([Version] IS NULL OR [Version] = 1)", 1L, true)]
+    [InlineData("[Id] = @p AND ([Version] = 1 OR [Version] IS NULL)", 1L, true)]
+    [InlineData("([Version] = 2) AND [Id] = 7", 2L, false)]
+    public void A_single_row_update_condition_is_recognized(string predicate, long? version, bool allowsNull)
     {
-        var check = SqlParser.ParseExpression("[Id] = @p AND ([Version] = 3 OR [Version] IS NULL)");
-        var plain = SqlParser.ParseExpression("[Id] = @p");
-
-        Assert.Equal(3, SqlTree.VersionCheck(check));
-        Assert.True(SqlTree.AllowsNullVersion(check));
-        Assert.Null(SqlTree.VersionCheck(plain));
-        Assert.False(SqlTree.AllowsNullVersion(plain));
+        var condition = SqlTree.UpdateCondition(SqlParser.ParseExpression(predicate))!;
+        Assert.NotNull(condition);
+        Assert.Equal(version, condition.Version);
+        Assert.Equal(allowsNull, condition.AllowsNullVersion);
     }
+
+    [Theory]
+    [InlineData("[Version] = 3")]
+    [InlineData("[Id] = @p AND [Name] = @n")]
+    [InlineData("[Id] = @p OR [Id] = @q")]
+    [InlineData("[Id] = @p AND [Version] = @v")]
+    [InlineData("[Id] = @p AND [Version] = 1 AND [Version] = 2")]
+    [InlineData("[Id] > @p")]
+    [InlineData("[Id] = @p AND ([Version] IS NULL OR [Version] > 1)")]
+    [InlineData("t.[Id] = @p")]
+    public void Any_other_update_condition_is_not_recognized(string predicate)
+        => Assert.Null(SqlTree.UpdateCondition(SqlParser.ParseExpression(predicate)));
 
     [Fact]
     public void A_literal_type_is_found_whatever_its_qualifier()
-        => Assert.Equal("My.Type", SqlTree.TypeLiteral(SqlParser.ParseExpression("[Document].[Type] = 'My.Type' AND [Id] = @p")));
+        => Assert.Equal(new LiteralExpr("My.Type"), SqlTree.TypeComparison(SqlParser.ParseExpression("[Document].[Type] = 'My.Type' AND [Id] = @p")));
+
+    [Fact]
+    public void A_type_under_an_OR_is_not_a_type_filter()
+        => Assert.Null(SqlTree.TypeComparison(SqlParser.ParseExpression("[Type] = 'A' OR [Type] = 'B'")));
+
+    [Theory]
+    [InlineData("[Type] = @Type", null)]
+    [InlineData("[Document].[Type] = 'A'", null)]
+    [InlineData("[Type] = @Type AND [Id] = @Id", "[Id] = @Id")]
+    [InlineData("[Type] = @Type AND [Name] LIKE 'a%'", "[Name] LIKE 'a%'")]
+    [InlineData("[Type] = @A OR [Type] = @B", "[Type] = @A OR [Type] = @B")]
+    public void WithoutTypeComparison_leaves_every_other_condition(string predicate, string? left)
+    {
+        var remaining = SqlTree.WithoutTypeComparison(SqlParser.ParseExpression(predicate));
+        Assert.Equal(left is null ? null : SqlPrinter.Print(SqlParser.ParseExpression(left)), remaining is null ? null : SqlPrinter.Print(remaining));
+    }
+
+    [Theory]
+    [InlineData("[Id] = @Id", 1)]
+    [InlineData("[Id] IN (@Id1, @Id2, 7)", 3)]
+    [InlineData("([Id] = @Id)", 1)]
+    public void A_predicate_that_selects_by_key_gives_its_operands(string predicate, int count)
+        => Assert.Equal(count, SqlTree.KeyOperands(SqlParser.ParseExpression(predicate))!.Count);
+
+    [Theory]
+    [InlineData("[Id] = @Id AND [Type] = @Type")]
+    [InlineData("[Id] IN (SELECT [Id] FROM [T] AS t)")]
+    [InlineData("[Id] IN (@Id1, [Other])")]
+    [InlineData("[Id] > @Id")]
+    [InlineData("[Id] = 'x'")]
+    public void Any_other_predicate_does_not_select_by_key(string predicate)
+        => Assert.Null(SqlTree.KeyOperands(SqlParser.ParseExpression(predicate)));
+
+    private static readonly Dictionary<string, string> Tables = new() { ["a"] = "One", ["b"] = "Two", ["c"] = "One" };
+
+    [Fact]
+    public void Terms_are_split_over_the_tables_they_refer_to()
+    {
+        var split = SqlTree.SplitByTable(SqlParser.ParseExpression("a.[Name] = @n AND b.[Age] > @a AND a.[City] = @c"), Tables, "sql");
+        Assert.Equal(2, split["One"].Count);
+        Assert.Single(split["Two"]);
+    }
+
+    [Fact]
+    public void Aliases_of_one_table_are_one_target()
+    {
+        // The same index joined twice: a condition over both aliases is tested against the rows of the one table.
+        var split = SqlTree.SplitByTable(SqlParser.ParseExpression("(a.[Day] = @x OR c.[Day] = @y)"), Tables, "sql");
+        Assert.Single(split["One"]);
+        Assert.Empty(split["Two"]);
+    }
+
+    [Fact]
+    public void An_unqualified_term_belongs_to_the_only_table()
+        => Assert.Single(SqlTree.SplitByTable(SqlParser.ParseExpression("[Name] = @n"), new Dictionary<string, string> { ["a"] = "One", ["c"] = "One" }, "sql")["One"]);
+
+    [Theory]
+    [InlineData("[Name] = @n")]
+    [InlineData("a.[Name] = b.[Name]")]
+    [InlineData("a.[Name] = @n OR b.[Name] = @n")]
+    [InlineData("[Document].[Version] = 3")]
+    [InlineData("z.[Name] = @n")]
+    public void A_term_that_cannot_be_run_against_one_table_is_refused(string predicate)
+        => Assert.Throws<NotSupportedException>(() => SqlTree.SplitByTable(SqlParser.ParseExpression(predicate), Tables, "sql"));
+
+    [Fact]
+    public void A_term_over_a_subquery_belongs_to_the_alias_of_its_operand()
+    {
+        var split = SqlTree.SplitByTable(SqlParser.ParseExpression("a.[DocumentId] IN (SELECT s.[DocumentId] FROM [T] AS s WHERE s.[X] = @x)"), Tables, "sql");
+        Assert.Single(split["One"]);
+    }
+
+    [Fact]
+    public void Equality_operands_are_found_by_column()
+    {
+        var operands = SqlTree.EqualityOperands(SqlParser.ParseExpression("[nextval] = @previous AND [dimension] = @dimension"))!;
+        Assert.Equal(new ParamRef("previous"), operands["NEXTVAL"]);
+        Assert.Equal(new ParamRef("dimension"), operands["dimension"]);
+        Assert.Null(SqlTree.EqualityOperands(SqlParser.ParseExpression("[a] = @a AND [b] > @b")));
+        Assert.Null(SqlTree.EqualityOperands(SqlParser.ParseExpression("[a] = @a AND [a] = @b")));
+    }
 }

@@ -21,7 +21,7 @@ namespace YesSql.Provider.CosmosDb.Internal;
 /// to 100 operations; a rejected batch is retried item by item); in <see cref="PartitionStrategy.PerTable"/>
 /// they span partitions, so rollback is best-effort per item.
 /// <para>
-/// Writes are started without waiting for the response (see <see cref="UpsertAsync"/>), so the round trips of one
+/// Writes are started without waiting for the response (see <see cref="CreateAsync"/>), so the round trips of one
 /// save overlap. Every other command, commit and rollback first waits for the writes in flight
 /// (<see cref="CompleteWritesAsync"/>), and a failed write is thrown there, never dropped.
 /// </para>
@@ -49,21 +49,44 @@ internal sealed class CosmosDbTransaction : DbTransaction
 
     /// <summary>
     /// Record the inverse of a write. <paramref name="prior"/> == null means the write created the item
-    /// (undo = delete); otherwise undo restores the prior snapshot (undo = upsert).
+    /// (undo = delete); otherwise undo restores the prior snapshot (undo = upsert). Writes complete on other threads,
+    /// so the log is guarded.
     /// </summary>
     internal void Record(string id, string partitionKey, JObject? prior)
-        => _undo.Add(new UndoOp(id, partitionKey, prior));
+    {
+        lock (_undo)
+        {
+            _undo.Add(new UndoOp(id, partitionKey, prior));
+        }
+    }
 
     /// <summary>
-    /// Writes an item. The request is started and this returns once it is under way, so the next write of the same
-    /// save can start before this one is answered. A failure is kept and thrown by the next command that waits for the
-    /// writes in flight, or by commit. The caller records the undo before it calls this.
+    /// Creates an item. It fails if an item with the same id already exists, as an INSERT of a duplicate key does. The
+    /// request is started and this returns once it is under way, so the next write of the same save can start before
+    /// this one is answered. A failure is kept and thrown by the next command that waits for the writes in flight, or by
+    /// commit. The undo (delete) is recorded when the item has been created, never for an item that was already there.
     /// </summary>
-    internal Task UpsertAsync(Container container, JObject item, PartitionKey partitionKey, CancellationToken cancellationToken)
-        => StartAsync(item["id"]!.ToString(),
-            () => container.UpsertItemAsync(item, partitionKey, cancellationToken: cancellationToken), cancellationToken);
+    internal Task CreateAsync(Container container, JObject item, PartitionKey partitionKey, string partitionKeyValue, CancellationToken cancellationToken)
+    {
+        var itemId = item["id"]!.ToString();
+        return StartAsync(itemId, async () =>
+        {
+            await container.CreateItemAsync(item, partitionKey, cancellationToken: cancellationToken).ConfigureAwait(false);
+            Record(itemId, partitionKeyValue, null);
+        }, cancellationToken);
+    }
 
-    /// <summary>Deletes an item, started and not awaited like <see cref="UpsertAsync"/>. An item that is already gone is not a failure.</summary>
+    /// <summary>
+    /// Replaces an item that exists, started and not awaited like <see cref="CreateAsync"/>. The caller records the
+    /// undo (the prior state) before it calls this.
+    /// </summary>
+    internal Task ReplaceAsync(Container container, JObject item, PartitionKey partitionKey, CancellationToken cancellationToken)
+    {
+        var itemId = item["id"]!.ToString();
+        return StartAsync(itemId, () => container.ReplaceItemAsync(item, itemId, partitionKey, cancellationToken: cancellationToken), cancellationToken);
+    }
+
+    /// <summary>Deletes an item, started and not awaited like <see cref="CreateAsync"/>. An item that is already gone is not a failure.</summary>
     internal Task DeleteAsync(Container container, string itemId, PartitionKey partitionKey, CancellationToken cancellationToken)
         => StartAsync(itemId, async () =>
         {
@@ -155,7 +178,11 @@ internal sealed class CosmosDbTransaction : DbTransaction
         // A write that failed means the unit of work is not committed.
         await CompleteWritesAsync().ConfigureAwait(false);
         _committed = true;
-        _undo.Clear();
+        lock (_undo)
+        {
+            _undo.Clear();
+        }
+
         _connection.EndTransaction(this);
     }
 
@@ -202,20 +229,25 @@ internal sealed class CosmosDbTransaction : DbTransaction
         }
     }
 
+    // Restores the items the unit of work touched. An operation leaves the log once it has been applied, so a rollback
+    // that fails partway can be run again for the rest.
     private async Task RollbackCoreAsync(CancellationToken cancellationToken)
     {
-        if (_committed || _undo.Count == 0)
+        if (_committed)
         {
             return;
         }
 
-        var container = _connection.CosmosContainer;
-
         // Only the first record for an item matters: it holds the item's state from before the unit of work
         // touched it, which is what rollback restores. Keeping one operation per item keeps the number of
         // operations, and so the number of batches, down to the number of items touched.
-        var ops = _undo.GroupBy(op => (op.PartitionKey, op.Id)).Select(group => group.First()).ToList();
-        _undo.Clear();
+        List<UndoOp> ops;
+        lock (_undo)
+        {
+            ops = _undo.GroupBy(op => (op.PartitionKey, op.Id)).Select(group => group.First()).ToList();
+        }
+
+        var container = _connection.CosmosContainer;
 
         if (_connection.Options.PartitionStrategy == PartitionStrategy.PerStore)
         {
@@ -238,13 +270,16 @@ internal sealed class CosmosDbTransaction : DbTransaction
                 using var response = await batch.ExecuteAsync(cancellationToken);
                 if (!response.IsSuccessStatusCode)
                 {
-                    // Atomic restore failed (e.g. deleting an already-gone item aborts the batch) — fall
-                    // back to best-effort per item so the rollback still completes.
+                    // A batch is all or nothing, and it is refused when one operation cannot apply, for example the
+                    // delete of an item that is already gone. Apply its operations one at a time instead: that is
+                    // no longer atomic, and anything other than a missing item is thrown.
                     foreach (var op in chunk)
                     {
                         await ApplyOneAsync(container, partitionKey, op, cancellationToken);
                     }
                 }
+
+                Applied(chunk);
             }
         }
         else
@@ -252,7 +287,18 @@ internal sealed class CosmosDbTransaction : DbTransaction
             foreach (var op in ops)
             {
                 await ApplyOneAsync(container, new PartitionKey(op.PartitionKey), op, cancellationToken);
+                Applied([op]);
             }
+        }
+    }
+
+    // Takes the operations that have been applied, and every earlier record of the same items, out of the log.
+    private void Applied(IEnumerable<UndoOp> applied)
+    {
+        var items = applied.Select(op => (op.PartitionKey, op.Id)).ToHashSet();
+        lock (_undo)
+        {
+            _undo.RemoveAll(op => items.Contains((op.PartitionKey, op.Id)));
         }
     }
 

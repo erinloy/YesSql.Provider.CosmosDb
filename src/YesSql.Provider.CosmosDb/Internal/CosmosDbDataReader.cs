@@ -6,9 +6,8 @@ using System.Data.Common;
 namespace YesSql.Provider.CosmosDb.Internal;
 
 /// <summary>
-/// Minimal forward-only <see cref="DbDataReader"/> over an in-memory result set, sufficient for the
-/// way YesSql/Dapper materialize <c>Document</c> rows (column-name → value mapping). Columns are the
-/// document fields <c>Id</c>, <c>Type</c>, <c>Content</c>, <c>Version</c>.
+/// A forward-only <see cref="DbDataReader"/> over an in-memory result set. It has what Dapper needs to materialize YesSql's
+/// rows: documents (<c>Id</c>, <c>Type</c>, <c>Content</c>, <c>Version</c>), index rows and single values such as counts.
 /// </summary>
 internal sealed class CosmosDbDataReader : DbDataReader
 {

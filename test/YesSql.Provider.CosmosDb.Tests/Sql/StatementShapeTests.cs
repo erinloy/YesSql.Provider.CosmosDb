@@ -3,10 +3,10 @@ using YesSql.Provider.CosmosDb.Internal.Sql;
 
 namespace YesSql.Provider.CosmosDb.Tests.Sql;
 
-// The golden file statement-shapes.tsv holds what the regex implementation extracted from each statement of the
-// corpus: how it was routed, its tables and joins, predicate, ordering and paging. The parser-based code has to find
-// the same things. Only the fields a route uses are compared, because the regexes also produced values that no code
-// read (the projection of a count query, for example).
+// statements.sql is the corpus: every distinct statement YesSql sent while its CoreTests ran against this provider.
+// statement-shapes.tsv holds what the provider has to find in each one: how it is routed, its tables and joins, predicate,
+// ordering and paging. A change in the SQL YesSql generates, or in the parser, that changes a shape fails here. Only the
+// fields a route uses are compared.
 public class StatementShapeTests
 {
     private static string[] Corpus() =>
@@ -91,7 +91,7 @@ public class StatementShapeTests
                     ? $"{reduce.IndexTable}:{reduce.IndexAlias}:{reduce.BridgeAlias}:{reduce.BridgeColumn}/{reduce.BridgeTable}"
                     : string.Empty));
                 fields.Add("typeParameter=" + SqlTree.DocumentTypeParameter(shape.Where));
-                fields.Add("typeLiteral=" + SqlTree.TypeLiteral(shape.Where));
+                fields.Add("typeLiteral=" + (SqlTree.TypeComparison(shape.Where) is LiteralExpr { Value: string text } ? text : null));
                 fields.Add("projection=" + Attempt(() => shape.Projection is null ? "*" : string.Join(",", shape.Projection)));
                 fields.Add("datePart=" + (shape.DatePart is { } date ? date.Part + ":" + date.Column : string.Empty));
                 break;
@@ -108,8 +108,14 @@ public class StatementShapeTests
                 fields.Add("replace=" + (update.Assignments[0].Value is FunctionExpr { Name: var name } && name.Equals("replace", StringComparison.OrdinalIgnoreCase)
                     ? update.Table + ":" + update.Assignments[0].Column
                     : string.Empty));
-                fields.Add("versionCheck=" + SqlTree.VersionCheck(update.Where));
-                fields.Add("allowNull=" + (SqlTree.AllowsNullVersion(update.Where) ? "1" : "0"));
+                var condition = SqlTree.UpdateCondition(update.Where);
+                if (fields.Contains("replace=") && condition is null)
+                {
+                    throw new InvalidOperationException("The condition of a single-row update is not recognized: " + SqlPrinter.Print(update));
+                }
+
+                fields.Add("versionCheck=" + condition?.Version);
+                fields.Add("allowNull=" + (condition?.AllowsNullVersion == true ? "1" : "0"));
                 fields.Add("where=" + (update.Where is null ? string.Empty : SqlPrinter.Print(update.Where)));
                 break;
 
