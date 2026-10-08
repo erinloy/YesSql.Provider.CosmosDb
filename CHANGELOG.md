@@ -5,6 +5,7 @@ All notable changes are listed here. The project is in preview, so minor version
 ## Unreleased
 
 ### Added
+- The Orchard Core sample and its documentation use `UseBlockIdGenerator()`, as Orchard does for every database that more than one process can reach (checked against Orchard Core's `OrchardCoreBuilderExtensions`: SQL Server, MySQL and PostgreSQL use it, SQLite uses the default). The sample's content checks now run through it on both Orchard Core versions and both partition strategies.
 - `UseBlockIdGenerator()` works. YesSql's block id generator leases ids from an `Identifiers` table with a conditional update; the provider answers its three statements with a create and an ETag-conditional replace of one item, so processes that share a store never lease the same block. The conformance suites run with it (`COSMOS_ID_GENERATOR=Block`).
 - docs/YESSQL-COUPLING.md lists what the provider assumes about the SQL YesSql generates and which test pins each assumption. docs/ARCHITECTURE.md gains the schema commands, the id generators and the reason for the undo log, and the README opens with how the provider works.
 

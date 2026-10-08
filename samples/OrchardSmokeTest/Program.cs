@@ -61,7 +61,9 @@ builder.Services
                             : null,
                     },
                 })
-                .UseDefaultIdGenerator();
+                // Orchard uses the block generator for every database that more than one process can reach (SQL Server, MySQL and
+                // PostgreSQL), and the default one only for SQLite. A Cosmos DB account is reached by every node, so it takes the block one.
+                .UseBlockIdGenerator();
 
             var tablePrefix = shellSettings["TablePrefix"];
             if (!string.IsNullOrWhiteSpace(tablePrefix))
