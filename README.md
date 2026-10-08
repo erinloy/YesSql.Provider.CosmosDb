@@ -15,6 +15,19 @@ A [YesSql](https://github.com/sebastienros/yessql) storage provider for [Azure C
 
 YesSql ships providers for SQL Server, PostgreSQL, MySQL and SQLite. This package adds Cosmos DB without forking YesSql.
 
+## How it works
+
+YesSql has no storage layer below the session. It builds SQL text with an `ISqlDialect` and runs it through Dapper on an ADO.NET `DbConnection` that `IConfiguration.ConnectionFactory` supplies. This package implements the three extension points YesSql offers there (`ConnectionFactory`, `SqlDialect`, `CommandInterpreter`) and changes nothing in YesSql.
+
+- **A Cosmos-backed ADO.NET implementation.** The connection, command, reader and transaction classes are internal. A command parses the SQL text it is given into a statement tree and runs it as Cosmos operations: point reads, creates, replaces, deletes and queries inside one partition.
+- **It recognizes the SQL that YesSql and Orchard Core emit, not SQL in general.** A statement outside that grammar throws, and so does a condition the provider cannot apply. Nothing is skipped or dropped.
+- **Rows are items.** Every table of YesSql lives in one container as items `{ id: "<table>:<Id>", pk, __table, <columns> }`. Index rows hold their `DocumentId`, and a reduce index's link table holds one item for each link.
+- **Schema commands do nothing, on purpose.** A container has no schema: a table or column exists when an item that has it is written, and Cosmos indexes every property. The one exception is `RenameColumn`, which rewrites the field in every item of the table. Dropping a column or table leaves its data in place. See [Schema commands](docs/ARCHITECTURE.md#schema-commands).
+- **Transactions are an undo log, not isolation.** Writes are applied as they are issued, so YesSql's autoflush sees them, and each records its inverse. Rolling back replays the inverses. With `PerStore` the replay is transactional batches; with `PerTable` it is item by item. See [Partition strategies](#partition-strategies) and [docs/PARTITIONING.md](docs/PARTITIONING.md).
+- **Ids.** Document ids come from YesSql's id generator, which works unchanged (`UseDefaultIdGenerator` and `UseBlockIdGenerator`). Index row ids come from a counter item per table that processes lease in blocks of 32.
+
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) has the details, and [docs/YESSQL-COUPLING.md](docs/YESSQL-COUPLING.md) lists what the provider assumes about the SQL YesSql generates, so that a change in YesSql which breaks an assumption fails a test here.
+
 ## Status
 
 Preview (0.1.x). Interfaces and behavior may still change.
@@ -80,7 +93,7 @@ The database and container are created on first use unless `CreateIfNotExists` i
 | `PartitionStrategy` | `PerTable` | How items map to logical partitions. See below. |
 | `PartitionScope` | `store` | Partition key value used by `PerStore`, for example a tenant name. |
 | `CreateIfNotExists` | `true` | Create the database and container if they do not exist. |
-| `ClientOptions` | `null` | `CosmosClientOptions` passed to the SDK client. Needed for the emulator. |
+| `ClientOptions` | `null` | `CosmosClientOptions` passed to the SDK client. Needed for the emulator. One SDK client is shared for each account endpoint and key for the life of the process, and the options of the first store that opens it apply. |
 
 ### Partition strategies
 
@@ -88,20 +101,51 @@ Cosmos DB can only commit atomically within a single logical partition. A YesSql
 
 | Strategy | Partition key | Rollback of a unit of work | Scale limit |
 | --- | --- | --- | --- |
-| `PerTable` (default) | YesSql table name | Best effort, item by item | None beyond Cosmos itself |
+| `PerTable` (default) | YesSql table name | Best effort, item by item | 20 GB and 10,000 RU/s for each YesSql table, so for all documents of a collection |
 | `PerStore` | `PartitionScope` | One transactional batch per 100 items changed | 20 GB and 10,000 RU/s per store |
 
 `PerStore` fits workloads with bounded data per store, such as one Orchard Core tenant per `PartitionScope`. A rollback is atomic only while it fits in one batch and the batch is accepted; the exact guarantee and its limits are in [docs/PARTITIONING.md](docs/PARTITIONING.md).
 
 ## Limitations
 
-- The provider is not a SQL engine. YesSql talks to it through ADO.NET and SQL text, and it recognizes the statement shapes that YesSql and Orchard Core generate. A statement outside the SQL it understands is rejected with a `DbException` that names the position of the problem, and one it parses but cannot run throws `NotSupportedException`.
+### SQL
+
+- The provider is not a SQL engine. YesSql talks to it through ADO.NET and SQL text, and it recognizes the statement shapes that YesSql and Orchard Core generate. A statement outside the SQL it understands is rejected with a `DbException` that names the position of the problem, and one it parses but cannot run throws `NotSupportedException`. A few misuse errors (a missing parameter, a partition key path that does not match the container) throw `InvalidOperationException`. The statement shapes are listed in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#statement-handling).
+- Nothing in a statement is skipped. A condition the provider cannot apply, or a join it cannot answer, throws.
+- `INSERT` creates an item and fails with a `CosmosDbException` (status 409) if the id exists, as a duplicate key does in a relational database. `UPDATE` changes one row selected by `@Id` and affects 0 rows when it is not there.
+- Comparisons in a `WHERE` clause (`=`, `LIKE`, `IN`) follow Cosmos DB, which compares strings case-sensitively. Ordering by an index column is case-insensitive, like the relational providers.
+- Cosmos DB numbers are 64-bit floating point. Ids and counts are far below the point where that matters (2^53), but a `long` or `decimal` index column outside it has not been tested and may lose precision.
+
+### Schema and ids
+
+- Schema commands do nothing, except `RenameColumn`, which rewrites the field in every item and is not undone by a rollback. Raw SQL that a migration sends with `SchemaBuilder.ExecuteSql` is ignored, because there is nothing to run it against. Dropping a table or a column does not delete data, and nothing enforces primary keys, unique constraints or foreign keys.
+- `UseDefaultIdGenerator` keeps its counter in memory, seeded from `MAX(Id)` when the store starts, as it does with every provider, so two processes that write to one store at the same time need `UseBlockIdGenerator`, which leases ids from the store with a conditional write and is safe across processes.
+
+### Transactions
+
 - There is no isolation between sessions. Writes are applied as they happen, so another session can read changes from a unit of work that has not committed. On rollback the provider restores the previous version of each item, which can overwrite a concurrent writer's changes to the same item.
-- With `PerTable`, a failed unit of work is rolled back item by item, and a crash during rollback can leave partial writes.
-- A count, a first match, or a page ordered by document id (the order YesSql gives a paged query that has no order of its own) over one map index is answered by Cosmos from the distinct document ids. Orders on an index column, queries through a reduce index or several indexes, and queries that filter on the document type read every matching index row to the client, then order and page there, so their request unit cost grows with the number of matching index rows. An order on an index column cannot be left to Cosmos: it sorts text case-sensitively, where YesSql's other providers do not, and it sorts the stored date text, which is wrong for times with fractions of a second. At 500 rows per key on a real account, a count cost 7 RU and an ordered page of 20 documents cost 24 RU.
-- A save makes about 6 requests for a document with a map and a reduce index (50 RU before ids were reserved in blocks, 38 RU now). Writes inside a unit of work are started without waiting for the response, so requests that do not depend on each other overlap and a save waits for about 3 round trips in a row. An update or delete first reads the index rows it changes, and those reads cannot overlap, so it takes more.
-- `PerStore` limits the whole store to 20 GB of data and 10,000 RU/s.
-- The automated tests in CI run against the emulator. The 5.4.7 conformance suite has also been run against one real serverless account (West US); that run found a date comparison the emulator does not reproduce (see the changelog). Behavior and request unit cost on a live account at scale have not been measured.
+- A crash before commit leaves the writes in place, because the undo log is in memory.
+- With `PerTable`, a failed unit of work is rolled back item by item, and a crash during rollback can leave partial writes. With `PerStore` a rollback is atomic for each batch of up to 100 items.
+- A write that Cosmos rejects is reported by a later statement or by the commit, not by the statement that issued it, because writes inside a unit of work are started without waiting for the response.
+
+### Cost and speed
+
+- A count, a first match, or a page ordered by document id (the order YesSql gives a paged query that has no order of its own) over one map index is answered by Cosmos from the distinct document ids. Orders on an index column, queries through a reduce index or several indexes, and queries that filter on the document type read every matching index row to the client, then order and page there, so their request unit cost grows with the number of matching index rows. At 500 rows per key on a real account, a count cost 7 RU and an ordered page of 20 documents cost 24 RU.
+- An order on an index column cannot be left to Cosmos: it sorts text case-sensitively, where YesSql's other providers do not, and it sorts the stored date text, which is wrong for times with fractions of a second.
+- A save makes about 6 requests for a document with a map and a reduce index (50 RU before ids were reserved in blocks, 38 RU now). Requests that do not depend on each other overlap, so a save waits for about 3 round trips in a row. An update or delete first reads the index rows it changes, and those reads cannot overlap, so it takes more.
+
+### Scale
+
+- `PerStore` limits the whole store to 20 GB of data and 10,000 RU/s. `PerTable` limits each YesSql table to the same, which means all the documents of a collection.
+
+### Accounts and clients
+
+- Authentication is the account key (`CosmosDbOptions.AccountKey`). There is no support for Microsoft Entra ID or managed identity.
+- The provider sets no consistency level, so the account's default applies, and it leaves throttling (429) to the Cosmos SDK's default retry policy. Both can be changed through `CosmosDbOptions.ClientOptions`, and the first `ClientOptions` used for an account apply to every store that uses it in the process.
+
+### Evidence
+
+- The automated tests in CI run against the emulator. The 5.4.7 conformance suite has also been run against one real serverless account (West US) with the code of version 0.1.5; that run found a date comparison the emulator does not reproduce (see the changelog). Behavior and request unit cost on a live account at scale have not been measured, and the later changes (writes started without waiting, stricter statements) have not been run against one.
 
 ## Running against the emulator
 
@@ -149,6 +193,7 @@ See [docs/CONFORMANCE.md](docs/CONFORMANCE.md) for how the conformance project w
 ## Documentation
 
 - [Architecture](docs/ARCHITECTURE.md): storage model and how SQL is translated to Cosmos operations
+- [What the provider assumes about YesSql](docs/YESSQL-COUPLING.md)
 - [Partitioning and transactions](docs/PARTITIONING.md)
 - [Conformance and tests](docs/CONFORMANCE.md)
 - [Orchard Core integration](docs/ORCHARD-INTEGRATION.md)

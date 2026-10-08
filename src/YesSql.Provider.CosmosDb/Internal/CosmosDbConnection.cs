@@ -2,6 +2,7 @@ using System;
 using System.Collections.Concurrent;
 using System.Data;
 using System.Data.Common;
+using System.Diagnostics.CodeAnalysis;
 using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.Azure.Cosmos;
@@ -44,7 +45,7 @@ internal sealed class CosmosDbConnection : DbConnection
 
     internal CosmosDbOptions Options => _options;
 
-    [System.Diagnostics.CodeAnalysis.AllowNull]
+    [AllowNull]
     public override string ConnectionString { get; set; } = string.Empty;
 
     public override string Database => _options.DatabaseId;
@@ -136,7 +137,7 @@ internal sealed class CosmosDbConnection : DbConnection
     {
         if (disposing)
         {
-            // Do NOT dispose the shared CosmosClient — it is a process-lifetime singleton shared by every
+            // Do not dispose the shared CosmosClient: it lives as long as the process and every
             // connection. Just detach this connection's references.
             _client = null;
             _container = null;

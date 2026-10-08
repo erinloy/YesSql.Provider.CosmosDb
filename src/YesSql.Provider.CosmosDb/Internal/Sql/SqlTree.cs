@@ -4,6 +4,12 @@ using System.Linq;
 
 namespace YesSql.Provider.CosmosDb.Internal.Sql;
 
+/// <summary>
+/// The condition of a single-row update: the operand that gives the key, and the version the row has to have (null for an
+/// update that is not checked), which a row with no version also meets when <see cref="AllowsNullVersion"/> is set.
+/// </summary>
+internal sealed record UpdateCondition(SqlExpr Key, long? Version, bool AllowsNullVersion);
+
 /// <summary>Operations on a parsed expression that the translator needs, done on the tree and not on text.</summary>
 internal static class SqlTree
 {
@@ -42,26 +48,54 @@ internal static class SqlTree
     /// nothing is left.
     /// </summary>
     public static SqlExpr? WithoutDocumentTypePredicate(SqlExpr? predicate)
+        => Without(predicate, term => term is BinaryExpr { Operator: "=", Left: ColumnRef { QualifierIsTable: true, Name: var name }, Right: ParamRef }
+            && name.Equals("Type", StringComparison.OrdinalIgnoreCase));
+
+    /// <summary>
+    /// Removes the <c>[Type] = x</c> terms of a query over the document table, whatever the qualifier, where <c>x</c> is a
+    /// parameter or a string literal. Only terms joined by <c>AND</c> are removed. What is left is every other condition
+    /// of the query, or null when there is none.
+    /// </summary>
+    public static SqlExpr? WithoutTypeComparison(SqlExpr? predicate) => Without(predicate, IsTypeComparison);
+
+    /// <summary>The value, a parameter or a string literal, in the first <c>[Type] = x</c> term under <c>AND</c>, or null when there is none.</summary>
+    public static SqlExpr? TypeComparison(SqlExpr? predicate)
+    {
+        switch (predicate)
+        {
+            case BinaryExpr comparison when IsTypeComparison(comparison):
+                return comparison.Right;
+            case LogicalExpr { IsAnd: true } and:
+                return and.Terms.Select(TypeComparison).FirstOrDefault(found => found is not null);
+            case ParenExpr paren:
+                return TypeComparison(paren.Inner);
+            default:
+                return null;
+        }
+    }
+
+    private static bool IsTypeComparison(SqlExpr term)
+        => term is BinaryExpr { Operator: "=", Left: ColumnRef column, Right: ParamRef or LiteralExpr { Value: string } }
+           && column.Name.Equals("Type", StringComparison.OrdinalIgnoreCase);
+
+    // The predicate without the terms that match, looking only at terms joined by AND.
+    private static SqlExpr? Without(SqlExpr? predicate, Func<SqlExpr, bool> matches)
     {
         switch (predicate)
         {
             case null:
                 return null;
 
-            case BinaryExpr { Operator: "=", Left: ColumnRef { QualifierIsTable: true, Name: var name }, Right: ParamRef }
-                when name.Equals("Type", StringComparison.OrdinalIgnoreCase):
-                return null;
-
             case LogicalExpr { IsAnd: true } and:
-                var kept = and.Terms.Select(WithoutDocumentTypePredicate).Where(t => t is not null).Cast<SqlExpr>().ToList();
+                var kept = and.Terms.Select(term => Without(term, matches)).Where(term => term is not null).Cast<SqlExpr>().ToList();
                 return And(kept);
 
             case ParenExpr paren:
-                var inner = WithoutDocumentTypePredicate(paren.Inner);
+                var inner = Without(paren.Inner, matches);
                 return inner is null ? null : new ParenExpr(inner);
 
             default:
-                return predicate;
+                return matches(predicate) ? null : predicate;
         }
     }
 
@@ -88,28 +122,30 @@ internal static class SqlTree
         }
     }
 
-    /// <summary>The first <c>[Type] = 'literal'</c> comparison anywhere in the predicate, whatever its qualifier, or null.</summary>
-    public static string? TypeLiteral(SqlExpr? predicate)
+    /// <summary>
+    /// The operands of a predicate that selects documents by key and by nothing else, <c>[Id] = x</c> or
+    /// <c>[Id] IN (x, ...)</c> where each <c>x</c> is a parameter or a whole number, or null for any other predicate.
+    /// </summary>
+    public static IReadOnlyList<SqlExpr>? KeyOperands(SqlExpr? predicate)
     {
-        string? found = null;
-        if (predicate is not null)
+        while (predicate is ParenExpr paren)
         {
-            Visit(predicate, node =>
-            {
-                if (found is null
-                    && node is BinaryExpr { Operator: "=", Left: ColumnRef column, Right: LiteralExpr { Value: string text } }
-                    && column.Name.Equals("Type", StringComparison.OrdinalIgnoreCase))
-                {
-                    found = text;
-                }
-            });
+            predicate = paren.Inner;
         }
 
-        return found;
+        return predicate switch
+        {
+            BinaryExpr { Operator: "=", Left: ColumnRef column, Right: var key } when IsKey(column) && IsKeyOperand(key) => new[] { key },
+            InListExpr { Negated: false, Operand: ColumnRef column } list when IsKey(column) && list.Items.All(IsKeyOperand) => list.Items,
+            _ => null,
+        };
+
+        static bool IsKey(ColumnRef column) => column.Name.Equals("Id", StringComparison.OrdinalIgnoreCase);
+        static bool IsKeyOperand(SqlExpr operand) => operand is ParamRef or LiteralExpr { Value: long };
     }
 
-    /// <summary>True when the predicate selects by key: <c>[Id] = x</c> or <c>[Id] IN (...)</c> anywhere in it.</summary>
-    public static bool SelectsById(SqlExpr? predicate)
+    /// <summary>True when the predicate has an <c>[Id]</c> comparison anywhere in it, a sign that the query selects by key.</summary>
+    public static bool MentionsId(SqlExpr? predicate)
     {
         var found = false;
         if (predicate is not null)
@@ -118,57 +154,102 @@ internal static class SqlTree
             {
                 found |= node switch
                 {
-                    BinaryExpr { Operator: "=", Left: ColumnRef column } => IsId(column),
-                    InListExpr { Negated: false, Operand: ColumnRef column } => IsId(column),
-                    InSubqueryExpr { Negated: false, Operand: ColumnRef column } => IsId(column),
+                    BinaryExpr { Operator: "=", Left: ColumnRef column } => column.Name.Equals("Id", StringComparison.OrdinalIgnoreCase),
+                    InListExpr { Negated: false, Operand: ColumnRef column } => column.Name.Equals("Id", StringComparison.OrdinalIgnoreCase),
+                    InSubqueryExpr { Negated: false, Operand: ColumnRef column } => column.Name.Equals("Id", StringComparison.OrdinalIgnoreCase),
                     _ => false,
                 };
             });
         }
 
         return found;
-
-        static bool IsId(ColumnRef column) => column.Name.Equals("Id", StringComparison.OrdinalIgnoreCase);
     }
 
-    /// <summary>The version in a <c>[Version] = n</c> comparison of an update's predicate, or null when it has none.</summary>
-    public static long? VersionCheck(SqlExpr? predicate)
+    /// <summary>
+    /// The operand of each <c>[Column] = x</c> term of a predicate that is only such terms joined by <c>AND</c>, where <c>x</c> is a
+    /// parameter or a literal, by column name. Returns null when the predicate has any other kind of term, or two terms for one column.
+    /// </summary>
+    public static IReadOnlyDictionary<string, SqlExpr>? EqualityOperands(SqlExpr? predicate)
     {
-        long? found = null;
-        if (predicate is not null)
+        var operands = new Dictionary<string, SqlExpr>(StringComparer.OrdinalIgnoreCase);
+        foreach (var term in Conjuncts(predicate))
         {
-            Visit(predicate, node =>
+            if (term is BinaryExpr { Operator: "=", Left: ColumnRef column, Right: ParamRef or LiteralExpr } comparison
+                && operands.TryAdd(column.Name, comparison.Right))
             {
-                if (found is null
-                    && node is BinaryExpr { Operator: "=", Left: ColumnRef column, Right: LiteralExpr { Value: long version } }
-                    && column.Name.Equals("Version", StringComparison.OrdinalIgnoreCase))
-                {
-                    found = version;
-                }
-            });
+                continue;
+            }
+
+            return null;
         }
 
-        return found;
+        return operands;
     }
 
-    /// <summary>True when the predicate has a <c>[Version] IS NULL</c> test, which lets a version check pass for a row with no version.</summary>
-    public static bool AllowsNullVersion(SqlExpr? predicate)
+    /// <summary>
+    /// The condition of a single-row <c>UPDATE</c>: <c>[Id] = x</c>, optionally with the version check YesSql adds to an update of a
+    /// document, <c>[Version] = n</c> or <c>([Version] IS NULL OR [Version] = n)</c>, where <c>x</c> is a parameter or a whole number
+    /// and <c>n</c> a whole number. Returns null for any other condition: a check that is not recognized must not be skipped.
+    /// </summary>
+    public static UpdateCondition? UpdateCondition(SqlExpr? predicate)
     {
-        var found = false;
-        if (predicate is not null)
+        SqlExpr? key = null;
+        long? version = null;
+        var allowsNull = false;
+
+        foreach (var term in Conjuncts(predicate))
         {
-            Visit(predicate, node =>
+            var inner = term is ParenExpr paren ? paren.Inner : term;
+            switch (inner)
             {
-                found |= node is IsNullExpr { Negated: false, Operand: ColumnRef column }
-                    && column.Name.Equals("Version", StringComparison.OrdinalIgnoreCase);
-            });
+                case BinaryExpr { Operator: "=", Left: ColumnRef { Qualifier: null, Name: var name }, Right: var value }
+                    when name.Equals("Id", StringComparison.OrdinalIgnoreCase) && key is null && value is ParamRef or LiteralExpr { Value: long }:
+                    key = value;
+                    break;
+
+                case BinaryExpr { Operator: "=", Left: ColumnRef { Qualifier: null, Name: var name }, Right: LiteralExpr { Value: long number } }
+                    when name.Equals("Version", StringComparison.OrdinalIgnoreCase) && version is null:
+                    version = number;
+                    break;
+
+                case LogicalExpr { IsAnd: false, Terms: [var first, var second] } when version is null && IsNullOrVersion(first, second, out var number):
+                    version = number;
+                    allowsNull = true;
+                    break;
+
+                default:
+                    return null;
+            }
         }
 
-        return found;
+        return key is null ? null : new UpdateCondition(key, version, allowsNull);
+    }
+
+    // [Version] IS NULL OR [Version] = n, in either order.
+    private static bool IsNullOrVersion(SqlExpr first, SqlExpr second, out long version)
+    {
+        version = 0;
+        if (second is IsNullExpr)
+        {
+            (first, second) = (second, first);
+        }
+
+        if (first is IsNullExpr { Negated: false, Operand: ColumnRef { Qualifier: null, Name: var nullName } }
+            && second is BinaryExpr { Operator: "=", Left: ColumnRef { Qualifier: null, Name: var versionName }, Right: LiteralExpr { Value: long number } }
+            && nullName.Equals("Version", StringComparison.OrdinalIgnoreCase)
+            && versionName.Equals("Version", StringComparison.OrdinalIgnoreCase))
+        {
+            version = number;
+            return true;
+        }
+
+        return false;
     }
 
     /// <summary>The distinct qualifiers of every column in the expression, including inside <c>IN (SELECT ...)</c>.</summary>
-    public static IReadOnlySet<string> Qualifiers(SqlExpr expression)
+    public static IReadOnlySet<string> Qualifiers(SqlExpr expression) => Qualifiers(expression, enterSubqueries: true);
+
+    private static IReadOnlySet<string> Qualifiers(SqlExpr expression, bool enterSubqueries)
     {
         var qualifiers = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         Visit(expression, node =>
@@ -177,8 +258,42 @@ internal static class SqlTree
             {
                 qualifiers.Add(q);
             }
-        });
+        }, enterSubqueries);
         return qualifiers;
+    }
+
+    /// <summary>
+    /// Assigns each <c>AND</c> term of a predicate to the one index table it refers to, for a query that reads the joined index
+    /// tables one at a time. <paramref name="tables"/> maps each join alias to its table. Aliases of one table, as when a query
+    /// joins the same index twice, are one target, because the conditions are tested against the rows of that table. A term that
+    /// refers to no join, to a column of the document, or to more than one table cannot be run against one table, and is refused
+    /// instead of being dropped or applied to the wrong table. A term with no qualifier belongs to the only table when there is
+    /// one. The result has an entry for every table.
+    /// </summary>
+    /// <exception cref="NotSupportedException">A term cannot be assigned to one table.</exception>
+    public static IReadOnlyDictionary<string, List<SqlExpr>> SplitByTable(SqlExpr? predicate, IReadOnlyDictionary<string, string> tables, string sql)
+    {
+        var aliases = new Dictionary<string, string>(tables, StringComparer.OrdinalIgnoreCase);
+        var split = tables.Values.Distinct(StringComparer.OrdinalIgnoreCase).ToDictionary(table => table, _ => new List<SqlExpr>(), StringComparer.OrdinalIgnoreCase);
+        foreach (var term in Conjuncts(predicate))
+        {
+            // The columns inside an IN (SELECT ...) belong to the subquery, which is run on its own.
+            var qualifiers = Qualifiers(term, enterSubqueries: false);
+            var owners = qualifiers.Count == 0
+                ? split.Keys.ToList()
+                : qualifiers.Select(qualifier => aliases.TryGetValue(qualifier, out var table) ? table : null).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+
+            if (owners.Count != 1 || owners[0] is null)
+            {
+                var refers = qualifiers.Count == 0 ? "no table" : string.Join(", ", qualifiers);
+                throw new NotSupportedException(
+                    $"A condition that refers to {refers} cannot be run against one index table ({string.Join(", ", split.Keys)}): {sql}");
+            }
+
+            split[owners[0]!].Add(term);
+        }
+
+        return split;
     }
 
     /// <summary>The <c>IN (SELECT ...)</c> nodes of an expression that are not inside another subquery.</summary>

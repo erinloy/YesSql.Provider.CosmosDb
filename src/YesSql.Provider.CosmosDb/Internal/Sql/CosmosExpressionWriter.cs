@@ -45,6 +45,9 @@ internal sealed class CosmosExpressionWriter
     /// <summary>The Cosmos text for a property of the item, <c>c["Name"]</c>.</summary>
     public static string Property(string name) => "c[\"" + EscapeName(name) + "\"]";
 
+    /// <summary>A name written as a double quoted string, such as a table name compared with the <c>__table</c> field.</summary>
+    public static string StringLiteral(string name) => "\"" + EscapeName(name) + "\"";
+
     private static string EscapeName(string name)
     {
         // Property names are written between double quotes, so a name that could end the string is refused.

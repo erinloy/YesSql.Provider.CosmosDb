@@ -19,7 +19,9 @@ Set `CosmosDbOptions.PartitionStrategy`.
 
 ### `PerTable` (default)
 
-The partition key is the YesSql table name, so `Document`, `UserIndex` and so on are separate logical partitions. Queries over one table stay within one partition, and no single partition has to hold the whole store, so this scales out.
+The partition key is the YesSql table name, so `Document`, `UserIndex` and so on are separate logical partitions. Queries over one table stay within one partition, and no single partition has to hold the whole store.
+
+The ceiling moves to the table, though: every document of a collection is in the one `Document` partition, so the documents of a collection are limited to 20 GB and 10,000 RU/s, and every document write goes to that partition. Index tables are separate partitions, each with its own limits. This is a wide ceiling for a content store, and the wrong one for a store whose documents keep growing without bound.
 
 A unit of work spans partitions, so it cannot be rolled back atomically. See [Rollback](#rollback).
 
@@ -51,7 +53,7 @@ Optimistic concurrency is separate from rollback. A checked `UPDATE` compares th
 | If | Use |
 | --- | --- |
 | Data per store is bounded and you want failed requests to be reverted as completely as Cosmos allows (typical for an Orchard Core tenant) | `PerStore` |
-| One store may exceed 20 GB or 10,000 RU/s | `PerTable` |
+| Documents of one collection may exceed 20 GB or 10,000 RU/s | Neither. Both put them in one logical partition. |
 | Best-effort cleanup on failure is acceptable | `PerTable` |
 
 Hierarchical partition keys raise the first-level size limit, but atomicity applies to the full key path, so they do not give atomic units of work across tables. The provider does not use them.

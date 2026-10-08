@@ -15,6 +15,9 @@ internal enum ScalarRoute
 
     /// <summary>A count over one table.</summary>
     CountItems,
+
+    /// <summary><c>SELECT [nextval] FROM [Identifiers] WHERE [dimension] = x</c>, which the block id generator sends to lease a block of ids.</summary>
+    Identifier,
 }
 
 /// <summary>How a <c>SELECT</c> executed as a reader is run, in the order the provider tests for them.</summary>
@@ -52,7 +55,7 @@ internal enum ReaderRoute
 }
 
 /// <summary>A join onto a named table: <c>JOIN [Table] AS Alias ON ...</c>.</summary>
-internal sealed record NamedJoin(string Table, string Alias, SqlExpr On);
+internal sealed record NamedJoin(string Table, string Alias, SqlExpr On, JoinKind Kind = JoinKind.Inner);
 
 /// <summary>
 /// The two joins that make up a reduce index: the index joined through the bridge table's foreign key
@@ -97,7 +100,7 @@ internal sealed class SelectShape
         {
             if (join.Source is NamedSource { Alias: { } alias } named)
             {
-                _namedJoins.Add(new NamedJoin(named.Table, alias, join.On));
+                _namedJoins.Add(new NamedJoin(named.Table, alias, join.On, join.Kind));
             }
         }
     }
@@ -124,6 +127,14 @@ internal sealed class SelectShape
 
     /// <summary>True when the statement joins anything, including a derived table.</summary>
     public bool HasJoin => _joins.Count > 0;
+
+    /// <summary>True when a join of the statement is a <c>LEFT</c> or <c>RIGHT</c> join.</summary>
+    public bool HasOuterJoin => _joins.Any(join => join.Kind != JoinKind.Inner);
+
+    /// <summary>True for <c>count(1)</c> and <c>count(*)</c>, which count joined rows, and false for <c>count(DISTINCT x)</c>, which counts values.</summary>
+    public bool CountsRows
+        => Statement.Items.Any(item => item.Expression is FunctionExpr { Distinct: false } function
+            && function.Name.Equals("count", StringComparison.OrdinalIgnoreCase));
 
     /// <summary>Every join in the statement, including those inside a derived table, in the order they are written.</summary>
     public IReadOnlyList<NamedJoin> NamedJoins => _namedJoins;
@@ -211,11 +222,31 @@ internal sealed class SelectShape
     /// <summary>True for a table that holds YesSql documents, whose name ends in <c>Document</c>.</summary>
     public static bool IsDocumentTable(string table) => table.EndsWith("Document", StringComparison.OrdinalIgnoreCase);
 
+    /// <summary>True for the table of YesSql's block id generator, whose name ends in <c>Identifiers</c>.</summary>
+    public static bool IsIdentifierTable(string table) => table.EndsWith("Identifiers", StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// For <c>SELECT [nextval] FROM [Identifiers] WHERE [dimension] = x</c>, the operand <c>x</c>; for any other statement, null.
+    /// </summary>
+    public SqlExpr? IdentifierDimension
+        => Statement is { Items: [{ Expression: ColumnRef column }], From: NamedSource from, Joins.Count: 0 }
+           && column.Name.Equals("nextval", StringComparison.OrdinalIgnoreCase)
+           && IsIdentifierTable(from.Table)
+           && SqlTree.EqualityOperands(Where) is { Count: 1 } compared
+           && compared.TryGetValue("dimension", out var dimension)
+            ? dimension
+            : null;
+
     /// <summary>How the statement is run when it is executed as a scalar, or null when it cannot be.</summary>
     public ScalarRoute? Scalar
     {
         get
         {
+            if (IdentifierDimension is not null)
+            {
+                return ScalarRoute.Identifier;
+            }
+
             if (HasFunction("max"))
             {
                 return ScalarRoute.MaxId;
@@ -275,7 +306,7 @@ internal sealed class SelectShape
 
             if (IsDocumentTable(RequiredFromTable))
             {
-                return SqlTree.SelectsById(Where) ? ReaderRoute.DocumentsById : ReaderRoute.Documents;
+                return SqlTree.MentionsId(Where) ? ReaderRoute.DocumentsById : ReaderRoute.Documents;
             }
 
             return ReaderRoute.IndexRows;

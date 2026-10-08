@@ -2,6 +2,27 @@
 
 All notable changes are listed here. The project is in preview, so minor versions may change behavior.
 
+## Unreleased
+
+### Added
+- `UseBlockIdGenerator()` works. YesSql's block id generator leases ids from an `Identifiers` table with a conditional update; the provider answers its three statements with a create and an ETag-conditional replace of one item, so processes that share a store never lease the same block. The conformance suites run with it (`COSMOS_ID_GENERATOR=Block`).
+- docs/YESSQL-COUPLING.md lists what the provider assumes about the SQL YesSql generates and which test pins each assumption. docs/ARCHITECTURE.md gains the schema commands, the id generators and the reason for the undo log, and the README opens with how the provider works.
+
+### Changed
+- `INSERT` creates the item and fails with a `CosmosDbException` (409) if the id exists. It used to replace the item, so two processes that issued the same document id overwrote each other's document, and rolling back the second removed the first's.
+- `UPDATE` of a row that does not exist affects 0 rows. It used to create a partial row and report 1. Its columns come from the `SET` clause and its row and version check from the `WHERE` clause, which has to be `[Id] = x` with the optional version check YesSql writes; any other condition throws a `SqlSyntaxException` where it used to be ignored.
+- A query of the document table that has a condition other than a filter on `Type`, and a query by key that is not `[Id] = x` or `[Id] IN (...)`, throw `NotSupportedException`. The extra condition used to be dropped, so the query returned rows it should not have.
+- A query over several indexes, or over a reduce index with map indexes, applies each condition to the one index table it refers to, and throws `NotSupportedException` for a condition that refers to two tables, to the document or to none. Conditions used to be dropped or applied to the wrong table.
+- The diagnostic test `OrchardCosmosVerify`, which was always skipped, is removed.
+- `CosmosDbCommand` is split by what its parts do (`Reads`, `Counts`, `Sequences`, `Identifiers`, `Values`), the query loops that were copied about twenty times are one method, and comments are plain text. Behavior does not change.
+
+### Fixed
+- The filter on the document type (`Query<T>()` with `filterType`) is applied to queries over a reduce index and over several indexes. Only the single-index path applied it, so documents of other types were returned.
+- A `COUNT(1)` over `LEFT JOIN` and `RIGHT JOIN` was counted as an inner join. It is counted exactly for one index table, and any other `LEFT` or `RIGHT JOIN` throws instead of returning inner join rows. `COUNT(1)` over an `INNER JOIN` counts joined rows, as SQL does.
+- A long list of ids in a query (`ARRAY_CONTAINS`) is split over several queries instead of making one that Cosmos refuses.
+- A rollback that failed partway lost the operations it had not yet applied. An operation leaves the undo log when it has been applied, so the rollback can be run again.
+- Package: source link and deterministic builds, so a debugger can open the code of a released version.
+
 ## 0.1.6
 
 ### Added

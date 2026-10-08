@@ -6,9 +6,9 @@ using YesSql.Sql;
 namespace YesSql.Provider.CosmosDb;
 
 /// <summary>
-/// YesSql SQL dialect for Cosmos DB. It emits a small, restricted SQL surface that the provider's ADO.NET
-/// command implementation translates into Cosmos SDK operations. Most members only need to return a value
-/// YesSql can use; Cosmos is schemaless, so the DDL-related members are placeholders.
+/// YesSql SQL dialect for Cosmos DB. YesSql builds its SQL with this dialect, and the provider's ADO.NET command parses that
+/// SQL and runs it as Cosmos operations. The dialect quotes names with brackets, which the parser reads, and returns the
+/// fragments YesSql asks for. Those that belong to DDL or to identity columns are never run, because Cosmos has neither.
 /// </summary>
 public sealed class CosmosDbDialect : BaseDialect
 {
@@ -62,7 +62,7 @@ public sealed class CosmosDbDialect : BaseDialect
         // Template for YesSql's 'now' function.
         Methods.Add("now", new TemplateFunction("GetCurrentDateTime()"));
 
-        // Date-part extraction → Cosmos DateTimePart(part, <iso-datetime>). The translator recognises a
+        // Date-part extraction, as Cosmos DateTimePart(part, date). The command recognizes a
         // DateTimePart(...) projection and runs it as a scalar Cosmos query.
         Methods.Add("second", new TemplateFunction("DateTimePart(\"second\", {0})"));
         Methods.Add("minute", new TemplateFunction("DateTimePart(\"minute\", {0})"));
@@ -79,8 +79,9 @@ public sealed class CosmosDbDialect : BaseDialect
     /// <inheritdoc />
     public override bool SupportsBatching => false;
 
-    // Identity is produced by YesSql's IIdGenerator (block allocation), not by a DB identity column.
-    // Cosmos has no auto-increment, so these DDL/identity fragments are unused by the shim.
+    // Document ids come from YesSql's IIdGenerator, not from an identity column, and Cosmos has none. The identity column
+    // fragments are DDL, which is never run. IdentitySelectString is different: YesSql appends it to the insert of an index
+    // row to read the new id back, so it is how the command knows that the insert wants an id.
     /// <inheritdoc />
     public override string IdentityColumnString => "";
     /// <inheritdoc />
@@ -102,7 +103,7 @@ public sealed class CosmosDbDialect : BaseDialect
     /// <inheritdoc />
     public override byte DefaultDecimalScale => 5;
 
-    // Bracket quoting — easy and unambiguous for the shim's parser to strip.
+    // Bracket quoting, which the SQL lexer reads unambiguously.
     /// <inheritdoc />
     public override string QuoteForColumnName(string columnName) => "[" + columnName + "]";
     /// <inheritdoc />

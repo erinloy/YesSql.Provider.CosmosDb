@@ -1,3 +1,4 @@
+using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Text;
@@ -7,15 +8,14 @@ using YesSql.Sql.Schema;
 namespace YesSql.Provider.CosmosDb;
 
 /// <summary>
-/// Schema-command interpreter for Cosmos DB. Cosmos is schemaless, so most DDL (create/alter/drop table,
-/// add/drop columns, indexes, foreign keys) is a no-op: the single container is provisioned by the
-/// connection, and index properties live embedded in the document served by Cosmos automatic indexing.
-/// The exception is RenameColumn, which must rewrite the field on every stored row — it is emitted as a
-/// "renamecolumn [table] [old] [new]" statement that the command executes against the partition.
+/// Schema-command interpreter for Cosmos DB. A container has no schema, so creating, altering and dropping tables, columns,
+/// indexes and foreign keys do nothing, and neither does raw SQL in a migration. The container is provisioned by the
+/// connection, and Cosmos indexes every property. The exception is RenameColumn, which has to rewrite the field in every item
+/// of the table: it is emitted as "renamecolumn [table] [old] [new]", which the command executes.
 /// </summary>
 public sealed class CosmosDbCommandInterpreter : ICommandInterpreter
 {
-    private static readonly string[] None = System.Array.Empty<string>();
+    private static readonly string[] None = Array.Empty<string>();
 
     /// <inheritdoc />
     public IEnumerable<string> CreateSql(IEnumerable<ISchemaCommand> commands)
