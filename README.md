@@ -71,7 +71,7 @@ var configuration = new Configuration()
         AccountKey = "<key>",
         DatabaseId = "myapp",
     })
-    .UseDefaultIdGenerator();
+    .UseBlockIdGenerator();
 
 var store = await StoreFactory.CreateAndInitializeAsync(configuration);
 

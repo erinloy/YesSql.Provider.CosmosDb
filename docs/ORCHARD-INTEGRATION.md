@@ -41,7 +41,7 @@ builder.Services
 
             configuration
                 .UseCosmosDb(new CosmosDbOptions { /* endpoint, key, database */ })
-                .UseDefaultIdGenerator();
+                .UseBlockIdGenerator();
 
             var tablePrefix = shellSettings["TablePrefix"];
             if (!string.IsNullOrWhiteSpace(tablePrefix))
@@ -59,6 +59,8 @@ builder.Services
 The complete working version is [`samples/OrchardSmokeTest/Program.cs`](../samples/OrchardSmokeTest/Program.cs).
 
 Setup validates a database provider and connection string before it commits. The sample avoids the interactive setup screen by using the `OrchardCore.AutoSetup` feature, and declares `"DatabaseProvider": "Sqlite"` in the tenant settings only so that Orchard's validation passes. The label is never used to open a connection, because the replacement `IStore` handles all data access.
+
+Orchard configures YesSql with `UseBlockIdGenerator()` for SQL Server, MySQL and PostgreSQL, which more than one process can reach, and with `UseDefaultIdGenerator()` only for SQLite, which one process owns. A Cosmos DB account is reached by every node of an application, so the registration uses the block generator, which leases ids from the store and is safe across processes. The default generator would hand two nodes the same document ids; with this provider the second node's insert then fails with a conflict, where it used to overwrite the first node's document.
 
 Three details are easy to get wrong:
 
