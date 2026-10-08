@@ -38,7 +38,7 @@ YesSql creates and changes tables through `SchemaBuilder`, which turns each comm
 | Create table, add column, add index, add or drop foreign key | Nothing. The table and the columns exist when an item that has them is written. |
 | `RenameColumn` | Sends `renamecolumn [Table] [From] [To]`, and the command rewrites that field in every item of the table. This is a data rewrite, not metadata, and it is not undone by a rollback. |
 | Drop table, drop column, alter column | Nothing. The items and the fields stay where they are. |
-| `ExecuteSql` (raw SQL in a migration) | Ignored. There is nothing to run it against. |
+| `ExecuteSql` (raw SQL in a migration) | Throws `NotSupportedException`. The relational providers run the statement, and there is nothing to run it against here. A statement tagged for particular providers (`ForProvider`) is skipped, as YesSql's own interpreter skips it. |
 
 Nothing enforces primary keys, unique constraints or foreign keys, and no `NOT NULL` is checked. A `SchemaBuilder` that was created with `throwOnError: false` swallows the exceptions of its commands, so a `renamecolumn` that fails is not reported in that case.
 
